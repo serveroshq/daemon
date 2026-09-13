@@ -1,0 +1,17 @@
+[package]
+name = "daemon-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local durable state: the job ledger, the telemetry ring buffer, and the outbox that survives disconnects"
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,6 @@
+target/
+target-linux/
+dist/
+*.db
+*.log
+.DS_Store

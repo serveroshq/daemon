@@ -1,0 +1,107 @@
+# Tag `vX.Y.Z` → static binaries for amd64 and arm64, signed with the
+# release key, checksummed, and published with a manifest per arch.
+#
+# Secrets: SERVEROS_RELEASE_KEY (hex private key from `serveros-release keygen`),
+#          SERVEROS_DEPLOY_TOKEN (the panel's SERVEROS_DEPLOY_TOKEN, to register releases).
+# Variables: SERVEROS_RELEASE_PUBKEY (the matching public key, baked into the binary),
+#            SERVEROS_PANEL_URL (e.g. https://serveros.com; skipped when unset).
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p serverosd
+        env:
+          SERVEROS_VERSION: ${{ github.ref_name }}
+          SERVEROS_COMMIT: ${{ github.sha }}
+          SERVEROS_CHANNEL: ${{ contains(github.ref_name, '-') && 'canary' || 'stable' }}
+          SERVEROS_TARGET: linux-${{ matrix.arch }}
+          SERVEROS_RELEASE_PUBKEY: ${{ vars.SERVEROS_RELEASE_PUBKEY }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+      - name: Stage
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/serverosd dist/serverosd-${{ github.ref_name }}-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: serverosd-${{ matrix.arch }}
+          path: dist/*
+
+  sign-and-publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Sign and write manifests
+        env:
+          RELEASE_KEY: ${{ secrets.SERVEROS_RELEASE_KEY }}
+        run: |
+          set -euo pipefail
+          cargo build --release -p serveros-release
+          printf '%s' "$RELEASE_KEY" > release.key
+          chmod 600 release.key
+          cd dist
+          sha256sum serverosd-* > SHA256SUMS
+          for arch in amd64 arm64; do
+            f="serverosd-${{ github.ref_name }}-linux-$arch"
+            ../target/release/serveros-release manifest \
+              --version "${{ github.ref_name }}" \
+              --channel "${{ contains(github.ref_name, '-') && 'canary' || 'stable' }}" \
+              --url "https://releases.serveros.com/${{ github.ref_name }}/$f" \
+              --file "$f" --key ../release.key \
+              --notes-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" \
+              > "manifest-$arch.json"
+          done
+          rm -f ../release.key
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+      - name: Register with the panel
+        if: vars.SERVEROS_PANEL_URL != ''
+        env:
+          PANEL_URL: ${{ vars.SERVEROS_PANEL_URL }}
+          DEPLOY_TOKEN: ${{ secrets.SERVEROS_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            jq --arg arch "$arch" '. + {arch: $arch}' "dist/manifest-$arch.json" \
+              | curl -fsS -X POST "$PANEL_URL/api/daemon/releases" \
+                  -H "Authorization: Bearer $DEPLOY_TOKEN" \
+                  -H "Content-Type: application/json" -H "Accept: application/json" \
+                  --data-binary @-
+            echo
+          done

@@ -1,0 +1,25 @@
+# The gateway runs next to the panel (or on its own box) and holds the
+# daemons' mutual-TLS connections. Secrets come from the environment file.
+[Unit]
+Description=ServerOS gateway
+Documentation=https://serveros.com/docs/daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=serveros-gateway
+Group=serveros-gateway
+EnvironmentFile=/etc/serveros/gateway.env
+ExecStart=/usr/local/bin/serveros-gateway
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadOnlyPaths=/etc/serveros
+
+[Install]
+WantedBy=multi-user.target

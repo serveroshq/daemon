@@ -1,0 +1,18 @@
+[package]
+name = "daemon-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Self-health: memory growth, wedged workers, connection-failure loops, clock skew, and the resource budget"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-protocol.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+tokio.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

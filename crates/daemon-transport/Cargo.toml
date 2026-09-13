@@ -1,0 +1,23 @@
+[package]
+name = "daemon-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The outbound-only mutual-TLS control channel to the panel: connect, handshake, heartbeat, sequence, reconnect"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-identity.workspace = true
+daemon-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+rustls.workspace = true
+futures-util.workspace = true
+rand.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true

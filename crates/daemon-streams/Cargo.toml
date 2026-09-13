@@ -1,0 +1,21 @@
+[package]
+name = "daemon-streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Live log tails and PTY terminal sessions over the control channel, back-pressured and rate-capped"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+base64.workspace = true
+nix = { workspace = true, features = ["term", "fs", "process", "signal", "user"] }
+libc.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

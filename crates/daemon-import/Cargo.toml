@@ -1,0 +1,23 @@
+[package]
+name = "daemon-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Import: enrich what discovery found, preview adoption honestly, adopt without touching the service, and reverse it"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-protocol.workspace = true
+daemon-state.workspace = true
+daemon-inventory.workspace = true
+daemon-services.workspace = true
+daemon-capability.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

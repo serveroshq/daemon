@@ -1,0 +1,43 @@
+[package]
+name = "serverosd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The ServerOS daemon: one static binary that connects a machine to the panel"
+
+[[bin]]
+name = "serverosd"
+path = "src/main.rs"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-protocol.workspace = true
+daemon-audit.workspace = true
+daemon-capability.workspace = true
+daemon-http.workspace = true
+daemon-state.workspace = true
+daemon-identity.workspace = true
+daemon-transport.workspace = true
+daemon-telemetry.workspace = true
+daemon-inventory.workspace = true
+daemon-import.workspace = true
+daemon-jobs.workspace = true
+daemon-services.workspace = true
+daemon-files.workspace = true
+daemon-streams.workspace = true
+daemon-deploy.workspace = true
+daemon-backup.workspace = true
+daemon-supervisor.workspace = true
+daemon-selfupdate.workspace = true
+daemon-uninstall.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+time.workspace = true
+base64.workspace = true
+libc.workspace = true

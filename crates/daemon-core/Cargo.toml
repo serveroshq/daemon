@@ -1,0 +1,17 @@
+[package]
+name = "daemon-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Paths, configuration, build info, and redaction shared by every part of the ServerOS daemon"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+toml.workspace = true
+regex.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

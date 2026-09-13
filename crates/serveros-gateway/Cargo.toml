@@ -1,0 +1,43 @@
+[package]
+name = "serveros-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The panel-side relay: terminates each daemon's mutual-TLS control channel, authorises it by certificate serial, and brokers commands and browser streams"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "serveros-gateway"
+path = "src/main.rs"
+
+[dependencies]
+daemon-protocol.workspace = true
+daemon-http.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap = { workspace = true, features = ["env"] }
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+x509-parser.workspace = true
+httparse.workspace = true
+hex.workspace = true
+sha2.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+url.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rcgen.workspace = true
+daemon-transport.workspace = true
+daemon-identity.workspace = true

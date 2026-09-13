@@ -1,0 +1,17 @@
+[package]
+name = "daemon-files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "File operations inside permitted roots: symlink-safe, size-bounded, backed up before edits"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-capability.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+time.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

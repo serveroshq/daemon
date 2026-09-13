@@ -1,0 +1,20 @@
+[package]
+name = "daemon-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Machine facts, metric samples from procfs, the 24-hour ring buffer, and the derived signals that become events"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-protocol.workspace = true
+daemon-state.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+libc.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

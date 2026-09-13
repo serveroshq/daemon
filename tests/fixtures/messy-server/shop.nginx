@@ -1,0 +1,10 @@
+server {
+    listen 80;
+    listen 443 ssl;
+    server_name shop.example.com;
+    ssl_certificate /etc/letsencrypt/live/shop.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/shop.example.com/privkey.pem;
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+    }
+}

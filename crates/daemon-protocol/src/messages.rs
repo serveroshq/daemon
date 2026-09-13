@@ -1,0 +1,707 @@
+//! Payload types for protocol major 1. Plain data, serde-shaped, with
+//! defaults on every field added after the first release so old panels and
+//! old daemons keep parsing each other.
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+// ---------------------------------------------------------------- handshake
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Hello {
+    pub machine_id: String,
+    pub daemon_version: String,
+    pub daemon_commit: String,
+    pub channel: String,
+    /// Protocol majors this daemon can speak, newest first.
+    pub supported_majors: Vec<u16>,
+    pub facts: MachineFacts,
+    /// Where the daemon's local history starts, so the panel knows how far
+    /// back it may ask for a backfill.
+    #[serde(default)]
+    pub oldest_local_sample_ts: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HelloAck {
+    pub major: u16,
+    #[serde(default)]
+    pub panel_version: String,
+    /// The panel's last seen sequence from this daemon, for gap detection
+    /// across reconnects.
+    #[serde(default)]
+    pub last_seen_seq: Option<u64>,
+    /// "read_only" makes the daemon refuse every mutating command.
+    #[serde(default)]
+    pub mode: PanelMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelMode {
+    #[default]
+    Managed,
+    ReadOnly,
+}
+
+// ---------------------------------------------------------------- facts
+
+/// Static-ish description of the machine, sent on connect and whenever it
+/// changes (a reboot into a new kernel, a resized disk).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MachineFacts {
+    pub hostname: String,
+    pub os: String,
+    pub os_version: String,
+    pub kernel: String,
+    pub arch: String,
+    pub libc: String,
+    pub cpu_model: String,
+    pub cpu_cores: u32,
+    pub memory_bytes: u64,
+    pub disks: Vec<DiskFact>,
+    pub interfaces: Vec<InterfaceFact>,
+    pub timezone: String,
+    pub boot_ts: i64,
+    #[serde(default)]
+    pub init_system: String,
+    #[serde(default)]
+    pub docker_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskFact {
+    pub mount: String,
+    pub device: String,
+    pub fs_type: String,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterfaceFact {
+    pub name: String,
+    pub addresses: Vec<String>,
+    pub mac: Option<String>,
+}
+
+// ---------------------------------------------------------------- liveness
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Heartbeat {
+    pub uptime_secs: u64,
+    pub daemon_version: String,
+    pub daemon_uptime_secs: u64,
+    #[serde(default)]
+    pub load_1m: f32,
+    /// Jobs currently executing, so the panel can hold updates and restarts.
+    #[serde(default)]
+    pub running_jobs: u32,
+}
+
+// ---------------------------------------------------------------- telemetry
+
+/// One sample. `service` is `None` for the machine as a whole.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Sample {
+    pub ts: i64,
+    #[serde(default)]
+    pub service: Option<String>,
+    pub cpu_percent: f32,
+    #[serde(default)]
+    pub cpu_per_core: Vec<f32>,
+    pub load: [f32; 3],
+    pub mem_total: u64,
+    pub mem_used: u64,
+    pub mem_available: u64,
+    pub mem_cached: u64,
+    pub swap_total: u64,
+    pub swap_used: u64,
+    pub disks: Vec<DiskSample>,
+    pub net_rx_bytes: u64,
+    pub net_tx_bytes: u64,
+    pub net_rx_errors: u64,
+    pub net_tx_errors: u64,
+    pub process_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiskSample {
+    pub mount: String,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub inodes_used: u64,
+    pub inodes_free: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+/// A batch of samples, either live or a backfill. `gap_before` marks that
+/// samples older than the first one here were lost (buffer overrun, a
+/// crash) so the panel draws a break instead of a flat line.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetryBatch {
+    pub samples: Vec<Sample>,
+    #[serde(default)]
+    pub backfill: bool,
+    #[serde(default)]
+    pub gap_before: bool,
+}
+
+// ---------------------------------------------------------------- inventory
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InventoryReport {
+    pub scanned_at: i64,
+    pub duration_ms: u64,
+    /// Whether the scan finished inside its budget. A truncated scan is
+    /// still reported, honestly labelled.
+    pub complete: bool,
+    pub services: Vec<DiscoveredService>,
+    #[serde(default)]
+    pub listeners: Vec<Listener>,
+    #[serde(default)]
+    pub certificates: Vec<CertificateInfo>,
+    #[serde(default)]
+    pub scheduled: Vec<ScheduledTask>,
+    /// Anything discovery could not classify. Reported as-is rather than
+    /// guessed at.
+    #[serde(default)]
+    pub unknown: Vec<UnknownListener>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredService {
+    /// Stable across scans: `systemd:nginx.service`, `docker:<container id>`.
+    pub key: String,
+    pub name: String,
+    pub kind: ServiceKind,
+    pub manager: ServiceManager,
+    pub status: ServiceStatus,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub exec: Option<String>,
+    #[serde(default)]
+    pub config_paths: Vec<String>,
+    #[serde(default)]
+    pub data_dir: Option<String>,
+    /// 0..=100. Below 60 the panel shows it as a guess.
+    pub confidence: u8,
+    #[serde(default)]
+    pub details: BTreeMap<String, String>,
+    /// What ServerOS could actually do with this service if adopted.
+    pub capabilities: Vec<AdoptedCapability>,
+    /// Whether ServerOS created it or found it.
+    #[serde(default)]
+    pub origin: ServiceOrigin,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceKind {
+    WebServer,
+    Database,
+    Cache,
+    App,
+    GameServer,
+    Container,
+    Runtime,
+    Proxy,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceManager {
+    Systemd,
+    Docker,
+    Compose,
+    Pm2,
+    Supervisor,
+    Screen,
+    Cron,
+    Manual,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus {
+    Running,
+    Stopped,
+    Failed,
+    Restarting,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceOrigin {
+    #[default]
+    Discovered,
+    Created,
+}
+
+/// The capability matrix. An adopted service advertises exactly what works
+/// for it rather than a generic set of disabled buttons.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AdoptedCapability {
+    Lifecycle,
+    Logs,
+    Metrics,
+    Config,
+    Backup,
+    Deploy,
+    Rollback,
+    Files,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Listener {
+    pub proto: String,
+    pub address: String,
+    pub port: u16,
+    pub pid: Option<u32>,
+    pub exe: Option<String>,
+    pub user: Option<String>,
+    #[serde(default)]
+    pub cmdline: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnknownListener {
+    pub port: u16,
+    pub exe: Option<String>,
+    pub pid: Option<u32>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CertificateInfo {
+    pub path: String,
+    pub subject: String,
+    pub issuer: String,
+    pub not_after: i64,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub renewal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledTask {
+    pub source: String,
+    pub schedule: String,
+    pub command: String,
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+// ---------------------------------------------------------------- events
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Event {
+    pub kind: EventKind,
+    pub severity: Severity,
+    pub summary: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub data: BTreeMap<String, String>,
+    /// If the daemon knows the fix, it says so and the panel shows a button.
+    #[serde(default)]
+    pub suggested_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    DiskFillProjected,
+    DiskThreshold,
+    MemoryPressure,
+    OomKill,
+    RestartLoop,
+    ServiceCrashed,
+    CertificateExpiring,
+    SecurityUpdates,
+    RebootRequired,
+    SustainedLoad,
+    ServiceDiscovered,
+    ServiceGone,
+    UpdateAvailable,
+    UpdateApplied,
+    UpdateRolledBack,
+    DaemonRestarted,
+    ClockSkew,
+    PreExisting,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    Info,
+    Warning,
+    Critical,
+}
+
+// ---------------------------------------------------------------- commands
+
+/// A durable job. `id` is the envelope id; the payload is one of the
+/// fixed job types. There is deliberately no "run this shell string" job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Command {
+    /// Who in the panel asked. Recorded in actions.log verbatim.
+    pub actor: Actor,
+    /// The user confirmed a preview or typed a confirmation; required for
+    /// the operations that demand it (restore, reboot, reinstall).
+    #[serde(default)]
+    pub confirmed: bool,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    pub job: Job,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Actor {
+    pub kind: ActorKind,
+    /// The panel user's email or the automation's name.
+    pub name: String,
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    User,
+    Automation,
+    Panel,
+    Scheduler,
+    Local,
+    Daemon,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Job {
+    /// Read-only: rescan services now.
+    Discover,
+    /// Read-only: resend machine facts.
+    Facts,
+    ServiceAction {
+        service: String,
+        action: ServiceAction,
+    },
+    ServiceLogs {
+        service: String,
+        lines: u32,
+    },
+    ReadFile {
+        path: String,
+        service: Option<String>,
+    },
+    WriteFile {
+        path: String,
+        content_b64: String,
+        mode: Option<u32>,
+        service: Option<String>,
+    },
+    ListDir {
+        path: String,
+        service: Option<String>,
+    },
+    DeleteFile {
+        path: String,
+        service: Option<String>,
+    },
+    Chmod {
+        path: String,
+        mode: u32,
+        service: Option<String>,
+    },
+    Chown {
+        path: String,
+        user: String,
+        group: Option<String>,
+        service: Option<String>,
+    },
+    Deploy(DeploySpec),
+    Rollback {
+        service: String,
+        release: Option<String>,
+    },
+    Backup {
+        service: String,
+        reason: String,
+    },
+    Restore {
+        service: String,
+        snapshot: String,
+    },
+    PackageUpdates {
+        apply: bool,
+        security_only: bool,
+    },
+    Reboot,
+    FirewallRule {
+        action: FirewallAction,
+        rule: String,
+    },
+    SshKey {
+        user: String,
+        action: KeyAction,
+        public_key: String,
+    },
+    Adopt {
+        service: String,
+        dry_run: bool,
+    },
+    Unadopt {
+        service: String,
+    },
+    OpenTerminal {
+        user: String,
+        session: Uuid,
+    },
+    TailLogs {
+        source: String,
+        session: Uuid,
+    },
+    /// The machine's public deploy key for a service, generated if missing.
+    DeployKey {
+        service: String,
+    },
+    /// Read-only: the snapshots on disk for a service.
+    Snapshots {
+        service: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+    Reload,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallAction {
+    Allow,
+    Deny,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploySpec {
+    pub service: String,
+    pub repo: String,
+    pub commit: String,
+    #[serde(default)]
+    pub compose_file: Option<String>,
+    #[serde(default)]
+    pub dockerfile: Option<String>,
+    /// Encrypted panel-side; decrypted only in transit to this daemon.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub health: Option<HealthCheck>,
+    #[serde(default)]
+    pub domains: Vec<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthCheck {
+    pub path: String,
+    #[serde(default = "default_expected_status")]
+    pub expected_status: u16,
+    #[serde(default = "default_health_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_health_retries")]
+    pub retries: u32,
+}
+
+fn default_expected_status() -> u16 {
+    200
+}
+
+fn default_health_timeout() -> u64 {
+    30
+}
+
+fn default_health_retries() -> u32 {
+    5
+}
+
+// ---------------------------------------------------------------- job updates
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobUpdate {
+    pub job_id: Uuid,
+    pub state: JobState,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub progress: Option<u8>,
+    #[serde(default)]
+    pub log: Vec<String>,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<JobError>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Accepted,
+    Running,
+    Succeeded,
+    Failed,
+    TimedOut,
+    Refused,
+    Cancelled,
+}
+
+impl JobState {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, JobState::Accepted | JobState::Running)
+    }
+}
+
+/// A failure that names the phase and carries the real output.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobError {
+    pub phase: String,
+    pub message: String,
+    #[serde(default)]
+    pub output_tail: Vec<String>,
+    /// What a person can do next.
+    #[serde(default)]
+    pub next_step: Option<String>,
+}
+
+// ---------------------------------------------------------------- streams
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamFrame {
+    pub session: Uuid,
+    pub kind: StreamKind,
+    /// base64 of the bytes; PTY data is not always UTF-8.
+    pub data_b64: String,
+    #[serde(default)]
+    pub eof: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamKind {
+    PtyInput,
+    PtyOutput,
+    PtyResize,
+    LogLine,
+}
+
+// ---------------------------------------------------------------- control
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Control {
+    /// Update to `version` from `url`, checked against `signature` (ed25519
+    /// over the binary, base64). Refused while a pin is set. `approved`
+    /// means a person confirmed this specific version in the panel, which
+    /// lifts the automatic-updates and major-version gates.
+    SelfUpdate {
+        version: String,
+        url: String,
+        sha256: String,
+        signature: String,
+        #[serde(default)]
+        channel: Option<String>,
+        #[serde(default)]
+        min_from: Option<String>,
+        #[serde(default)]
+        approved: bool,
+    },
+    Reconfigure {
+        updates_channel: Option<String>,
+        pinned_version: Option<Option<String>>,
+        mode: Option<PanelMode>,
+    },
+    /// Stop management; leave everything running.
+    Disconnect {
+        reason: String,
+    },
+    /// The panel wants samples from `from_ts` to `to_ts` again.
+    Backfill {
+        from_ts: i64,
+        to_ts: i64,
+    },
+    CancelJob {
+        job_id: Uuid,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_are_tagged_by_type() {
+        let job = Job::ServiceAction {
+            service: "nginx".into(),
+            action: ServiceAction::Reload,
+        };
+        let json = serde_json::to_value(&job).unwrap();
+
+        assert_eq!(json["type"], "service_action");
+        assert_eq!(json["action"], "reload");
+    }
+
+    #[test]
+    fn there_is_no_shell_job() {
+        // The capability boundary is enforced by the type system: if this
+        // ever parses, someone added a generic exec path.
+        let raw = serde_json::json!({"type": "shell", "command": "rm -rf /"});
+
+        assert!(serde_json::from_value::<Job>(raw).is_err());
+    }
+
+    #[test]
+    fn missing_optional_fields_default() {
+        let hello: HelloAck = serde_json::from_str(r#"{"major": 1}"#).unwrap();
+
+        assert_eq!(hello.mode, PanelMode::Managed);
+        assert_eq!(hello.last_seen_seq, None);
+    }
+
+    #[test]
+    fn terminal_states_are_terminal() {
+        assert!(JobState::Failed.is_terminal());
+        assert!(!JobState::Running.is_terminal());
+    }
+}

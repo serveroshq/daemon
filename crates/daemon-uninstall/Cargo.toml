@@ -1,0 +1,16 @@
+[package]
+name = "daemon-uninstall"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "One command that removes ServerOS and leaves the server exactly as it was, printing what went and what stayed"
+
+[dependencies]
+daemon-core.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

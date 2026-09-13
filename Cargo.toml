@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/serverosd",
+    "crates/daemon-core",
+    "crates/daemon-protocol",
+    "crates/daemon-audit",
+    "crates/daemon-capability",
+    "crates/daemon-http",
+    "crates/daemon-state",
+    "crates/daemon-identity",
+    "crates/daemon-transport",
+    "crates/daemon-telemetry",
+    "crates/daemon-inventory",
+    "crates/daemon-jobs",
+    "crates/daemon-import",
+    "crates/daemon-services",
+    "crates/daemon-files",
+    "crates/daemon-streams",
+    "crates/daemon-deploy",
+    "crates/daemon-backup",
+    "crates/daemon-supervisor",
+    "crates/daemon-selfupdate",
+    "crates/daemon-uninstall",
+    "crates/release-tool",
+    "crates/serveros-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+repository = "https://github.com/serveroshq/daemon"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Internal crates share one version line so every crate moves together.
+daemon-core = { path = "crates/daemon-core" }
+daemon-protocol = { path = "crates/daemon-protocol" }
+daemon-audit = { path = "crates/daemon-audit" }
+daemon-capability = { path = "crates/daemon-capability" }
+daemon-http = { path = "crates/daemon-http" }
+daemon-state = { path = "crates/daemon-state" }
+daemon-identity = { path = "crates/daemon-identity" }
+daemon-transport = { path = "crates/daemon-transport" }
+daemon-telemetry = { path = "crates/daemon-telemetry" }
+daemon-inventory = { path = "crates/daemon-inventory" }
+daemon-jobs = { path = "crates/daemon-jobs" }
+daemon-import = { path = "crates/daemon-import" }
+daemon-services = { path = "crates/daemon-services" }
+daemon-files = { path = "crates/daemon-files" }
+daemon-streams = { path = "crates/daemon-streams" }
+daemon-deploy = { path = "crates/daemon-deploy" }
+daemon-backup = { path = "crates/daemon-backup" }
+daemon-supervisor = { path = "crates/daemon-supervisor" }
+daemon-selfupdate = { path = "crates/daemon-selfupdate" }
+daemon-uninstall = { path = "crates/daemon-uninstall" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde", "local-offset"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+rcgen = "0.13"
+x509-parser = "0.16"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rand = "0.8"
+nix = { version = "0.29", features = ["process", "signal", "fs", "user", "term", "poll"] }
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+httparse = "1"
+tempfile = "3"
+regex = "1"
+url = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

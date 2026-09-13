@@ -1,0 +1,16 @@
+[package]
+name = "daemon-capability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The capability boundary: the fixed set of privileged operations, and the broker that refuses everything else"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-audit.workspace = true
+daemon-protocol.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

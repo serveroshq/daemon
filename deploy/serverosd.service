@@ -1,0 +1,19 @@
+# Installed by `serverosd enrol`; kept here for reference and packaging.
+[Unit]
+Description=ServerOS daemon
+Documentation=https://serveros.com/docs/daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/serverosd run
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+KillMode=mixed
+LimitNOFILE=65536
+Environment=SERVEROS_LOG=info
+
+[Install]
+WantedBy=multi-user.target

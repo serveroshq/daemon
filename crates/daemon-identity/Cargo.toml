@@ -1,0 +1,23 @@
+[package]
+name = "daemon-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The machine's keypair and client certificate, and the enrolment that mints them"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-http.workspace = true
+daemon-protocol.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rcgen.workspace = true
+x509-parser.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
