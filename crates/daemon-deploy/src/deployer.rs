@@ -213,6 +213,7 @@ impl Deployer {
             }
             if let (Some(port), false) = (host_port, spec.domains.is_empty()) {
                 progress.phase("proxy", Some(80)).await;
+                self.proxy.ensure_installed(cancel, progress).await?;
                 self.proxy.ensure_import()?;
                 self.proxy
                     .publish(service, &spec.domains, port, cancel, progress)
@@ -283,6 +284,7 @@ impl Deployer {
         // 7. Proxy swap: validated, reloaded, reverted on failure.
         if !spec.domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
+            self.proxy.ensure_installed(cancel, progress).await?;
             self.proxy.ensure_import()?;
             self.proxy
                 .publish(service, &spec.domains, host_port, cancel, progress)

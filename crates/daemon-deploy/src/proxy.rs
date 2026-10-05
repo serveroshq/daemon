@@ -17,6 +17,39 @@ pub const CADDYFILE: &str = "/etc/caddy/Caddyfile";
 pub const INCLUDE_DIR: &str = "/etc/caddy/serveros.d";
 const CADDY_IMPORT_LINE: &str = "import /etc/caddy/serveros.d/*.caddy";
 
+/// Installs Caddy from its official apt repository (Debian and Ubuntu),
+/// and opens 80 and 443 when ufw is active: Caddy needs both to answer the
+/// ACME HTTP-01 challenge and to redirect HTTP to HTTPS.
+const CADDY_INSTALL_SCRIPT: &str = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "automatic Caddy install needs apt (Debian or Ubuntu)" >&2
+  exit 3
+fi
+apt-get update -q
+apt-get install -y -q debian-keyring debian-archive-keyring apt-transport-https curl gnupg
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+  | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+  > /etc/apt/sources.list.d/caddy-stable.list
+chmod o+r /usr/share/keyrings/caddy-stable-archive-keyring.gpg /etc/apt/sources.list.d/caddy-stable.list
+apt-get update -q
+apt-get install -y -q caddy
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+fi
+systemctl enable --now caddy
+"#;
+
+/// The Caddyfile for a Caddy that ServerOS installed: only our sites, in
+/// place of the package's welcome page on :80.
+fn fresh_caddyfile() -> String {
+    format!(
+        "# Installed by ServerOS. Per-service sites live in serveros.d; Caddy\n# gets and renews their certificates on its own.\n{CADDY_IMPORT_LINE}\n"
+    )
+}
+
 pub const NGINX_CONF: &str = "/etc/nginx/nginx.conf";
 pub const NGINX_INCLUDE_DIR: &str = "/etc/nginx/serveros.d";
 const NGINX_INCLUDE_LINE: &str = "include /etc/nginx/serveros.d/*.conf;";
@@ -111,6 +144,53 @@ impl Proxy {
     fn none_configured() -> Failure {
         Failure::new("proxy", "no reverse proxy is configured on this machine")
             .with_next_step("Set `[integrations] proxy = \"caddy\"` or `\"nginx\"` in daemon.toml, or publish the port yourself.")
+    }
+
+    /// Install Caddy when the machine doesn't have it yet, so a deploy
+    /// with a domain gets HTTPS without any setup on the machine. Returns
+    /// `true` when it was installed. nginx is never installed for you.
+    pub async fn ensure_installed(
+        &self,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<bool, Failure> {
+        if self.backend != ProxyBackend::Caddy || on_path("caddy") {
+            return Ok(false);
+        }
+
+        progress
+            .line("Caddy is not installed: installing it for automatic HTTPS".to_string())
+            .await;
+
+        let outcome = run_child(
+            "sh",
+            &["-c", CADDY_INSTALL_SCRIPT],
+            None,
+            &[],
+            Duration::from_secs(600),
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+
+        if !outcome.success() {
+            return Err(Failure::new("proxy", "could not install Caddy")
+                .with_output(outcome.tail().to_vec())
+                .with_next_step(
+                    "Install Caddy yourself (caddyserver.com/docs/install), then deploy again.",
+                ));
+        }
+
+        // Replace the package's welcome page with just our sites.
+        std::fs::write(&self.main_config, fresh_caddyfile()).map_err(|e| {
+            Failure::new(
+                "proxy",
+                format!("could not write {}: {e}", self.main_config.display()),
+            )
+        })?;
+
+        Ok(true)
     }
 
     /// Make sure the main config imports our directory. Returns `true`
@@ -282,6 +362,12 @@ impl Proxy {
     }
 }
 
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
+        .unwrap_or(false)
+}
+
 /// Append the Caddy import line unless it is already there.
 fn add_caddy_import(existing: &str) -> Option<String> {
     if existing.lines().any(|l| l.trim() == CADDY_IMPORT_LINE) {
@@ -324,6 +410,24 @@ fn add_nginx_include(existing: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caddy_serveros_installs_imports_only_our_sites() {
+        let caddyfile = fresh_caddyfile();
+
+        assert!(caddyfile.lines().any(|l| l == CADDY_IMPORT_LINE));
+        // Nothing to add: the import is already there.
+        assert!(add_caddy_import(&caddyfile).is_none());
+        assert!(!caddyfile.contains(":80"));
+    }
+
+    #[test]
+    fn installing_caddy_opens_the_ports_its_certificates_need() {
+        assert!(CADDY_INSTALL_SCRIPT.contains("apt-get install -y -q caddy"));
+        assert!(CADDY_INSTALL_SCRIPT.contains("ufw allow 80/tcp"));
+        assert!(CADDY_INSTALL_SCRIPT.contains("ufw allow 443/tcp"));
+        assert!(CADDY_INSTALL_SCRIPT.contains("systemctl enable --now caddy"));
+    }
 
     #[test]
     fn caddy_sites_are_rendered_from_validated_domains() {
