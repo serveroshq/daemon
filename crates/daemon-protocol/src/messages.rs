@@ -413,6 +413,37 @@ pub enum ActorKind {
     Daemon,
 }
 
+/// Where a backup goes. Credentials come from the panel with each job and
+/// are never written to disk, apart from an SFTP key held in a 0600 file
+/// for the length of the upload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum BackupDestination {
+    S3 {
+        endpoint: String,
+        region: String,
+        bucket: String,
+        access_key: String,
+        secret_key: String,
+        #[serde(default)]
+        path_style: bool,
+    },
+    Sftp {
+        host: String,
+        #[serde(default = "default_ssh_port")]
+        port: u16,
+        user: String,
+        private_key: String,
+        /// The receiver's host key line, pinned so a backup can't be
+        /// sent to a machine pretending to be the receiver.
+        host_key: Option<String>,
+    },
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Job {
@@ -465,6 +496,21 @@ pub enum Job {
     Backup {
         service: String,
         reason: String,
+    },
+    /// Snapshot a service and send it off the machine: to S3-compatible
+    /// storage, or over SFTP to another machine set up as a receiver.
+    /// Objects land at `<prefix>/<service>/<snapshot id>/<file>`.
+    BackupTo {
+        service: String,
+        reason: String,
+        prefix: String,
+        destination: BackupDestination,
+    },
+    /// Let another machine's daemon drop backups here over SFTP, as the
+    /// `serveros-backups` user, which can do nothing but SFTP into its
+    /// home directory.
+    BackupReceiver {
+        public_key: String,
     },
     Restore {
         service: String,

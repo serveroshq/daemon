@@ -34,6 +34,7 @@ impl Handler for JobHandler {
     fn known_secrets(&self, job: &Job) -> Vec<String> {
         match job {
             Job::Deploy(spec) => spec.env.values().cloned().collect(),
+            Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             _ => Vec::new(),
         }
     }
@@ -487,6 +488,40 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                     .as_deref(),
             );
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::BackupTo {
+            service,
+            reason,
+            prefix,
+            destination,
+        } => {
+            let managed = managed(&app, &service).await?;
+            let grant = authorize(Operation::Data(DataOp::Snapshot {
+                service: managed.name.clone(),
+            }))?;
+            let result =
+                super::backup_ops::backup_to(&app, &ctx, &managed, &reason, &prefix, &destination)
+                    .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v["location"].as_str())
+                    .map(|l| format!("sent to {l}"))
+                    .as_deref(),
+            );
+            result
+        }
+
+        Job::BackupReceiver { public_key } => {
+            let grant = authorize(Operation::Machine(MachineOp::ManageSshKeys {
+                user: super::backup_ops::RECEIVER_USER.into(),
+            }))?;
+            let result = super::backup_ops::receiver(&public_key).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some("backup receiver"));
+            result
         }
 
         Job::Restore { service, snapshot } => {

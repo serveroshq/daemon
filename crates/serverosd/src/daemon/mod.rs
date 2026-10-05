@@ -1,6 +1,7 @@
 //! The long-running service: bootstrap, workers, and the control loop.
 
 mod app;
+mod backup_ops;
 mod control;
 mod handler;
 mod local;
@@ -95,6 +96,8 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             }
         }
         broker_state.created.users.push("serveros".into());
+        // The user other machines' backups arrive as, which ServerOS creates.
+        broker_state.created.users.push(backup_ops::RECEIVER_USER.into());
         let broker = Arc::new(Broker::new(Arc::clone(&audit), broker_state));
 
         let (outbound_tx, outbound_rx) = mpsc::channel(1024);

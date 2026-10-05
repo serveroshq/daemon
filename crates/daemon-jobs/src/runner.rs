@@ -352,6 +352,8 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Deploy(_) => "deploy",
         Job::Rollback { .. } => "rollback",
         Job::Backup { .. } => "backup",
+        Job::BackupTo { .. } => "backup_to",
+        Job::BackupReceiver { .. } => "backup_receiver",
         Job::Restore { .. } => "restore",
         Job::PackageUpdates { .. } => "package_updates",
         Job::Reboot => "reboot",
