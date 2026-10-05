@@ -530,8 +530,19 @@ pub enum KeyAction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeploySpec {
     pub service: String,
+    /// Git repository to build from. Empty for deploys made entirely of
+    /// `files`, such as a service template's Compose file.
+    #[serde(default)]
     pub repo: String,
+    /// The commit to build, or for file-only deploys the template revision
+    /// (any 40-hex digest); it names the release either way.
     pub commit: String,
+    /// Files written into the workspace after the source is fetched, keyed
+    /// by relative path: a template's Compose file, or a Dockerfile under
+    /// `.serveros/` for an app that has none. Paths are confined to the
+    /// workspace.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
     #[serde(default)]
     pub compose_file: Option<String>,
     #[serde(default)]

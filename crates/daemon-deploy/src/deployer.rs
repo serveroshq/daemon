@@ -156,19 +156,34 @@ impl Deployer {
         let commit = &spec.commit;
         let step_timeout = ctx.timeout;
 
-        // 2. Source.
+        // 2. Source: the repository at the commit, then any files the panel
+        // sent with the job (a template's Compose file, or a Dockerfile for
+        // an app that has none). Template deploys have files and no repo.
         progress.phase("fetch", Some(15)).await;
-        let (private_key, _) = git::key_paths(&self.keys_dir(), service);
-        git::fetch(
-            &spec.repo,
-            commit,
-            workspace,
-            private_key.exists().then_some(private_key.as_path()),
-            step_timeout,
-            cancel,
-            progress,
-        )
-        .await?;
+        if spec.repo.is_empty() {
+            if spec.files.is_empty() {
+                return Err(
+                    Failure::new("fetch", "nothing to deploy: no repository and no files")
+                        .with_next_step("Send a repository, or a template's files."),
+                );
+            }
+            progress
+                .line("no repository: deploying from the files sent with this job".to_string())
+                .await;
+        } else {
+            let (private_key, _) = git::key_paths(&self.keys_dir(), service);
+            git::fetch(
+                &spec.repo,
+                commit,
+                workspace,
+                private_key.exists().then_some(private_key.as_path()),
+                step_timeout,
+                cancel,
+                progress,
+            )
+            .await?;
+        }
+        write_files(workspace, &spec.files)?;
 
         // 3. Environment, before anything runs.
         progress.phase("env", Some(25)).await;
@@ -188,6 +203,22 @@ impl Deployer {
                 progress,
             )
             .await?;
+
+            // A Compose service that publishes an HTTP port on the host gets
+            // the same checks as a single container: health, then the proxy.
+            let host_port = spec.port.filter(|p| *p > 0);
+            if let (Some(port), Some(check)) = (host_port, spec.health.as_ref()) {
+                progress.phase("health", Some(70)).await;
+                health::wait_healthy(port, Some(check), progress).await?;
+            }
+            if let (Some(port), false) = (host_port, spec.domains.is_empty()) {
+                progress.phase("proxy", Some(80)).await;
+                self.proxy.ensure_import()?;
+                self.proxy
+                    .publish(service, &spec.domains, port, cancel, progress)
+                    .await?;
+            }
+
             progress.phase("verify", Some(90)).await;
 
             let release = Release {
@@ -393,6 +424,63 @@ impl Deployer {
     }
 }
 
+/// Most files one job may carry, and the most bytes in any one of them.
+const MAX_JOB_FILES: usize = 64;
+const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
+
+/// Write the job's files into the workspace. Paths must be plain relative
+/// paths (no `..`, no absolute paths), so nothing lands outside it.
+fn write_files(
+    workspace: &Path,
+    files: &std::collections::BTreeMap<String, String>,
+) -> Result<(), Failure> {
+    use std::path::Component;
+
+    if files.len() > MAX_JOB_FILES {
+        return Err(Failure::new(
+            "files",
+            format!(
+                "too many files ({}, the limit is {MAX_JOB_FILES})",
+                files.len()
+            ),
+        ));
+    }
+
+    for (name, content) in files {
+        let relative = Path::new(name);
+        let confined = !name.is_empty()
+            && relative
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)));
+        if !confined {
+            return Err(Failure::new(
+                "files",
+                format!("{name:?} must be a relative path inside the workspace"),
+            ));
+        }
+        if content.len() > MAX_JOB_FILE_BYTES {
+            return Err(Failure::new(
+                "files",
+                format!("{name} is larger than {MAX_JOB_FILE_BYTES} bytes"),
+            ));
+        }
+
+        let path = workspace.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                Failure::new(
+                    "files",
+                    format!("could not create {}: {e}", parent.display()),
+                )
+            })?;
+        }
+        std::fs::write(&path, content)
+            .map_err(|e| Failure::new("files", format!("could not write {name}: {e}")))?;
+    }
+
+    Ok(())
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
@@ -410,6 +498,37 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_files_are_written_inside_the_workspace_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("compose.yaml".to_string(), "services: {}\n".to_string());
+        files.insert(
+            ".serveros/Dockerfile".to_string(),
+            "FROM scratch\n".to_string(),
+        );
+
+        write_files(dir.path(), &files).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("compose.yaml")).unwrap(),
+            "services: {}\n"
+        );
+        assert!(dir.path().join(".serveros/Dockerfile").is_file());
+
+        for bad in ["../escape", "/etc/passwd", "a/../../b", "./x", ""] {
+            let mut files = std::collections::BTreeMap::new();
+            files.insert(bad.to_string(), "x".to_string());
+            assert!(
+                write_files(dir.path(), &files).is_err(),
+                "{bad:?} was accepted"
+            );
+        }
+
+        let mut big = std::collections::BTreeMap::new();
+        big.insert("big".to_string(), "x".repeat(MAX_JOB_FILE_BYTES + 1));
+        assert!(write_files(dir.path(), &big).is_err());
+    }
 
     #[test]
     fn env_files_are_root_only_and_validated() {
