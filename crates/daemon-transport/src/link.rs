@@ -23,7 +23,9 @@ pub enum LinkError {
     #[error("could not connect to {url}: {source} (the daemon only dials out on 443; check outbound firewall rules and DNS)")]
     Connect {
         url: String,
-        source: tokio_tungstenite::tungstenite::Error,
+        // Boxed: tungstenite's error is large, and this enum travels in
+        // every Result the link returns.
+        source: Box<tokio_tungstenite::tungstenite::Error>,
     },
     #[error("the panel did not answer the handshake within {0:?}")]
     HandshakeTimeout(Duration),
@@ -40,6 +42,9 @@ pub enum LinkError {
 }
 
 /// What the control loop sees from a link.
+// Nearly every event is a Message, so boxing it would only add an
+// allocation per frame.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum LinkEvent {
     Message(Inbound),
@@ -97,7 +102,7 @@ impl Link {
         .await
         .map_err(|source| LinkError::Connect {
             url: url.into(),
-            source,
+            source: Box::new(source),
         })?;
 
         let (mut sink, mut stream) = socket.split();
