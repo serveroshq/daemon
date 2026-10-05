@@ -4,6 +4,7 @@ use daemon_protocol::{DiskFact, InterfaceFact, MachineFacts};
 
 use crate::platform;
 use crate::procfs;
+mod hosting;
 
 pub fn gather_facts() -> MachineFacts {
     let os_release = platform::read_optional(platform::OS_RELEASE).unwrap_or_default();
@@ -46,6 +47,7 @@ pub fn gather_facts() -> MachineFacts {
         boot_ts: stat.map(|s| s.boot_ts).unwrap_or(0),
         init_system: init_system(),
         docker_version: None,
+        hosting: hosting::detect(),
     }
 }
 

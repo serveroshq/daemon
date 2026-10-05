@@ -69,6 +69,19 @@ pub struct MachineFacts {
     pub init_system: String,
     #[serde(default)]
     pub docker_version: Option<String>,
+    #[serde(default)]
+    pub hosting: HostingFacts,
+}
+
+/// Provider supplied instance details. Missing fields mean the platform did
+/// not expose them; a machine timezone is never treated as a location.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct HostingFacts {
+    pub provider: Option<String>,
+    pub region: Option<String>,
+    pub zone: Option<String>,
+    pub instance_type: Option<String>,
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -697,6 +710,9 @@ mod tests {
 
         assert_eq!(hello.mode, PanelMode::Managed);
         assert_eq!(hello.last_seen_seq, None);
+
+        let facts: MachineFacts = serde_json::from_str(r#"{"hostname":"box","os":"linux","os_version":"","kernel":"","arch":"x86_64","libc":"","cpu_model":"","cpu_cores":1,"memory_bytes":0,"disks":[],"interfaces":[],"timezone":"UTC","boot_ts":0}"#).unwrap();
+        assert_eq!(facts.hosting, HostingFacts::default());
     }
 
     #[test]
