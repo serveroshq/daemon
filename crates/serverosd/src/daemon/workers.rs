@@ -21,6 +21,7 @@ pub fn spawn_all(app: Arc<App>) {
     tokio::spawn(telemetry(Arc::clone(&app)));
     tokio::spawn(discovery(Arc::clone(&app)));
     tokio::spawn(super::service_stats::run(Arc::clone(&app)));
+    tokio::spawn(super::log_shipper::run(Arc::clone(&app)));
     tokio::spawn({
         let app = Arc::clone(&app);
         async move {

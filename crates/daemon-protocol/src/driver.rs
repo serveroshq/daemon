@@ -50,6 +50,7 @@ pub enum Outbound {
     Stream(StreamFrame),
     Gap { from: u64, to: u64 },
     Facts(MachineFacts),
+    Logs(LogBatch),
 }
 
 pub trait Driver: Send + Sync {
@@ -155,6 +156,7 @@ pub mod v1 {
                     },
                 ),
                 Outbound::Facts(m) => envelope(seq, Kind::Facts, m),
+                Outbound::Logs(m) => envelope(seq, Kind::Logs, m),
             }
         }
     }

@@ -716,6 +716,44 @@ pub enum StreamKind {
     LogLine,
 }
 
+// ------------------------------------------------------------------- logs
+
+/// Daemon → panel: lines from the services on the machine, shipped as they
+/// are written so the panel can keep and search them. Every line has been
+/// redacted. Best effort: lines written while the link is down are lost.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogBatch {
+    pub lines: Vec<LogEntry>,
+    /// Lines the daemon dropped since the last batch because a service
+    /// logged faster than the per-service cap.
+    #[serde(default)]
+    pub dropped: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntry {
+    /// The service the line came from, keyed as discovery keys it
+    /// (`docker:<short id>`, `systemd:<unit>`).
+    pub service: String,
+    /// When the service wrote it, unix milliseconds.
+    pub ts: i64,
+    /// `stdout` or `stderr` for containers; journald lines are `journal`.
+    pub stream: LogStream,
+    /// syslog severity 0-7 when the source says (journald does), so the
+    /// panel needn't guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u8>,
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+    Journal,
+}
+
 // ---------------------------------------------------------------- control
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

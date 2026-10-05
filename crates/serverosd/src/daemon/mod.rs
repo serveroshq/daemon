@@ -5,6 +5,7 @@ mod backup_ops;
 mod control;
 mod handler;
 mod local;
+mod log_shipper;
 mod machine;
 mod service_ops;
 mod service_stats;

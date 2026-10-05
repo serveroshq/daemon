@@ -48,6 +48,8 @@ pub struct Config {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
     #[serde(default)]
+    pub logs: LogsConfig,
+    #[serde(default)]
     pub files: FilesConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -185,6 +187,25 @@ pub struct DiscoveryConfig {
     pub budget_secs: u64,
 }
 
+/// Shipping service logs to the panel, where they are kept and searchable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct LogsConfig {
+    pub enabled: bool,
+    /// Lines per second any one service may ship; the rest are counted and
+    /// replaced by a marker line.
+    pub lines_per_second: u32,
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            lines_per_second: 100,
+        }
+    }
+}
+
 impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
@@ -263,6 +284,7 @@ impl Config {
             updates: UpdateConfig::default(),
             telemetry: TelemetryConfig::default(),
             discovery: DiscoveryConfig::default(),
+            logs: LogsConfig::default(),
             files: FilesConfig::default(),
             limits: LimitsConfig::default(),
             integrations: IntegrationsConfig::default(),

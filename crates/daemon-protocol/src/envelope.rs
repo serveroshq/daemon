@@ -49,6 +49,8 @@ pub enum Kind {
     Gap,
     /// Daemon → panel: machine facts changed since `Hello` (added in 1.1).
     Facts,
+    /// Daemon → panel: service log lines (added in 1.2).
+    Logs,
 }
 
 impl Envelope {
