@@ -157,4 +157,7 @@ keeps shipping until no supported daemon speaks it. The panel side needs:
 
 ## Licence
 
-Business Source License 1.1.
+[Business Source License 1.1](LICENSE). The source is public and you can run
+it on your own servers, but you may not sell it, resell it or offer it to
+others as a hosted or managed service. On 2030-10-05 it becomes Apache-2.0.
+For any other use, contact SERVEROS CLOUD LTD.
