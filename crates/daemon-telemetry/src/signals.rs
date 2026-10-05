@@ -325,6 +325,8 @@ mod tests {
             net_rx_errors: 0,
             net_tx_errors: 0,
             process_count: 1,
+            started_at: None,
+            restarts: None,
         }
     }
 

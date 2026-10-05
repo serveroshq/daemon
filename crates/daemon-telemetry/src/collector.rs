@@ -113,6 +113,8 @@ impl Collector {
             net_rx_errors: net.rx_errors,
             net_tx_errors: net.tx_errors,
             process_count,
+            started_at: None,
+            restarts: None,
         })
     }
 

@@ -168,6 +168,48 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
+        Job::ServiceExec {
+            service,
+            command,
+            timeout_secs,
+        } => {
+            let managed = managed(&app, &service)?;
+            let container = super::service_ops::container_of(&managed)
+                .ok_or_else(|| {
+                    Failure::new(
+                        "exec",
+                        format!(
+                            "{} isn't a container, so there's nowhere to run the command",
+                            managed.name
+                        ),
+                    )
+                })?
+                .to_string();
+            let grant = authorize(Operation::Service(ServiceOp::Exec {
+                service: managed.key.clone(),
+            }))?;
+            let result = super::service_ops::exec(&ctx, &container, &command, timeout_secs).await;
+            let summary: String = command.chars().take(80).collect();
+            grant.finish(&result.as_ref().map(|_| ()), Some(&summary));
+            result
+        }
+
+        Job::ServiceRemove {
+            service,
+            delete_data,
+        } => {
+            let managed = managed(&app, &service)?;
+            let grant = authorize(Operation::Service(ServiceOp::Remove {
+                service: managed.key.clone(),
+            }))?;
+            let result = super::service_ops::remove(&app, &ctx, &managed, delete_data).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                delete_data.then_some("data deleted"),
+            );
+            result
+        }
+
         Job::ServiceLogs { service, lines } => {
             let managed = managed(&app, &service)?;
             let grant = authorize(Operation::Service(ServiceOp::ReadLogs {
@@ -317,6 +359,14 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let result = result?;
 
             app.broker.record_created_service(spec.service.clone());
+            let registered =
+                super::service_ops::register_deploy(&app, &spec, &result.container).await;
+            ctx.progress
+                .line(format!(
+                    "{} container(s) now managed by ServerOS",
+                    registered.len()
+                ))
+                .await;
             let _ = app.state.kv_set(
                 &format!("deploy.{}.domains", spec.service),
                 &serde_json::to_string(&spec.domains).unwrap_or_default(),

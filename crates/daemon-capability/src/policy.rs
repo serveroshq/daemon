@@ -226,4 +226,17 @@ mod tests {
         assert!(checks_for(&reboot).contains(&Check::Confirmation));
         assert!(!checks_for(&restart).contains(&Check::Confirmation));
     }
+
+    #[test]
+    fn running_a_command_is_confirmed_and_blocked_in_read_only_mode() {
+        let exec = Operation::Service(ServiceOp::Exec {
+            service: "docker:abc123def456".into(),
+        });
+        let checks = checks_for(&exec);
+
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+        // Unlike removal, it works on adopted services too.
+        assert!(!checks.contains(&Check::CreatedByUs));
+    }
 }

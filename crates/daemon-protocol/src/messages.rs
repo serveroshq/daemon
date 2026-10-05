@@ -137,6 +137,12 @@ pub struct Sample {
     pub net_rx_errors: u64,
     pub net_tx_errors: u64,
     pub process_count: u32,
+    /// Per-service samples only: when the service last started (unix
+    /// seconds) and how many times its manager has restarted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -481,6 +487,20 @@ pub enum Job {
     Adopt {
         service: String,
         dry_run: bool,
+    },
+    /// Run a one-off command inside a service's container (`sh -c`).
+    ServiceExec {
+        service: String,
+        command: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Remove a service ServerOS created: its containers, network and
+    /// proxy site; its volumes too when `delete_data` is set.
+    ServiceRemove {
+        service: String,
+        #[serde(default)]
+        delete_data: bool,
     },
     Unadopt {
         service: String,

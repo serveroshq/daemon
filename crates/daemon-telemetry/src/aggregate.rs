@@ -67,6 +67,8 @@ pub fn fold(samples: &[Sample], bucket_ts: i64) -> Option<Sample> {
         net_rx_errors: last.net_rx_errors,
         net_tx_errors: last.net_tx_errors,
         process_count: last.process_count,
+        started_at: last.started_at,
+        restarts: last.restarts,
     })
 }
 
@@ -119,6 +121,8 @@ mod tests {
             net_rx_errors: 0,
             net_tx_errors: 0,
             process_count: 1,
+            started_at: None,
+            restarts: None,
         }
     }
 

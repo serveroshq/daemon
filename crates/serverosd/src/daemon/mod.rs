@@ -5,6 +5,8 @@ mod control;
 mod handler;
 mod local;
 mod machine;
+mod service_ops;
+mod service_stats;
 mod workers;
 
 use std::sync::Arc;

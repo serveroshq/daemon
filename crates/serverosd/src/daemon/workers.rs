@@ -20,6 +20,16 @@ use super::EXIT_RESTART;
 pub fn spawn_all(app: Arc<App>) {
     tokio::spawn(telemetry(Arc::clone(&app)));
     tokio::spawn(discovery(Arc::clone(&app)));
+    tokio::spawn(super::service_stats::run(Arc::clone(&app)));
+    tokio::spawn({
+        let app = Arc::clone(&app);
+        async move {
+            let count = super::service_ops::register_earlier_deploys(&app).await;
+            if count > 0 {
+                info!(count, "registered containers from earlier deploys");
+            }
+        }
+    });
     tokio::spawn(self_health(Arc::clone(&app)));
     tokio::spawn(updates(Arc::clone(&app)));
     tokio::spawn(housekeeping(app));

@@ -81,6 +81,10 @@ pub enum ServiceOp {
     Unadopt {
         service: String,
     },
+    /// Run a one-off command inside a service's container.
+    Exec {
+        service: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,6 +165,7 @@ impl Operation {
                 ServiceOp::Remove { .. } => "service.remove",
                 ServiceOp::Adopt { .. } => "service.adopt",
                 ServiceOp::Unadopt { .. } => "service.unadopt",
+                ServiceOp::Exec { .. } => "service.exec",
             },
             Operation::Deploy(d) => match d {
                 DeployOp::FetchSource { .. } => "deploy.fetch",
@@ -213,7 +218,8 @@ impl Operation {
                 | ServiceOp::Update { service }
                 | ServiceOp::Remove { service }
                 | ServiceOp::Adopt { service }
-                | ServiceOp::Unadopt { service } => service.clone(),
+                | ServiceOp::Unadopt { service }
+                | ServiceOp::Exec { service } => service.clone(),
                 ServiceOp::ReadConfig { service, path } => format!("{service} {}", path.display()),
             },
             Operation::Deploy(d) => match d {
@@ -271,6 +277,7 @@ impl Operation {
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })
+                | Operation::Service(ServiceOp::Exec { .. })
                 | Operation::Data(DataOp::DeleteFile { .. })
         )
     }

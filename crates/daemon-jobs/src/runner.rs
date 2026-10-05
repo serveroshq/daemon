@@ -359,6 +359,8 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::SshKey { .. } => "ssh_key",
         Job::Adopt { .. } => "adopt",
         Job::Unadopt { .. } => "unadopt",
+        Job::ServiceExec { .. } => "service_exec",
+        Job::ServiceRemove { .. } => "service_remove",
         Job::OpenTerminal { .. } => "open_terminal",
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use daemon_inventory::Scanner;
-use daemon_protocol::{DiscoveredService, Event, InventoryReport};
+use daemon_protocol::{DiscoveredService, Event, InventoryReport, ServiceOrigin};
 use daemon_services::adoption::{self, AdoptionPreview};
 use daemon_services::{ManagedService, Registry};
 use daemon_state::State;
@@ -47,17 +47,21 @@ impl Importer {
         let history = History::new(&self.state);
         let previous = history.last_report()?;
         let owners = history.port_owners()?;
-        let managed: Vec<String> = Registry::new(&self.state)
+        let managed: std::collections::BTreeMap<String, ServiceOrigin> = Registry::new(&self.state)
             .all()?
             .into_iter()
-            .map(|m| m.key)
+            .map(|m| (m.key, m.origin))
             .collect();
 
         for service in report.services.iter_mut() {
             self.enrich(service, &owners).await;
 
-            if managed.contains(&service.key) {
+            if let Some(origin) = managed.get(&service.key) {
                 service.details.insert("managed".into(), "true".into());
+                // Say so when ServerOS created it, e.g. from a deploy.
+                if *origin == ServiceOrigin::Created {
+                    service.origin = ServiceOrigin::Created;
+                }
             }
         }
 
