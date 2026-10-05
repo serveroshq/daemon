@@ -1,6 +1,3 @@
-//! Enrolment: one HTTPS call that turns a one-time token and a CSR into a
-//! machine certificate. Every failure explains what a person can do next.
-
 use daemon_http::{Client, HttpError, Trust};
 use daemon_protocol::MachineFacts;
 use serde::{Deserialize, Serialize};
@@ -44,8 +41,6 @@ pub struct EnrolResponse {
     pub machine_id: String,
     pub certificate: String,
     pub ca: String,
-    /// The control-channel host. Usually the enrolment host, but the panel
-    /// may point large fleets at a dedicated gateway.
     #[serde(default)]
     pub panel_host: Option<String>,
     #[serde(default)]
@@ -60,9 +55,6 @@ struct ErrorBody {
     code: String,
 }
 
-/// Perform the enrolment call. `panel_url` is the base, e.g.
-/// `https://api.serveros.com`. Returns the machine id and the identity to
-/// persist.
 pub async fn enrol(
     panel_url: &str,
     token: &str,
@@ -137,7 +129,6 @@ pub async fn enrol(
         ca_pem: answer.ca.clone(),
     };
 
-    // Refuse a certificate we could not actually use, before writing anything.
     identity.cert_chain_der()?;
     identity.ca_der()?;
 

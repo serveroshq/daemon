@@ -1,5 +1,3 @@
-//! The runner: ledger first, then the handler, then the terminal update.
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +13,6 @@ use uuid::Uuid;
 use crate::progress::Progress;
 use crate::Failure;
 
-/// What a handler gets besides the job itself.
 pub struct JobContext {
     pub id: Uuid,
     pub command: Command,
@@ -26,12 +23,9 @@ pub struct JobContext {
 
 pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, Failure>> + Send>>;
 
-/// Implemented once, by the daemon binary, as a match over `Job`.
 pub trait Handler: Send + Sync + 'static {
     fn handle(&self, ctx: JobContext) -> HandlerFuture;
 
-    /// Values (env secrets, tokens) that must be scrubbed from this job's
-    /// output even where no pattern would catch them.
     fn known_secrets(&self, _job: &Job) -> Vec<String> {
         Vec::new()
     }
@@ -71,9 +65,6 @@ impl Runner {
         self.running.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
-    /// Accept a command. Re-delivery of a known id replays the stored
-    /// outcome instead of running again. Returns immediately; the job
-    /// runs on its own task.
     pub async fn submit(&self, id: Uuid, command: Command) {
         let payload = serde_json::to_string(&command.job).unwrap_or_default();
         let actor = format!("{:?} {}", command.actor.kind, command.actor.name).to_lowercase();
@@ -262,8 +253,6 @@ impl Runner {
         finish(&self.state, &self.updates, id, status, result, error).await;
     }
 
-    /// On start-up: anything the ledger still shows as running was cut
-    /// off by a crash or restart. Close it honestly and tell the panel.
     pub async fn close_unfinished(&self, reason: &str) -> usize {
         let Ok(unfinished) = self.state.unfinished_jobs() else {
             return 0;
@@ -370,7 +359,6 @@ pub fn job_kind(job: &Job) -> &'static str {
     }
 }
 
-/// Jobs that change the machine. Read-only mode refuses these outright.
 pub fn mutates(job: &Job) -> bool {
     !matches!(
         job,

@@ -1,17 +1,3 @@
-//! `serveros-gateway`: the piece of the control plane that holds sockets.
-//!
-//! Daemons dial `wss://{host}/daemon/control` with the certificate the
-//! panel issued at enrolment. The gateway terminates that mutual-TLS
-//! connection, reads the certificate serial, and asks the panel whether
-//! that serial belongs to a machine. From then on it is a relay: batches of
-//! daemon envelopes go to `POST /api/gateway/machines/{uid}/ingest`, and
-//! the panel pushes commands through the internal HTTP API on the loopback
-//! side. Browser terminals and log tails attach to `/streams/{session}`
-//! with a ticket the panel signed, so a stream never crosses the panel.
-//!
-//! The gateway keeps no durable state. If it restarts, daemons reconnect
-//! with backoff and the panel's job rows and sample tables are the truth.
-
 pub mod config;
 pub mod daemon_conn;
 pub mod internal;
@@ -30,15 +16,12 @@ use tracing::warn;
 use crate::panel::PanelClient;
 use crate::registry::Registry;
 
-/// Everything a connection handler needs, shared by reference.
 pub struct Context {
     pub panel: PanelClient,
     pub registry: Registry,
     pub secret: String,
 }
 
-/// Accept daemons on one listener and panel/browser traffic on the other,
-/// forever. Returns only if a listener breaks.
 pub async fn run_listeners(
     daemons: TcpListener,
     internal: TcpListener,

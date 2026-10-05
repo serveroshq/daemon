@@ -1,11 +1,5 @@
-//! Ten-second samples become one-minute points for the wire and
-//! five-minute points for anything older than a day.
-
 use daemon_protocol::{DiskSample, Sample};
 
-/// Fold `samples` (any order) into one point stamped at the bucket start.
-/// Gauges are averaged, counters take the last value, disk usage takes
-/// the last value and IO sums.
 pub fn fold(samples: &[Sample], bucket_ts: i64) -> Option<Sample> {
     let mut sorted: Vec<&Sample> = samples.iter().collect();
     sorted.sort_by_key(|s| s.ts);
@@ -72,7 +66,6 @@ pub fn fold(samples: &[Sample], bucket_ts: i64) -> Option<Sample> {
     })
 }
 
-/// Group samples into `bucket_secs` buckets and fold each.
 pub fn downsample(samples: &[Sample], bucket_secs: i64) -> Vec<Sample> {
     let mut buckets: std::collections::BTreeMap<(i64, Option<String>), Vec<Sample>> =
         std::collections::BTreeMap::new();

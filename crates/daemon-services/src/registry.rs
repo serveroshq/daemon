@@ -1,6 +1,3 @@
-//! The adoption ledger, kept in `state.db` under one key so it travels
-//! with the rest of local state and is trivially exportable.
-
 use std::path::PathBuf;
 
 use daemon_protocol::{AdoptedCapability, DiscoveredService, ServiceManager, ServiceOrigin};
@@ -26,7 +23,6 @@ pub enum RunBy {
         dir: String,
         service: Option<String>,
     },
-    /// Something we can see but not drive (pm2, screen, a bare process).
     Observed {
         manager: String,
     },
@@ -73,21 +69,15 @@ impl RunBy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManagedService {
-    /// The discovery key, e.g. `systemd:nginx.service`.
     pub key: String,
     pub name: String,
     pub run_by: RunBy,
     pub origin: ServiceOrigin,
     pub adopted_at: i64,
     pub capabilities: Vec<AdoptedCapability>,
-    /// Directories the file browser may reach for this service.
     pub roots: Vec<PathBuf>,
-    /// Config files ServerOS may read (and, with a backup, edit).
     pub config_paths: Vec<PathBuf>,
     pub data_dir: Option<PathBuf>,
-    /// Anything ServerOS added for this service (proxy includes, env
-    /// files, cron entries), removed on un-adoption. Nothing pre-existing
-    /// is ever listed here.
     #[serde(default)]
     pub added_artifacts: Vec<PathBuf>,
 }
@@ -138,8 +128,6 @@ impl<'a> Registry<'a> {
         Ok(removed)
     }
 
-    /// Every root the file layer should permit: managed directories plus
-    /// data directories.
     pub fn permitted_roots(&self) -> Result<Vec<PathBuf>> {
         Ok(self
             .all()?

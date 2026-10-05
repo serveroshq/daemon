@@ -1,14 +1,9 @@
-//! Fetching source by commit SHA into a job workspace. Deploy keys are
-//! generated on the machine and only the public half ever leaves.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use daemon_jobs::{run_child, ChildOutcome, Failure, Progress};
 use tokio::sync::watch;
 
-/// Where per-service deploy keys live: `<keys_dir>/<service>` (0600) and
-/// `<keys_dir>/<service>.pub`.
 pub fn key_paths(keys_dir: &Path, service: &str) -> (PathBuf, PathBuf) {
     let private = keys_dir.join(sanitise(service));
     let public = keys_dir.join(format!("{}.pub", sanitise(service)));
@@ -28,7 +23,6 @@ pub fn sanitise(service: &str) -> String {
         .collect()
 }
 
-/// Generate a deploy key if none exists; return the public key text.
 pub async fn ensure_deploy_key(
     keys_dir: &Path,
     service: &str,
@@ -97,8 +91,6 @@ pub fn valid_repo(url: &str) -> bool {
             || url.starts_with("file://"))
 }
 
-/// Shallow-fetch exactly `commit` from `repo` into `workspace`. Refuses
-/// anything that is not a full commit: branches move, deploys must not.
 pub async fn fetch(
     repo: &str,
     commit: &str,

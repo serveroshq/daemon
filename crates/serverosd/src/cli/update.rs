@@ -1,8 +1,3 @@
-//! `serverosd update`: check the release feed, or install a version
-//! explicitly. Explicit installs override the automatic gate and the
-//! major-jump gate; they never override the signature, a pin, or
-//! `min_from`.
-
 use daemon_core::{BuildInfo, Config, Paths};
 use daemon_http::{Client, Trust};
 use daemon_selfupdate::{decide, install, Candidate, Decision, Policy};

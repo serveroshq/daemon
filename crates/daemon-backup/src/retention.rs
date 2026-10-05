@@ -1,10 +1,5 @@
-//! Conservative pruning: keep the newest `keep`, and never, ever delete
-//! the only remaining snapshot.
-
 use crate::snapshot::Manifest;
 
-/// Snapshots to delete, oldest first. `manifests` must be sorted by
-/// `created_at` ascending.
 pub fn to_prune(manifests: &[Manifest], keep: usize) -> Vec<Manifest> {
     let keep = keep.max(1);
 

@@ -1,5 +1,3 @@
-//! The long-running service: bootstrap, workers, and the control loop.
-
 mod app;
 mod backup_ops;
 mod control;
@@ -28,8 +26,6 @@ use tracing::{error, info, warn};
 
 pub use app::App;
 
-/// Exit code that asks systemd for a plain restart (Restart=always does
-/// it regardless; the code is for humans reading the journal).
 pub const EXIT_RESTART: i32 = 75;
 
 pub fn run(paths: Paths) -> anyhow::Result<()> {
@@ -39,7 +35,6 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
     let build = BuildInfo::current();
     info!("{}", build.banner());
 
-    // Before anything that can hang: is this binary on trial after an update?
     let guard = RollbackGuard {
         binary: paths.binary.clone(),
         state_dir: paths.state_dir.clone(),
@@ -97,7 +92,6 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             }
         }
         broker_state.created.users.push("serveros".into());
-        // The user other machines' backups arrive as, which ServerOS creates.
         broker_state.created.users.push(backup_ops::RECEIVER_USER.into());
         let broker = Arc::new(Broker::new(Arc::clone(&audit), broker_state));
 
@@ -128,7 +122,6 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
             .await;
         }
 
-        // Job updates are durable: they go through the outbox path.
         workers::forward_job_updates(Arc::clone(&app), job_updates_rx);
         workers::forward_streams(Arc::clone(&app));
         workers::spawn_all(Arc::clone(&app));

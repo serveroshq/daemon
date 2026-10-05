@@ -1,6 +1,3 @@
-//! Containers, straight from the Docker socket. A few GETs over the unix
-//! socket; no Docker SDK, no shelling out to the CLI.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -31,8 +28,6 @@ impl Container {
         &self.id[..self.id.len().min(12)]
     }
 
-    /// A manually started container with no restart policy dies with the
-    /// daemon or a reboot; worth calling out before adoption.
     pub fn will_not_survive_reboot(&self) -> bool {
         matches!(self.restart_policy.as_deref(), None | Some("no") | Some(""))
     }
@@ -74,7 +69,6 @@ struct RawMount {
     destination: String,
 }
 
-/// The `/containers/json?all=1` body.
 pub fn parse_containers(body: &str) -> Result<Vec<Container>, serde_json::Error> {
     let raw: Vec<RawContainer> = serde_json::from_str(body)?;
 
@@ -107,7 +101,6 @@ pub fn parse_containers(body: &str) -> Result<Vec<Container>, serde_json::Error>
                 state: c.state,
                 status: c.status,
                 ports,
-                // The list endpoint omits the restart policy; inspect fills it in.
                 restart_policy: None,
                 labels: c.labels,
                 created: c.created,
@@ -116,7 +109,6 @@ pub fn parse_containers(body: &str) -> Result<Vec<Container>, serde_json::Error>
         .collect())
 }
 
-/// `HostConfig.RestartPolicy.Name` from `/containers/<id>/json`.
 pub fn parse_restart_policy(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
 
@@ -135,8 +127,6 @@ pub fn parse_version(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// One GET against the Docker socket. Returns the body, or `None` if
-/// Docker is not there, refuses, or is slow.
 pub async fn get(socket: &Path, path: &str, timeout: Duration) -> Option<String> {
     let work = async {
         let mut stream = tokio::net::UnixStream::connect(socket).await.ok()?;
@@ -196,7 +186,6 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Containers plus the Docker version, or `None` when Docker is absent.
 pub async fn discover(
     socket: &Path,
     timeout: Duration,

@@ -1,9 +1,3 @@
-//! nginx and Apache virtual hosts, from their config files. A small
-//! tokenizer rather than a full grammar: enough for `server_name`,
-//! `listen`, `root`, `proxy_pass`, and the TLS paths, with `include`
-//! expansion bounded to a few hundred files so a pathological config
-//! cannot turn discovery into a filesystem walk.
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -21,10 +15,6 @@ pub struct VirtualHost {
 
 const MAX_INCLUDED_FILES: usize = 400;
 
-// ------------------------------------------------------------------ nginx
-
-/// Parse nginx config text, following `include` directives relative to
-/// `prefix`. `budget` bounds how many files are opened in total.
 pub fn parse_nginx(
     text: &str,
     path: &str,
@@ -63,8 +53,6 @@ pub fn parse_nginx(
                     for pattern in args {
                         for file in expand_include(&pattern, prefix, budget) {
                             if let Ok(inner) = std::fs::read_to_string(&file) {
-                                // Includes inside a server block (snippets) apply to it;
-                                // top-level includes are separate files with their own servers.
                                 if let Some(host) = current.as_mut() {
                                     apply_nginx_snippet(&inner, host);
                                 } else {
@@ -139,8 +127,6 @@ enum NginxItem {
     Directive(String, Vec<String>),
 }
 
-/// Tokenise nginx syntax: `name args... ;` directives, `name args... {`
-/// block openers, `}` closers, `#` comments, single/double quotes.
 fn nginx_statements(text: &str) -> Vec<NginxItem> {
     let mut items = Vec::new();
     let mut tokens: Vec<String> = Vec::new();
@@ -191,8 +177,6 @@ fn nginx_statements(text: &str) -> Vec<NginxItem> {
     items
 }
 
-/// Expand an include pattern (absolute or relative to `prefix`, `*` in the
-/// file name only) into existing files, spending from `budget`.
 fn expand_include(pattern: &str, prefix: &Path, budget: &mut usize) -> Vec<PathBuf> {
     let full = if pattern.starts_with('/') {
         PathBuf::from(pattern)
@@ -244,10 +228,6 @@ fn expand_include(pattern: &str, prefix: &Path, budget: &mut usize) -> Vec<PathB
     files
 }
 
-// ------------------------------------------------------------------ apache
-
-/// Apache `<VirtualHost>` blocks. Directives are one per line, so this is
-/// a line scanner.
 pub fn parse_apache(text: &str, path: &str, hosts: &mut Vec<VirtualHost>) {
     let mut current: Option<VirtualHost> = None;
 
@@ -312,8 +292,6 @@ pub fn parse_apache(text: &str, path: &str, hosts: &mut Vec<VirtualHost>) {
     }
 }
 
-// ------------------------------------------------------------------ entry
-
 pub fn discover() -> Vec<VirtualHost> {
     let mut hosts = Vec::new();
     let mut budget = MAX_INCLUDED_FILES;
@@ -348,7 +326,6 @@ pub fn discover() -> Vec<VirtualHost> {
     hosts
 }
 
-/// Certificate files referenced by any vhost, for the TLS source.
 pub fn certificate_paths(hosts: &[VirtualHost]) -> BTreeSet<String> {
     hosts.iter().filter_map(|h| h.certificate.clone()).collect()
 }

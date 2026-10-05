@@ -1,29 +1,15 @@
-//! Secret redaction, applied at write time. Anything that becomes a log
-//! line, a job update, or a stream frame passes through here before it is
-//! stored or sent, so a leaked token is caught once rather than at every
-//! display surface.
-
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 pub const REDACTED: &str = "[redacted]";
 
-/// Patterns for secrets that show up in build output, env dumps, and
-/// connection strings. Each has a named `secret` group that is replaced;
-/// the surrounding context (the key name, the scheme) stays so the line
-/// still reads.
 static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     [
-        // KEY=value pairs whose key smells like a secret.
         r#"(?i)\b(?P<key>[A-Z0-9_]*(?:secret|token|password|passwd|api[_-]?key|private[_-]?key|access[_-]?key|auth[_-]?key)[A-Z0-9_]*)\s*[=:]\s*(?P<secret>[^\s'"]+)"#,
-        // Bearer / Basic authorization headers.
         r"(?i)\b(?P<key>authorization:\s*(?:bearer|basic))\s+(?P<secret>[A-Za-z0-9\-._~+/]+=*)",
-        // Credentials embedded in URLs: scheme://user:pass@host
         r"(?P<key>[a-z][a-z0-9+.\-]*://[^:/\s]+):(?P<secret>[^@\s]+)@",
-        // Well-known prefixed tokens (GitHub, Stripe-style, AWS access keys).
         r"\b(?P<key>)(?P<secret>(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b",
-        // PEM private key blocks.
         r"(?s)(?P<key>-----BEGIN [A-Z ]*PRIVATE KEY-----)(?P<secret>.*?)(?:-----END [A-Z ]*PRIVATE KEY-----)",
     ]
     .iter()
@@ -31,7 +17,6 @@ static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     .collect()
 });
 
-/// Replace every recognised secret in `input`.
 pub fn redact(input: &str) -> String {
     let mut out = input.to_string();
 
@@ -42,9 +27,6 @@ pub fn redact(input: &str) -> String {
                 let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
                 let secret = caps.name("secret").map(|m| m.as_str()).unwrap_or("");
 
-                // Keep whatever surrounded the secret so the shape of the
-                // line survives (e.g. the `@host` after URL credentials, the
-                // END marker after a PEM block).
                 let start = caps.name("secret").map(|m| m.start()).unwrap_or(0)
                     - caps.get(0).map(|m| m.start()).unwrap_or(0);
                 let tail = &whole[start + secret.len()..];
@@ -62,8 +44,6 @@ pub fn redact(input: &str) -> String {
     out
 }
 
-/// Known secret values (an env file's contents, a deploy key) that must be
-/// scrubbed even where no pattern would catch them.
 pub fn redact_known(input: &str, known: &[&str]) -> String {
     let mut out = redact(input);
 

@@ -1,7 +1,3 @@
-//! Certificates in use: the ones web servers reference plus anything
-//! under Let's Encrypt's live directory. Public halves only; the private
-//! key files are never opened.
-
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -37,7 +33,6 @@ pub fn parse_certificate(pem: &[u8], path: &str) -> Option<CertificateInfo> {
     })
 }
 
-/// A public certificate file. Refuses anything that looks like a key.
 pub fn read_certificate(path: &Path) -> Option<CertificateInfo> {
     let name = path.file_name()?.to_str()?;
 
@@ -54,7 +49,6 @@ pub fn read_certificate(path: &Path) -> Option<CertificateInfo> {
     parse_certificate(&bytes, &path.to_string_lossy())
 }
 
-/// How a Let's Encrypt certificate is renewed, if we can tell.
 pub fn renewal_method(cert_path: &str) -> Option<String> {
     if !cert_path.starts_with("/etc/letsencrypt/") {
         return None;

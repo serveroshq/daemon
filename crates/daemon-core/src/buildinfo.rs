@@ -1,7 +1,3 @@
-//! What build is running. Stamped at compile time from environment
-//! variables the release pipeline sets; falls back to the crate version so
-//! a plain `cargo build` still reports something truthful.
-
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -34,7 +30,6 @@ impl BuildInfo {
         }
     }
 
-    /// `serverosd 0.1.0 (abc1234, stable, linux-amd64)`
     pub fn banner(&self) -> String {
         format!(
             "serverosd {} ({}, {}, {})",
@@ -42,14 +37,11 @@ impl BuildInfo {
         )
     }
 
-    /// The major.minor.patch triple, or zeros for a dev build that carries
-    /// no parseable version.
     pub fn semver(&self) -> (u64, u64, u64) {
         parse_semver(self.version).unwrap_or((0, 0, 0))
     }
 }
 
-/// Parse `1.2.3` or `v1.2.3` (any suffix after the patch is ignored).
 pub fn parse_semver(version: &str) -> Option<(u64, u64, u64)> {
     let trimmed = version.trim().trim_start_matches('v');
     let core = trimmed.split(['-', '+']).next()?;

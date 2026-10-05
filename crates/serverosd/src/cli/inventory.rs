@@ -1,5 +1,3 @@
-//! `serverosd inventory`: a read-only scan, printed for a person.
-
 use daemon_inventory::Scanner;
 
 use super::runtime;

@@ -1,6 +1,3 @@
-//! Machine-level jobs that are small enough to live here: package
-//! updates, reboot, firewall rules, and SSH keys for managed users.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -206,8 +203,6 @@ pub async fn package_updates(
     })
 }
 
-/// Schedule a reboot a few seconds out so the job result reaches the
-/// panel first.
 pub fn reboot_soon() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -225,9 +220,6 @@ pub fn valid_firewall_rule(rule: &str) -> bool {
         })
 }
 
-/// The subset of ufw's rule syntax every backend understands:
-/// `PORT[/PROTO]` or `from CIDR to any port PORT [proto PROTO]`. ufw gets
-/// the rule verbatim; nftables and iptables get this parsed form.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortRule {
     pub port: u16,
@@ -275,7 +267,6 @@ pub fn parse_port_rule(rule: &str) -> Option<PortRule> {
 }
 
 impl PortRule {
-    /// The rule as nftables spells it inside our chain.
     pub fn nft_expression(&self, action: FirewallAction) -> String {
         let verdict = match action {
             FirewallAction::Deny => "drop",
@@ -290,7 +281,6 @@ impl PortRule {
         format!("{source}{} dport {} {verdict}", self.proto, self.port)
     }
 
-    /// iptables arguments after the chain operation.
     pub fn iptables_args(&self, action: FirewallAction) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -431,8 +421,6 @@ async fn firewall_nft(
     let port_rule = parsed(rule)?;
     let expression = port_rule.nft_expression(action);
 
-    // Our own table and chain, created idempotently; nothing of the
-    // operator's is touched.
     let table = format!("add table {NFT_TABLE}");
     let chain = format!(
         "add chain {NFT_TABLE} {NFT_CHAIN} {{ type filter hook input priority 0; policy accept; }}"
@@ -478,8 +466,6 @@ async fn firewall_nft(
     Ok(run(ctx, "nft", &[list.as_str()], 30).await.tail().to_vec())
 }
 
-/// Find the handle of the rule whose text matches, in `nft -a list` output
-/// (`… tcp dport 22 accept # handle 7`).
 pub fn nft_handle(lines: &[String], expression: &str) -> Option<u64> {
     lines.iter().find_map(|line| {
         let (rule, handle) = line.trim().rsplit_once("# handle ")?;

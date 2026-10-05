@@ -1,5 +1,3 @@
-//! Everything the workers, the handler, and the control loop share.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -181,8 +179,6 @@ impl App {
         self.stopping.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Send to the panel. The control loop persists durable kinds when
-    /// the link is down.
     pub async fn send(&self, message: Outbound) {
         let _ = self.outbound.send(message).await;
     }
@@ -202,8 +198,6 @@ impl App {
             .take()
     }
 
-    /// A newly adopted service opens its directories to the file layer
-    /// and the broker.
     pub fn add_roots(&self, roots: &[PathBuf]) {
         for root in roots {
             self.broker.add_root(root.clone());

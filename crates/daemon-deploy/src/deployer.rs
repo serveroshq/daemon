@@ -1,6 +1,3 @@
-//! The orchestration: one deploy, phase by phase, with the old release
-//! kept live until the new one is verified.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +21,7 @@ pub struct DeployResult {
     pub container: String,
     pub port: u16,
     pub domains: Vec<String>,
-    /// The previous release, still on disk for rollback.
     pub previous: Option<String>,
-    /// Plain-language note about any restart the deploy could not avoid.
     pub restart_note: Option<String>,
 }
 
@@ -52,13 +47,10 @@ impl Deployer {
             .join(format!("{}.env", &commit[..commit.len().min(12)]))
     }
 
-    /// The public deploy key for a service, generating one if needed.
     pub async fn deploy_key(&self, service: &str, progress: &Progress) -> Result<String, Failure> {
         git::ensure_deploy_key(&self.keys_dir(), service, progress).await
     }
 
-    /// Write the env file for a release: 0600, owned by the service user
-    /// where one exists (falls back to root, which Docker reads fine).
     fn write_env(
         &self,
         service: &str,
@@ -109,7 +101,6 @@ impl Deployer {
         let commit = spec.commit.clone();
         let previous = ledger.current(&service);
 
-        // 1. Workspace.
         progress.phase("prepare", Some(5)).await;
         let workspace = self.paths.jobs_dir().join(ctx.id.to_string());
         std::fs::create_dir_all(&workspace)
@@ -119,14 +110,11 @@ impl Deployer {
             .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &mut cancel)
             .await;
 
-        // Workspaces are ephemeral; the image holds the release.
         let _ = std::fs::remove_dir_all(&workspace);
 
         match result {
             Ok(result) => Ok(result),
             Err(failure) => {
-                // Whatever happened, the old release is still serving. Clean
-                // up the half-made new one so a retry starts clean.
                 let _ = ledger.mark_failed(&service, &commit);
                 container::remove(&container::container_name(&service, &commit), progress).await;
                 if let Some(prev) = &previous {
@@ -156,9 +144,6 @@ impl Deployer {
         let commit = &spec.commit;
         let step_timeout = ctx.timeout;
 
-        // 2. Source: the repository at the commit, then any files the panel
-        // sent with the job (a template's Compose file, or a Dockerfile for
-        // an app that has none). Template deploys have files and no repo.
         progress.phase("fetch", Some(15)).await;
         if spec.repo.is_empty() {
             if spec.files.is_empty() {
@@ -185,11 +170,9 @@ impl Deployer {
         }
         write_files(workspace, &spec.files)?;
 
-        // 3. Environment, before anything runs.
         progress.phase("env", Some(25)).await;
         let env_file = self.write_env(service, commit, &spec.env)?;
 
-        // Compose projects: one command, an unavoidable restart, said plainly.
         if let Some(compose) = &spec.compose_file {
             progress.phase("build", Some(40)).await;
             let project = format!("serveros-{}", git::sanitise(service));
@@ -204,8 +187,6 @@ impl Deployer {
             )
             .await?;
 
-            // A Compose service that publishes an HTTP port on the host gets
-            // the same checks as a single container: health, then the proxy.
             let host_port = spec.port.filter(|p| *p > 0);
             if let (Some(port), Some(check)) = (host_port, spec.health.as_ref()) {
                 progress.phase("health", Some(70)).await;
@@ -245,7 +226,6 @@ impl Deployer {
             });
         }
 
-        // 4. Build.
         progress.phase("build", Some(40)).await;
         let tag = container::image_tag(service, commit);
         container::build(
@@ -259,7 +239,6 @@ impl Deployer {
         )
         .await?;
 
-        // 5. Start the new release beside the old one.
         progress.phase("start", Some(60)).await;
         let name = container::container_name(service, commit);
         let host_port = releases::port_for(commit);
@@ -277,11 +256,9 @@ impl Deployer {
         )
         .await?;
 
-        // 6. Health.
         progress.phase("health", Some(70)).await;
         health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
 
-        // 7. Proxy swap: validated, reloaded, reverted on failure.
         if !spec.domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
             self.proxy.ensure_installed(cancel, progress).await?;
@@ -291,7 +268,6 @@ impl Deployer {
                 .await?;
         }
 
-        // 8. Verify through the proxy path and record.
         progress.phase("verify", Some(90)).await;
         health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
 
@@ -308,7 +284,6 @@ impl Deployer {
             .promote(service, release, RETAINED_RELEASES)
             .map_err(|e| Failure::new("record", e.to_string()))?;
 
-        // 9. Drain and stop the old release; keep it for rollback.
         if let Some(prev) = previous {
             progress.phase("drain", Some(95)).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -341,8 +316,6 @@ impl Deployer {
         })
     }
 
-    /// Roll back to `target` (or the most recent standby): start it,
-    /// check it, re-point the proxy, stop the current.
     pub async fn rollback(
         &self,
         ctx: &JobContext,
@@ -426,12 +399,9 @@ impl Deployer {
     }
 }
 
-/// Most files one job may carry, and the most bytes in any one of them.
 const MAX_JOB_FILES: usize = 64;
 const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 
-/// Write the job's files into the workspace. Paths must be plain relative
-/// paths (no `..`, no absolute paths), so nothing lands outside it.
 fn write_files(
     workspace: &Path,
     files: &std::collections::BTreeMap<String, String>,

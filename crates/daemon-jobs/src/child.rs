@@ -1,7 +1,3 @@
-//! Running an external program for a job: output streamed line by line
-//! into the job log, a hard timeout, and the child killed (with its
-//! process group) when the deadline or a cancellation arrives.
-
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -14,17 +10,9 @@ use crate::progress::Progress;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildOutcome {
-    Exited {
-        code: i32,
-        tail: Vec<String>,
-    },
-    TimedOut {
-        tail: Vec<String>,
-    },
-    Cancelled {
-        tail: Vec<String>,
-    },
-    /// The program could not be started at all.
+    Exited { code: i32, tail: Vec<String> },
+    TimedOut { tail: Vec<String> },
+    Cancelled { tail: Vec<String> },
     Unstartable(String),
 }
 
@@ -45,8 +33,6 @@ impl ChildOutcome {
 
 const TAIL_LINES: usize = 40;
 
-/// Run `program args` in `cwd` with `env` on top of a minimal environment.
-/// Lines from stdout and stderr go to `progress` as they arrive.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_child(
     program: &str,
@@ -80,7 +66,6 @@ pub async fn run_child(
 
     #[cfg(unix)]
     {
-        // Own process group, so killing the child kills what it spawned.
         command.process_group(0);
 
         if let Some((uid, gid)) = run_as {
@@ -139,7 +124,6 @@ pub async fn run_child(
                     batch.push(line);
                 }
                 None => {
-                    // Output closed; wait for the exit status.
                     if status.is_none() {
                         status = Some(child.wait().await.ok());
                     }
@@ -166,7 +150,6 @@ pub async fn run_child(
         }
     }
 
-    // Drain anything still buffered.
     while let Ok(line) = line_rx.try_recv() {
         if tail.len() == TAIL_LINES {
             tail.pop_front();

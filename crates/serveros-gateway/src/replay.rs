@@ -1,7 +1,3 @@
-//! A stream that first replays bytes already read from it. The internal
-//! listener reads the request head to route it, then hands the socket to
-//! the WebSocket handshake, which expects to read that head itself.
-
 use std::pin::Pin;
 use std::task::{Context, Poll};
 

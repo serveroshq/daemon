@@ -1,7 +1,3 @@
-//! Uploading a snapshot to S3-compatible storage with a hand-rolled
-//! SigV4 PUT. Credentials arrive from the panel per job (decrypted in
-//! transit), live in memory for the upload, and are never written.
-
 use std::path::Path;
 
 use daemon_http::{Client, Trust};
@@ -13,13 +9,11 @@ type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct S3Target {
-    /// e.g. `s3.eu-west-2.amazonaws.com` or `fsn1.your-objectstorage.com`
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
-    /// Path-style (`endpoint/bucket/key`) for most non-AWS stores.
     pub path_style: bool,
 }
 
@@ -70,9 +64,6 @@ fn uri_encode(input: &str) -> String {
     out
 }
 
-/// The headers for a SigV4-signed PUT of `body` to `key`, computed for
-/// `timestamp` (`YYYYMMDDTHHMMSSZ`). Split out so it can be checked
-/// against a known vector without a network.
 pub fn sign_put(
     target: &S3Target,
     key: &str,
@@ -110,7 +101,6 @@ pub fn sign_put(
     ]
 }
 
-/// Upload one file. Returns the object URL on success.
 pub async fn upload(
     target: &S3Target,
     key: &str,

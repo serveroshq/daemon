@@ -1,15 +1,3 @@
-//! One daemon connection, from TLS accept to hang-up.
-//!
-//! 1. Finish the mutual-TLS handshake and read the certificate serial.
-//! 2. Accept the WebSocket upgrade on `/daemon/control`.
-//! 3. Wait for the daemon's `Hello`, ask the panel who the serial is, and
-//!    answer with the panel's `HelloAck` (or close with the refusal code).
-//! 4. Relay: daemon frames are batched to the panel once a second; stream
-//!    frames go straight to an attached browser; commands from the
-//!    internal API are sequenced and written to the socket.
-//! 5. On any exit, unregister and tell the panel the machine closed.
-
-// tungstenite's handshake callbacks return its own (large) error response type.
 #![allow(clippy::result_large_err)]
 
 use std::net::SocketAddr;
@@ -33,9 +21,7 @@ use crate::{tls, Context};
 
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
-/// Daemons drop a link silent for 45 seconds; ping well inside that.
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-/// Daemons heartbeat every 10 seconds; six missed is dead.
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(60);
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const FLUSH_AT: usize = 200;
@@ -72,7 +58,6 @@ pub async fn serve(tcp: TcpStream, peer: SocketAddr, acceptor: TlsAcceptor, ctx:
     let (mut sink, mut stream) = socket.split();
     let mut sequencer = Sequencer::new();
 
-    // Step 3: Hello.
     let hello_env = match tokio::time::timeout(HELLO_TIMEOUT, first_text(&mut stream)).await {
         Ok(Some(text)) => match Envelope::decode(&text) {
             Ok(env) if env.kind == Kind::Hello => env,
@@ -170,8 +155,6 @@ pub async fn serve(tcp: TcpStream, peer: SocketAddr, acceptor: TlsAcceptor, ctx:
 
     info!(%uid, %serial, version = %hello.daemon_version, major, %peer, "daemon connected");
 
-    // Uplink: batches leave the read loop through a channel so a slow
-    // panel never stalls the socket.
     let (batch_tx, mut batch_rx) = mpsc::channel::<Vec<Envelope>>(64);
     let uplink_ctx = Arc::clone(&ctx);
     let uplink_uid = uid.clone();

@@ -2,54 +2,31 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-/// One message on the control channel, in either direction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Envelope {
-    /// Protocol major version the payload conforms to.
     pub v: u16,
-    /// Monotonic per-connection sequence. Gaps mean loss; the receiver
-    /// asks for a backfill rather than pretending nothing happened.
     pub seq: u64,
-    /// Unique per message; for commands this is the job id, and re-delivery
-    /// of the same id returns the stored result.
     pub id: Uuid,
-    /// Unix seconds when the sender created the message.
     pub ts: i64,
     pub kind: Kind,
-    /// The kind-specific body. Decoded by the negotiated driver.
     pub payload: serde_json::Value,
 }
 
-/// Message classes. The direction is a convention, enforced by which side
-/// bothers to handle each kind.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
-    /// Daemon → panel on connect: identity, version, supported majors.
     Hello,
-    /// Panel → daemon: the negotiated major and panel capabilities.
     HelloAck,
-    /// Daemon → panel every 10 seconds: liveness, version, uptime.
     Heartbeat,
-    /// Daemon → panel: machine and service metrics.
     Telemetry,
-    /// Daemon → panel: discovered services and changes.
     Inventory,
-    /// Daemon → panel: something happened (crash, disk, update available).
     Event,
-    /// Panel → daemon: a durable job to run.
     Command,
-    /// Daemon → panel: accepted, progress, log lines, terminal result.
     JobUpdate,
-    /// Bidirectional: PTY and live log frames.
     Stream,
-    /// Panel → daemon: self-update, reconfigure, disconnect.
     Control,
-    /// Either direction: the peer noticed a sequence gap.
     Gap,
-    /// Daemon → panel: machine facts changed since `Hello` (added in 1.1).
     Facts,
-    /// Daemon → panel: service log lines (added in 1.2).
     Logs,
 }
 
@@ -79,8 +56,6 @@ impl Envelope {
     }
 }
 
-/// Hands out sequence numbers for one connection and spots gaps on the
-/// way in.
 #[derive(Debug, Default)]
 pub struct Sequencer {
     next_out: u64,
@@ -98,8 +73,6 @@ impl Sequencer {
         seq
     }
 
-    /// Record an incoming sequence number. Returns the range that went
-    /// missing when the number jumped, so the caller can ask for it.
     pub fn observe(&mut self, seq: u64) -> Option<std::ops::Range<u64>> {
         let gap = match self.last_in {
             Some(last) if seq > last + 1 => Some(last + 1..seq),
@@ -147,7 +120,6 @@ mod tests {
         assert_eq!(seq.observe(1), None);
         assert_eq!(seq.observe(4), Some(2..4));
         assert_eq!(seq.observe(5), None);
-        // A late duplicate never moves the high-water mark backwards.
         assert_eq!(seq.observe(3), None);
         assert_eq!(seq.observe(6), None);
     }

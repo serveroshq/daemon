@@ -1,6 +1,3 @@
-//! systemd units, via `systemctl` output. Read-only: `list-units` and
-//! `show`, nothing else.
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -23,8 +20,6 @@ pub struct Unit {
 }
 
 impl Unit {
-    /// Whether a person wrote this unit, as opposed to a distro package.
-    /// Distro units live under `/lib` or `/usr/lib`; local ones under `/etc`.
     pub fn user_created(&self) -> bool {
         self.fragment_path
             .as_deref()
@@ -36,7 +31,6 @@ impl Unit {
     }
 }
 
-/// `systemctl list-units --type=service --all --no-legend --plain`
 pub fn parse_list_units(text: &str) -> Vec<Unit> {
     text.lines()
         .filter_map(|line| {
@@ -63,7 +57,6 @@ pub fn parse_list_units(text: &str) -> Vec<Unit> {
         .collect()
 }
 
-/// `systemctl show <unit> -p ...` key=value lines.
 pub fn parse_show(text: &str) -> BTreeMap<String, String> {
     text.lines()
         .filter_map(|l| l.split_once('='))
@@ -71,7 +64,6 @@ pub fn parse_show(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// systemd renders ExecStart as `{ path=/usr/sbin/nginx ; argv[]=/usr/sbin/nginx -g daemon off; ... }`.
 pub fn exec_start_command(raw: &str) -> Option<String> {
     if let Some(argv) = raw.split("argv[]=").nth(1) {
         let cmd = argv.split(" ; ").next()?.trim();
@@ -113,7 +105,6 @@ pub fn apply_show(unit: &mut Unit, props: &BTreeMap<String, String>) {
         .is_some_and(|v| v == "enabled" || v == "static" || v == "enabled-runtime");
 }
 
-/// Drop every `(...)` group: systemd annotates list values with them.
 fn strip_parenthesised(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut depth = 0usize;
@@ -132,8 +123,6 @@ fn strip_parenthesised(text: &str) -> String {
 
 const SHOW_PROPERTIES: &str = "ExecStart,WorkingDirectory,User,EnvironmentFiles,FragmentPath,MainPID,NRestarts,UnitFileState,ActiveState,SubState";
 
-/// Units systemd itself owns, which discovery lists but never proposes
-/// for adoption.
 pub fn is_system_plumbing(name: &str) -> bool {
     const PREFIXES: &[&str] = &[
         "systemd-",
@@ -160,7 +149,6 @@ pub fn is_system_plumbing(name: &str) -> bool {
     PREFIXES.iter().any(|p| name.starts_with(p)) || name.starts_with("session-")
 }
 
-/// Every service unit with its details. `None` when systemd is absent.
 pub async fn discover(timeout: Duration) -> Option<Vec<Unit>> {
     let listing = exec::output(
         "systemctl",
@@ -177,13 +165,11 @@ pub async fn discover(timeout: Duration) -> Option<Vec<Unit>> {
     .await?;
     let mut units = parse_list_units(&listing);
 
-    // One `show` call for all units keeps this to two processes total.
     let names: Vec<&str> = units.iter().map(|u| u.name.as_str()).collect();
     let mut args = vec!["show", "-p", SHOW_PROPERTIES, "--no-pager"];
     args.extend(names.iter().copied());
 
     if let Some(shown) = exec::output("systemctl", &args, timeout).await {
-        // Blocks are separated by blank lines, in the order requested.
         for (unit, block) in units.iter_mut().zip(shown.split("\n\n")) {
             apply_show(unit, &parse_show(block));
         }

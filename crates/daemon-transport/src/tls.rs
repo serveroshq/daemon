@@ -1,7 +1,3 @@
-//! Mutual TLS: our certificate to the panel, the pinned CA for the panel.
-//! No system roots are consulted; a panel certificate not signed by the
-//! CA we were given at enrolment is a hard failure.
-
 use std::sync::Arc;
 
 use daemon_identity::{Identity, IdentityError};

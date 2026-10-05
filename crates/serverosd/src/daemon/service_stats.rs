@@ -1,12 +1,3 @@
-//! Per-service usage: CPU, memory, processes, network, uptime and restarts
-//! for each Docker container and running systemd service, keyed exactly as
-//! discovery keys them (`docker:<short id>`, `systemd:<unit>`) so the panel
-//! can put the numbers next to each discovered service.
-//!
-//! CPU is a share of the whole machine (0-100, like the machine sample), not
-//! Docker's per-core percentage. Sent every 15 seconds as telemetry samples
-//! with `service` set, outside the machine-sample downsampling.
-
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +9,6 @@ use tokio::process::Command;
 
 use super::app::App;
 
-/// When a service last started (unix seconds) and how often it restarted.
 type Started = (Option<i64>, Option<u32>);
 
 const EVERY: Duration = Duration::from_secs(15);
@@ -48,8 +38,6 @@ pub async fn run(app: Arc<App>) {
         }
     }
 }
-
-/* ------------------------------------------------------------- docker */
 
 async fn docker_samples(
     now: i64,
@@ -93,8 +81,6 @@ async fn docker_samples(
     rows.into_iter()
         .map(|row| {
             let (started_at, restarts) = started.get(&row.id).copied().unwrap_or((None, None));
-            // Read the container's cgroup when we can find it: exact, and it
-            // still works where `docker stats` reports zeros (nested Docker).
             let cgroup = container_cgroup(&row.id).and_then(|dir| {
                 cgroup_usage(&dir, &format!("docker:{}", row.id), cores, at, previous)
             });
@@ -140,7 +126,6 @@ struct DockerStat {
     pids: u32,
 }
 
-/// One line of `docker stats --format '{{json .}}'`.
 fn parse_docker_stat(line: &str) -> Option<DockerStat> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let field = |name: &str| v.get(name).and_then(|x| x.as_str()).unwrap_or("");
@@ -163,13 +148,11 @@ fn parse_docker_stat(line: &str) -> Option<DockerStat> {
     .filter(|s| !s.id.is_empty())
 }
 
-/// "9.1MiB / 7.66GiB" → (bytes, bytes).
 fn pair(text: &str) -> (u64, u64) {
     let mut parts = text.split('/').map(|p| parse_size(p.trim()));
     (parts.next().unwrap_or(0), parts.next().unwrap_or(0))
 }
 
-/// Docker's human sizes: "0B", "1.05kB", "9.1MiB", "7.66GiB".
 fn parse_size(text: &str) -> u64 {
     let split = text
         .find(|c: char| c.is_ascii_alphabetic())
@@ -191,7 +174,6 @@ fn parse_size(text: &str) -> u64 {
     (number * multiplier) as u64
 }
 
-/// "<full id> 2026-10-04T21:44:15.123456789Z 0" → (id, (started, restarts)).
 fn parse_docker_inspect(line: &str) -> Option<(String, Started)> {
     let mut parts = line.split_whitespace();
     let id = parts.next()?.to_string();
@@ -205,8 +187,6 @@ fn parse_docker_inspect(line: &str) -> Option<(String, Started)> {
 
     Some((id, (started, restarts)))
 }
-
-/* ------------------------------------------------------------- systemd */
 
 async fn systemd_samples(
     now: i64,
@@ -268,7 +248,6 @@ async fn systemd_samples(
     samples
 }
 
-/// A container's cgroup v2 directory, under the systemd or cgroupfs driver.
 fn container_cgroup(id: &str) -> Option<std::path::PathBuf> {
     [
         Path::new(SYSTEMD_SLICE).join(format!("docker-{id}.scope")),
@@ -285,8 +264,6 @@ struct CgroupUsage {
     pids: u32,
 }
 
-/// Usage from a cgroup v2 directory. CPU is the share of the machine since
-/// the last reading (`previous`, keyed by `id`); the first reading is 0%.
 fn cgroup_usage(
     dir: &Path,
     id: &str,
@@ -318,20 +295,16 @@ fn cgroup_usage(
     })
 }
 
-/// `usage_usec` from a cgroup v2 cpu.stat.
 fn parse_cpu_usage_usec(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|line| line.strip_prefix("usage_usec "))
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// A cgroup number file; "max" (no limit) reads as None.
 fn read_number(path: &Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// `systemctl show` blocks for several units → unit → (started, restarts).
-/// The start time comes from the monotonic timestamp and /proc/uptime.
 fn parse_systemctl_show(
     text: &str,
     now: i64,
@@ -369,8 +342,6 @@ fn parse_systemctl_show(
     out
 }
 
-/* ------------------------------------------------------------- shared */
-
 struct ServiceUsage {
     ts: i64,
     key: String,
@@ -384,7 +355,6 @@ struct ServiceUsage {
     restarts: Option<u32>,
 }
 
-/// A telemetry sample for one service. Machine-only fields stay empty.
 fn service_sample(u: ServiceUsage) -> Sample {
     Sample {
         ts: u.ts,
@@ -409,7 +379,6 @@ fn service_sample(u: ServiceUsage) -> Sample {
     }
 }
 
-/// A command's stdout, or None if it isn't installed or fails.
 async fn output(program: &str, args: &[&str]) -> Option<String> {
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -452,7 +421,6 @@ mod tests {
         assert_eq!(started, Some(1_791_150_255));
         assert_eq!(restarts, Some(2));
 
-        // Never-started containers report the zero time.
         let (_, (started, _)) = parse_docker_inspect("abc 0001-01-01T00:00:00Z 0").unwrap();
         assert_eq!(started, None);
     }
@@ -462,7 +430,6 @@ mod tests {
         let text = "Id=nginx.service\nActiveEnterTimestampMonotonic=5000000\nNRestarts=1\n\nId=cron.service\nActiveEnterTimestampMonotonic=0\nNRestarts=0\n";
         let parsed = parse_systemctl_show(text, 1_000, Some(105.0));
 
-        // Up 105 s, started 5 s after boot → started 100 s ago.
         assert_eq!(parsed["nginx.service"], (Some(900), Some(1)));
         assert_eq!(parsed["cron.service"], (None, Some(0)));
     }

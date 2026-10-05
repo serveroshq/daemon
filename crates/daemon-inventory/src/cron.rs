@@ -1,5 +1,3 @@
-//! Scheduled work: system and per-user crontabs, and systemd timers.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -7,8 +5,6 @@ use daemon_protocol::ScheduledTask;
 
 use crate::exec;
 
-/// A crontab. `system` crontabs (`/etc/crontab`, `/etc/cron.d/*`) carry a
-/// user column; per-user ones do not.
 pub fn parse_crontab(
     text: &str,
     source: &str,
@@ -47,9 +43,6 @@ pub fn parse_crontab(
         .collect()
 }
 
-/// `systemctl list-timers --all --no-legend --plain`: columns are NEXT LEFT
-/// LAST PASSED UNIT ACTIVATES, with dates containing spaces; anchor on the
-/// `.timer` token.
 pub fn parse_list_timers(text: &str) -> Vec<ScheduledTask> {
     text.lines()
         .filter_map(|line| {
@@ -128,7 +121,6 @@ pub async fn discover(timeout: Duration) -> Vec<ScheduledTask> {
     tasks
 }
 
-/// Whether ServerOS wrote this cron entry (it tags its own).
 pub fn is_ours(task: &ScheduledTask) -> bool {
     task.command.contains("serverosd") || task.source.contains("serveros")
 }

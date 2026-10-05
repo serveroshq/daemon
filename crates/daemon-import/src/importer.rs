@@ -1,5 +1,3 @@
-//! The import flow the panel drives: scan, preview, adopt, un-adopt.
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,8 +13,6 @@ use crate::enrich::{self, DataDirInfo};
 use crate::history::History;
 use crate::{ImportError, Result};
 
-/// What the panel gets after adoption: the ledger row plus the roots that
-/// just opened up, so the caller can tell the broker.
 #[derive(Debug, Clone, Serialize)]
 pub struct ImportOutcome {
     pub managed: ManagedService,
@@ -27,7 +23,6 @@ pub struct ImportOutcome {
 pub struct Importer {
     state: Arc<State>,
     scanner: Scanner,
-    /// Mount points from machine facts, for the data-directory notes.
     pub mounts: Vec<PathBuf>,
 }
 
@@ -40,8 +35,6 @@ impl Importer {
         }
     }
 
-    /// A full scan, enriched, remembered, and diffed against the last one.
-    /// Returns the report and the change events to raise.
     pub async fn scan(&self) -> Result<(InventoryReport, Vec<Event>)> {
         let mut report = self.scanner.scan().await;
         let history = History::new(&self.state);
@@ -58,7 +51,6 @@ impl Importer {
 
             if let Some(origin) = managed.get(&service.key) {
                 service.details.insert("managed".into(), "true".into());
-                // Say so when ServerOS created it, e.g. from a deploy.
                 if *origin == ServiceOrigin::Created {
                     service.origin = ServiceOrigin::Created;
                 }
@@ -118,7 +110,6 @@ impl Importer {
         }
     }
 
-    /// The last scan's view of one service.
     pub fn find(&self, key: &str) -> Result<DiscoveredService> {
         History::new(&self.state)
             .last_report()?
@@ -141,9 +132,6 @@ impl Importer {
         Ok(preview)
     }
 
-    /// Adopt. Nothing about the service changes: no restart, no reload,
-    /// no config rewrite. The registry gains a row and the broker gains
-    /// roots.
     pub fn adopt(&self, key: &str, now: i64) -> Result<ImportOutcome> {
         let registry = Registry::new(&self.state);
 
@@ -170,8 +158,6 @@ impl Importer {
         })
     }
 
-    /// Reverse an adoption. Returns the ServerOS-added artifacts that were
-    /// removed, so the job result can list them.
     pub fn unadopt(&self, key: &str) -> Result<Vec<PathBuf>> {
         let registry = Registry::new(&self.state);
 

@@ -1,5 +1,3 @@
-//! The local control socket: root-only, answers `status` for the CLI.
-
 use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

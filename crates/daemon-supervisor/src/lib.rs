@@ -1,22 +1,12 @@
-//! The supervisor watches the daemon itself: its memory, whether each
-//! worker is still ticking, whether the panel has been unreachable for a
-//! suspiciously long time, and whether the clock agrees with the panel's.
-//! It restarts workers before it restarts the process, and turns crash
-//! loops into events rather than silence.
-
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use daemon_protocol::{Event, EventKind, Severity};
 
-/// Idle budget from the spec: under 30 MB RSS. The supervisor warns at
-/// twice that and asks for a restart at four times.
 pub const RSS_WARN_BYTES: u64 = 60 * 1024 * 1024;
 pub const RSS_RESTART_BYTES: u64 = 120 * 1024 * 1024;
-/// A worker that has not ticked for this long is wedged.
 pub const WORKER_STALL: Duration = Duration::from_secs(120);
-/// Panel-reported time drifting further than this is worth an event.
 pub const CLOCK_SKEW_LIMIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +33,6 @@ impl Supervisor {
         Self::default()
     }
 
-    /// Workers call this on every loop iteration.
     pub fn tick(&self, worker: &'static str) {
         self.ticks
             .lock()
@@ -51,9 +40,6 @@ impl Supervisor {
             .insert(worker, Instant::now());
     }
 
-    /// Sleep between rounds of work while still ticking, so a worker that
-    /// runs hourly (discovery) isn't mistaken for a wedged one after
-    /// `WORKER_STALL` and the whole daemon restarted, mid-deploy.
     pub async fn idle(&self, worker: &'static str, total: Duration) {
         let heartbeat = WORKER_STALL / 4;
         let mut remaining = total;
@@ -85,8 +71,6 @@ impl Supervisor {
             .collect()
     }
 
-    /// Record a worker restart; too many in a short window means the
-    /// process itself should be restarted by systemd.
     pub fn record_worker_restart(&self) -> usize {
         let mut restarts = self.restarts.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
@@ -95,7 +79,6 @@ impl Supervisor {
         restarts.len()
     }
 
-    /// One pass. `rss` is the process's resident set in bytes.
     pub fn assess(&self, rss: u64) -> Verdict {
         if rss > RSS_RESTART_BYTES {
             return Verdict::RestartProcess(format!(
@@ -117,7 +100,6 @@ impl Supervisor {
         Verdict::Fine
     }
 
-    /// Events worth raising from one pass, rate-limited by the caller.
     pub fn events(&self, rss: u64, panel_ts: Option<i64>, now_ts: i64) -> Vec<Event> {
         let mut events = Vec::new();
 
@@ -161,7 +143,6 @@ impl Supervisor {
     }
 }
 
-/// Resident set size of this process, from `/proc/self/status`.
 pub fn own_rss() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
 
@@ -172,16 +153,11 @@ pub fn own_rss() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
-/// Crash-loop bookkeeping across process restarts: a small file with the
-/// last few start times. Systemd restarts us; this notices when it keeps
-/// having to.
 pub struct StartHistory {
     pub path: std::path::PathBuf,
 }
 
 impl StartHistory {
-    /// Record this start and return how many starts happened in the last
-    /// ten minutes, including this one.
     pub fn record(&self, now_ts: i64) -> usize {
         let mut starts: Vec<i64> = std::fs::read_to_string(&self.path)
             .ok()

@@ -1,7 +1,3 @@
-//! The broker. Every privileged operation is a [`Request`] that becomes a
-//! [`Grant`] or a [`Denied`]; a grant is the only way to reach the code
-//! that does the work, and both outcomes are written to actions.log.
-
 use std::sync::{Arc, RwLock};
 
 use daemon_audit::{Actor, AuditLog, Entry, Outcome};
@@ -15,12 +11,9 @@ use crate::roots::PermittedRoots;
 pub struct Request {
     pub actor: Actor,
     pub operation: Operation,
-    /// The panel forwarded a confirmed, user-initiated instruction.
     pub confirmed: bool,
 }
 
-/// Proof that a request was authorised. Carries what the executor needs
-/// and the audit handle so the outcome gets logged.
 pub struct Grant {
     pub request: Request,
     audit: Arc<AuditLog>,
@@ -36,7 +29,6 @@ impl std::fmt::Debug for Grant {
 }
 
 impl Grant {
-    /// Log the outcome. Consumes the grant: an operation reports once.
     pub fn finish<E: std::fmt::Display>(self, result: &Result<(), E>, note: Option<&str>) {
         let duration = Some(self.started.elapsed());
         let (outcome, message) = match result {
@@ -68,8 +60,6 @@ pub struct Denied {
     pub explanation: String,
 }
 
-/// Live state the policy checks read: roots grow as services are adopted,
-/// read-only mode flips from the panel.
 #[derive(Debug, Default)]
 pub struct BrokerState {
     pub roots: PermittedRoots,
@@ -132,9 +122,6 @@ impl Broker {
             .push(user);
     }
 
-    /// Decide. The start line is written for grants; refusals get their
-    /// own line with the reason, so a refused request is as visible as a
-    /// granted one.
     pub fn authorize(&self, request: Request) -> Result<Grant, Denied> {
         let state = self.state.read().unwrap_or_else(|p| p.into_inner());
 

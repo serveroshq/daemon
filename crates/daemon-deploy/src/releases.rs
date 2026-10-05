@@ -1,6 +1,3 @@
-//! What was deployed, per service, in `state.db`. The ledger is the truth
-//! about which container the proxy should point at.
-
 use daemon_state::State;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +8,6 @@ pub struct Release {
     pub container: String,
     pub port: u16,
     pub deployed_at: i64,
-    /// `live`, `standby` (stopped, kept for rollback), `failed`.
     pub status: String,
 }
 
@@ -55,7 +51,6 @@ impl<'a> ReleaseLedger<'a> {
             .and_then(|c| all.releases.iter().find(|r| &r.commit == c).cloned())
     }
 
-    /// The most recent standby release, for rollback.
     pub fn previous(&self, service: &str) -> Option<Release> {
         let all = self.load(service);
         all.releases
@@ -65,8 +60,6 @@ impl<'a> ReleaseLedger<'a> {
             .cloned()
     }
 
-    /// Record a release as live, demote the old current to standby, and
-    /// return the releases that fell off the retention window.
     pub fn promote(
         &self,
         service: &str,
@@ -112,9 +105,6 @@ impl<'a> ReleaseLedger<'a> {
     }
 }
 
-/// A stable port for a release, derived from the commit so re-deploying
-/// the same commit lands on the same port. Range 20000-29999 avoids the
-/// common service ports.
 pub fn port_for(commit: &str) -> u16 {
     let hash = commit
         .bytes()

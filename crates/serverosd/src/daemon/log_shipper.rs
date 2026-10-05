@@ -1,10 +1,3 @@
-//! Shipping service logs to the panel, which keeps them and makes them
-//! searchable. Every running container is followed with `docker logs -f`,
-//! and the systemd services discovery found are followed together through
-//! one `journalctl -f -o json`. Lines are redacted, capped per service,
-//! batched, and sent as `logs` messages while the link is up; lines written
-//! while it is down are not kept (the services' own logs still have them).
-
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,15 +19,10 @@ use tracing::debug;
 
 use super::app::App;
 
-/// How often the set of followed services is brought up to date.
 const RECONCILE_EVERY: Duration = Duration::from_secs(10);
-/// A batch goes out when it is this big or this old.
 const BATCH_LINES: usize = 500;
 const BATCH_EVERY: Duration = Duration::from_secs(2);
-/// Longer lines are cut, with a marker.
 const MAX_LINE_BYTES: usize = 8 * 1024;
-/// Logs from a container's first moments, for one that appears between
-/// two reconciles.
 const NEW_CONTAINER_LOOKBACK_MS: i64 = 30_000;
 
 pub async fn run(app: Arc<App>) {
@@ -66,7 +54,6 @@ pub async fn run(app: Arc<App>) {
         tick.tick().await;
         app.supervisor.tick("log_shipper");
 
-        // Containers.
         if let Some(running) = running_containers().await {
             containers.retain(|id, task| {
                 let keep = running.contains_key(id) && !task.is_finished();
@@ -89,7 +76,6 @@ pub async fn run(app: Arc<App>) {
             }
         }
 
-        // systemd services, as discovery last saw them.
         let units = systemd_units(&app);
         let current = journal
             .as_ref()
@@ -121,15 +107,10 @@ struct Shipper {
     tx: mpsc::Sender<LogEntry>,
     cap: usize,
     dropped: Arc<AtomicU64>,
-    /// The newest line shipped per service, unix ms, so a restarted follow
-    /// picks up where the last one stopped.
     cursors: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 impl Shipper {
-    /// Where to start following `key`: after its last shipped line; now,
-    /// for what was already running when the daemon started; a little
-    /// earlier for something new, so its start-up lines aren't missed.
     fn since(&self, key: &str, at_start: bool) -> i64 {
         let now = now_ms();
         match self.cursors.lock().unwrap().get(key) {
@@ -173,7 +154,6 @@ impl Shipper {
             ))
         });
 
-        // Abort reaches here: the readers go with the child.
         struct Guard(Vec<JoinHandle<()>>);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -273,7 +253,6 @@ impl Shipper {
         let _ = child.wait().await;
     }
 
-    /// Queue one line. False once the batcher is gone.
     #[allow(clippy::too_many_arguments)]
     async fn ship(
         &self,
@@ -330,7 +309,6 @@ impl Shipper {
     }
 }
 
-/// Collects lines and sends them in batches while the panel is connected.
 async fn batcher(app: Arc<App>, mut rx: mpsc::Receiver<LogEntry>, dropped: Arc<AtomicU64>) {
     let mut pending: Vec<LogEntry> = Vec::new();
     let mut tick = tokio::time::interval(BATCH_EVERY);
@@ -363,7 +341,6 @@ async fn batcher(app: Arc<App>, mut rx: mpsc::Receiver<LogEntry>, dropped: Arc<A
     }
 }
 
-/// The running containers, short id to name, or None when Docker can't say.
 async fn running_containers() -> Option<BTreeMap<String, String>> {
     let ps = Command::new("docker")
         .args(["ps", "--format", "{{.ID}} {{.Names}}"])
@@ -371,7 +348,6 @@ async fn running_containers() -> Option<BTreeMap<String, String>> {
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    // A wedged Docker must not wedge the worker.
     let output = tokio::time::timeout(Duration::from_secs(5), ps)
         .await
         .ok()?
@@ -392,7 +368,6 @@ async fn running_containers() -> Option<BTreeMap<String, String>> {
     )
 }
 
-/// Running systemd services from discovery's last report.
 fn systemd_units(app: &App) -> BTreeSet<String> {
     let Ok(Some(report)) = History::new(&app.state).last_report() else {
         return BTreeSet::new();
@@ -408,7 +383,6 @@ fn systemd_units(app: &App) -> BTreeSet<String> {
         .collect()
 }
 
-/// `docker logs --timestamps` puts an RFC 3339 time and a space first.
 fn split_docker_timestamp(raw: &str) -> (Option<i64>, &str) {
     if let Some((stamp, rest)) = raw.split_once(' ') {
         if let Ok(at) = OffsetDateTime::parse(stamp, &Rfc3339) {
@@ -431,7 +405,6 @@ fn parse_journal(raw: &str) -> Option<JournalLine> {
     let text = |field: &str| value.get(field).and_then(|v| v.as_str());
 
     let unit = text("_SYSTEMD_UNIT").or_else(|| text("UNIT"))?.to_string();
-    // journald sends non-UTF-8 messages as an array of bytes.
     let message = match value.get("MESSAGE")? {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Array(bytes) => {

@@ -1,6 +1,3 @@
-//! The telemetry ring buffer. Samples land here first; the panel gets
-//! them live when connected and as a backfill when it comes back.
-
 use rusqlite::params;
 
 use crate::{Result, State};
@@ -23,8 +20,6 @@ impl State {
         })
     }
 
-    /// Samples in `[from_ts, to_ts]`, newest first, capped at `limit` so a
-    /// backfill request for a whole day comes back in pages.
     pub fn samples_between(
         &self,
         from_ts: i64,
@@ -52,7 +47,6 @@ impl State {
         })
     }
 
-    /// Enforce the retention window. Returns how many rows went.
     pub fn prune_samples(&self, before_ts: i64) -> Result<usize> {
         self.with(|c| Ok(c.execute("DELETE FROM samples WHERE ts < ?1", params![before_ts])?))
     }

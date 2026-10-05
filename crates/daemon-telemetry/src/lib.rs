@@ -1,16 +1,3 @@
-//! What the machine is doing, sampled every 10 seconds.
-//!
-//! The readers are pure functions over the text procfs gives us, so they
-//! are tested against fixtures on any platform; only [`platform`] touches
-//! the real files, and only on Linux. Samples go into the ring buffer in
-//! `state.db`, are aggregated to one-minute points for transmission, and
-//! feed [`signals`], which turns trends into events.
-//!
-//! Telemetry never collects application data, database contents, file
-//! contents, environment values, process memory, or network payloads.
-//! There is no code path here that could: the readers only open the
-//! `/proc` and `/sys` files named in [`platform`].
-
 pub mod aggregate;
 pub mod collector;
 pub mod facts;

@@ -1,9 +1,3 @@
-//! The daemon makes exactly two kinds of plain HTTPS request: the
-//! enrolment call (before it has a client certificate) and release
-//! downloads. Both go to hosts the caller names explicitly; there is no
-//! general-purpose fetch. Small enough to read in one sitting, which is
-//! the point of not pulling in a full HTTP stack.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,8 +56,6 @@ impl Response {
     }
 }
 
-/// Which certificate authorities to trust. The public web PKI for
-/// enrolment and downloads; the pinned ServerOS CA once we have it.
 #[derive(Clone)]
 pub enum Trust {
     WebPki,
@@ -151,8 +143,6 @@ impl Client {
         .await
     }
 
-    /// A POST with caller-supplied headers, for services that authenticate
-    /// with a shared secret (the gateway talking to the panel).
     pub async fn post_json_with_headers<T: serde::Serialize>(
         &self,
         url: &str,
@@ -166,7 +156,6 @@ impl Client {
         self.request("POST", url, &all, Some(&bytes)).await
     }
 
-    /// A PUT with caller-supplied headers, for signed object-storage uploads.
     pub async fn put(
         &self,
         url: &str,

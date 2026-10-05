@@ -1,7 +1,3 @@
-//! Server-side mutual TLS. Clients must present a certificate signed by
-//! the daemon CA; the serial on that certificate is the machine's identity
-//! and the panel is the one who decides what it maps to.
-
 use std::sync::Arc;
 
 use rustls::pki_types::CertificateDer;
@@ -58,8 +54,6 @@ pub fn server_config(
     Ok(Arc::new(config))
 }
 
-/// The serial of the leaf certificate a peer presented, in the panel's
-/// canonical form: lowercase hex, no leading zeros.
 pub fn peer_serial(certs: Option<&[CertificateDer<'_>]>) -> Option<String> {
     let leaf = certs?.first()?;
     let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref()).ok()?;

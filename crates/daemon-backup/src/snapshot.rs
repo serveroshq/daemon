@@ -1,5 +1,3 @@
-//! Taking and restoring snapshots.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -35,7 +33,6 @@ pub struct ManifestFile {
 
 pub struct Snapshotter {
     pub backups_dir: PathBuf,
-    /// Refuse when the projected snapshot would push the disk past this.
     pub disk_high_water_percent: u8,
     pub retention: usize,
 }
@@ -58,8 +55,6 @@ impl Snapshotter {
         manifests
     }
 
-    /// Take a snapshot. `estimate` is the expected size, for the disk
-    /// safety check; pass the data directory size or the last snapshot's.
     pub async fn take(
         &self,
         service: &ManagedService,
@@ -164,8 +159,6 @@ impl Snapshotter {
                     None,
                 )
                 .await;
-                // GNU tar exits 1 for "file changed as we read it", which is
-                // fine for a live app as long as the archive was written.
                 if !matches!(outcome, ChildOutcome::Exited { code: 0 | 1, .. }) || !out.is_file() {
                     return Err(failure("dump", outcome, "tar"));
                 }
@@ -212,8 +205,6 @@ impl Snapshotter {
         Ok(manifest)
     }
 
-    /// Restore `snapshot_id`. A pre-restore snapshot is taken first;
-    /// its id is returned alongside so the panel can offer "undo".
     pub async fn restore<L: Lifecycle>(
         &self,
         service: &ManagedService,
@@ -393,8 +384,6 @@ async fn shell_to_file(
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
 ) -> Result<(), Failure> {
-    // Redirect through sh so the dump streams to disk rather than through
-    // the job log.
     let cmd = format!(
         "{} {} > '{}'",
         program,

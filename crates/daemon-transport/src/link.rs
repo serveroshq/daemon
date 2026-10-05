@@ -1,6 +1,3 @@
-//! One live connection: dial, handshake, then pump frames both ways
-//! until the socket dies or the control loop hangs up.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,8 +20,6 @@ pub enum LinkError {
     #[error("could not connect to {url}: {source} (the daemon only dials out on 443; check outbound firewall rules and DNS)")]
     Connect {
         url: String,
-        // Boxed: tungstenite's error is large, and this enum travels in
-        // every Result the link returns.
         source: Box<tokio_tungstenite::tungstenite::Error>,
     },
     #[error("the panel did not answer the handshake within {0:?}")]
@@ -41,40 +36,24 @@ pub enum LinkError {
     Silent(Duration),
 }
 
-/// What the control loop sees from a link.
-// Nearly every event is a Message, so boxing it would only add an
-// allocation per frame.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum LinkEvent {
     Message(Inbound),
-    /// A sequence gap on the inbound side; the control loop may ask the
-    /// panel to resend.
-    Gap {
-        from: u64,
-        to: u64,
-    },
+    Gap { from: u64, to: u64 },
     Closed(LinkError),
 }
 
-/// A connected, negotiated link.
 pub struct Link {
     pub ack: HelloAck,
     pub major: u16,
-    /// Send typed messages; they are sequenced and framed by the pump.
     pub tx: mpsc::Sender<Outbound>,
-    /// Typed messages from the panel, plus the close reason at the end.
     pub rx: mpsc::Receiver<LinkEvent>,
 }
 
-/// The heartbeat body is supplied by the caller so the transport does not
-/// need to know about uptime or running jobs.
 pub type HeartbeatSource = Arc<dyn Fn() -> Heartbeat + Send + Sync>;
 
 impl Link {
-    /// Dial, present `hello`, and negotiate. Returns once the panel has
-    /// acknowledged; the pumps run on background tasks until the socket
-    /// dies or `tx` is dropped.
     pub async fn connect(
         url: &str,
         identity: &daemon_identity::Identity,
@@ -89,7 +68,6 @@ impl Link {
             .unwrap_or_default()
             .to_string();
 
-        // Surface a bad hostname before the socket is opened.
         ServerName::try_from(host.clone())
             .map_err(|e| LinkError::HandshakeMalformed(e.to_string()))?;
 
@@ -108,7 +86,6 @@ impl Link {
         let (mut sink, mut stream) = socket.split();
         let mut sequencer = Sequencer::new();
 
-        // Hello goes out with our newest driver; the ack tells us which to use.
         let hello_env = newest().encode(sequencer.next_seq(), &Outbound::Hello(hello))?;
         sink.send(Message::Text(
             hello_env
@@ -148,8 +125,6 @@ impl Link {
         let (in_tx, in_rx) = mpsc::channel::<LinkEvent>(256);
         let major = driver.major();
 
-        // Outbound pump: sequences and frames whatever the control loop sends,
-        // and emits heartbeats on its own clock.
         let write_driver = Arc::clone(&driver);
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -191,8 +166,6 @@ impl Link {
             let _ = sink.close().await;
         });
 
-        // Inbound pump: decodes frames, tracks the panel's sequence, and
-        // watches liveness.
         let read_driver = Arc::clone(&driver);
         tokio::spawn(async move {
             let mut inbound_seq = Sequencer::new();
@@ -207,7 +180,6 @@ impl Link {
                 let text = match frame {
                     Message::Text(text) => text,
                     Message::Close(_) => break LinkError::Lost("closed by panel".into()),
-                    // Pings are answered by tungstenite automatically on the next write.
                     _ => continue,
                 };
 

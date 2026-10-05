@@ -1,8 +1,3 @@
-//! One driver per protocol major. The transport hands every inbound
-//! envelope to the negotiated driver, which turns it into typed messages;
-//! outbound messages go the other way. A breaking change is a new module
-//! here and a new entry in [`SUPPORTED_MAJORS`], never an edit to v1.
-
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
@@ -10,7 +5,6 @@ use uuid::Uuid;
 use crate::envelope::{Envelope, Kind};
 use crate::messages::*;
 
-/// Newest first. Negotiation picks the highest major both sides speak.
 pub const SUPPORTED_MAJORS: &[u16] = &[1];
 
 #[derive(Debug, Error)]
@@ -28,7 +22,6 @@ pub enum DriverError {
     UnexpectedKind(Kind),
 }
 
-/// Everything the panel can send the daemon, typed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inbound {
     HelloAck(HelloAck),
@@ -38,7 +31,6 @@ pub enum Inbound {
     Gap { from: u64, to: u64 },
 }
 
-/// Everything the daemon sends the panel, typed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
     Hello(Hello),
@@ -56,12 +48,9 @@ pub enum Outbound {
 pub trait Driver: Send + Sync {
     fn major(&self) -> u16;
     fn decode(&self, envelope: &Envelope) -> Result<Inbound, DriverError>;
-    /// Build an envelope with the given sequence number. The id is fresh
-    /// unless the message carries its own (job updates reuse the job id).
     fn encode(&self, seq: u64, message: &Outbound) -> Result<Envelope, DriverError>;
 }
 
-/// Pick the driver for the major the panel settled on.
 pub fn negotiate(panel_major: u16) -> Result<Box<dyn Driver>, DriverError> {
     match panel_major {
         1 => Ok(Box::new(v1::DriverV1)),
@@ -72,8 +61,6 @@ pub fn negotiate(panel_major: u16) -> Result<Box<dyn Driver>, DriverError> {
     }
 }
 
-/// The driver the daemon uses before the panel has answered `Hello`:
-/// always our newest, since `Hello` itself lists every major we speak.
 pub fn newest() -> Box<dyn Driver> {
     negotiate(SUPPORTED_MAJORS[0]).expect("newest major is always supported")
 }

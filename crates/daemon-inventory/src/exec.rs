@@ -1,8 +1,3 @@
-//! Running a read-only command with a hard timeout, for the handful of
-//! tools discovery consults (`systemctl`, `--version` flags). Every call
-//! goes through here so the list of what discovery executes is short and
-//! greppable.
-
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -10,9 +5,6 @@ use tokio::process::Command;
 
 use crate::InventoryError;
 
-/// Stdout of `program args...`, or `None` if it is missing, fails, or
-/// takes longer than `timeout`. Discovery treats every one of those the
-/// same way: as "don't know", never as an error that stops the scan.
 pub async fn output(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let child = Command::new(program)
         .args(args)
@@ -31,8 +23,6 @@ pub async fn output(program: &str, args: &[&str], timeout: Duration) -> Option<S
     }
 }
 
-/// For tools that print their banner to stderr (`nginx -v`, `apache2 -v`):
-/// stdout and stderr combined, success status required.
 pub async fn output_stderr_ok(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let child = Command::new(program)
         .args(args)
@@ -54,8 +44,6 @@ pub async fn output_stderr_ok(program: &str, args: &[&str], timeout: Duration) -
     }
 }
 
-/// Like [`output`] but tells the caller about a timeout, for sources that
-/// want to report "scan truncated".
 pub async fn output_or_timeout(
     program: &str,
     args: &[&str],
@@ -82,7 +70,6 @@ pub async fn output_or_timeout(
     }
 }
 
-/// The first version-looking token in a `--version` banner.
 pub fn version_from_banner(banner: &str) -> Option<String> {
     banner
         .split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '/' | '='))

@@ -1,16 +1,9 @@
-//! The non-capability list as code. These are the promises on the Trust
-//! page; each is a function here and a test at the bottom.
-
 use std::path::{Path, PathBuf};
 
 use crate::ops::{DataOp, MachineOp, Operation, ServiceOp};
 
-/// Files no operation may read, whatever the roots say.
 const FORBIDDEN_READS: &[&str] = &["/etc/shadow", "/etc/gshadow", "/etc/sudoers"];
 
-/// Directory names under which private keys live. A path with one of
-/// these as a component is refused for reads unless ServerOS created the
-/// key (tracked by the manifest, checked by the broker).
 const KEY_DIRS: &[&str] = &[
     ".ssh",
     "private",
@@ -19,7 +12,6 @@ const KEY_DIRS: &[&str] = &[
     "letsencrypt/archive",
 ];
 
-/// Filename patterns for private key material.
 fn looks_like_private_key(path: &Path) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let lower = name.to_ascii_lowercase();
@@ -56,9 +48,6 @@ pub fn is_forbidden_read(path: &Path) -> bool {
     in_key_dir && looks_like_private_key(&normalized) || normalized.starts_with("/etc/shadow")
 }
 
-/// Whether the operation is one the daemon may do to a service it did not
-/// create. Lifecycle and reads are fine on adopted services; create,
-/// update, and remove are only for ServerOS-created ones.
 pub fn allowed_on_adopted(op: &ServiceOp) -> bool {
     !matches!(
         op,
@@ -66,14 +55,10 @@ pub fn allowed_on_adopted(op: &ServiceOp) -> bool {
     )
 }
 
-/// Users whose `authorized_keys` ServerOS may touch: only the ones it
-/// created.
 pub fn manages_user(user: &str, managed_users: &[String]) -> bool {
     managed_users.iter().any(|u| u == user)
 }
 
-/// The hosts the daemon may open outbound connections to. Enforced by the
-/// transport and the backup uploader, which take their targets from here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Egress {
     pub panel_host: String,
@@ -86,7 +71,6 @@ impl Egress {
     }
 }
 
-/// A one-line explanation for a refusal, written to actions.log.
 pub fn explain_refusal(op: &Operation, reason: &Refusal) -> String {
     match reason {
         Refusal::OutsideRoots => format!("{} is outside permitted roots", op.target()),
@@ -110,8 +94,6 @@ pub enum Refusal {
     UnmanagedUser,
 }
 
-/// Which rule an operation is subject to. Kept as data so the broker is a
-/// small match and the policy reads top to bottom.
 pub fn checks_for(op: &Operation) -> Vec<Check> {
     let mut checks = Vec::new();
 
@@ -148,8 +130,6 @@ pub enum Check {
     ManagedUser,
 }
 
-/// Paths ServerOS itself created (deploy keys, certificates it obtained),
-/// which the forbidden-key rule exempts.
 #[derive(Debug, Clone, Default)]
 pub struct Created {
     pub paths: Vec<PathBuf>,
@@ -236,7 +216,6 @@ mod tests {
 
         assert!(checks.contains(&Check::Confirmation));
         assert!(checks.contains(&Check::ReadOnlyMode));
-        // Unlike removal, it works on adopted services too.
         assert!(!checks.contains(&Check::CreatedByUs));
     }
 }

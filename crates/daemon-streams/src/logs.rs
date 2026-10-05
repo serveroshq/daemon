@@ -1,7 +1,3 @@
-//! Following logs. Three sources, one shape: a child process whose
-//! stdout is lines. journald and files use the tools already on the box;
-//! Docker uses the CLI's follow mode.
-
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -14,8 +10,6 @@ use uuid::Uuid;
 
 use crate::{frame, LINE_RATE_CAP};
 
-/// What to tail. Parsed from the job's `source` string:
-/// `unit:nginx.service`, `docker:<container>`, `file:/var/log/x.log`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     Unit(String),
@@ -93,8 +87,6 @@ pub struct LogTail {
 }
 
 impl LogTail {
-    /// Start following. Frames go to `out`; the tail ends when the child
-    /// exits, `out` closes, or [`LogTail::stop`] is called.
     pub fn start(
         session: Uuid,
         source: &Source,
@@ -181,12 +173,9 @@ impl LogTail {
 pub enum Admit {
     Send,
     Drop,
-    /// Send, preceded by a marker for `n` dropped lines.
     Summarise(usize),
 }
 
-/// Token bucket per second with a dropped-line count carried into the
-/// next second, so the reader learns what it missed.
 pub struct RateLimiter {
     cap: usize,
     window: Instant,
@@ -199,7 +188,6 @@ impl RateLimiter {
         Self::new_at(cap, Instant::now())
     }
 
-    /// Start the first window at `now`, so tests drive the clock.
     pub fn new_at(cap: usize, now: Instant) -> Self {
         Self {
             cap,

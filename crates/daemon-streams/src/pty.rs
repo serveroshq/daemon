@@ -1,6 +1,3 @@
-//! A PTY running a login shell as a named user. Linux only; elsewhere the
-//! functions compile and report that terminals need Linux.
-
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use thiserror::Error;
@@ -15,7 +12,6 @@ pub enum PtyError {
     Os(String),
 }
 
-/// The parent's end of a running shell.
 pub struct Pty {
     pub master: OwnedFd,
     pub child_pid: i32,
@@ -27,7 +23,6 @@ pub struct Size {
     pub cols: u16,
 }
 
-/// Look the user up in `/etc/passwd`: uid, gid, home, shell.
 pub fn lookup(user: &str) -> Option<(u32, u32, String, String)> {
     let text = std::fs::read_to_string("/etc/passwd").ok()?;
 
@@ -65,8 +60,6 @@ pub fn spawn(user: &str, size: Size) -> Result<Pty, PtyError> {
     };
     let pty = openpty(Some(&winsize), None).map_err(|e| PtyError::Os(e.to_string()))?;
 
-    // Everything between fork and exec must be async-signal-safe: no
-    // allocation, no locks. Prepare every string first.
     let shell_c = CString::new(shell.clone()).map_err(|e| PtyError::Os(e.to_string()))?;
     let argv0 = CString::new(format!("-{}", shell.rsplit('/').next().unwrap_or("sh")))
         .map_err(|e| PtyError::Os(e.to_string()))?;
@@ -146,7 +139,6 @@ impl Pty {
         }
     }
 
-    /// A non-blocking duplicate of the master for tokio to drive.
     pub fn async_master(&self) -> std::io::Result<tokio::io::unix::AsyncFd<OwnedFd>> {
         let dup = unsafe { libc::dup(self.master.as_raw_fd()) };
         if dup < 0 {

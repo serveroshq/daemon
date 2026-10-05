@@ -1,7 +1,3 @@
-//! Exponential backoff with full jitter, capped around a minute, so five
-//! thousand daemons losing the panel at once do not all redial at the
-//! same instant.
-
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
@@ -30,7 +26,6 @@ impl Backoff {
         }
     }
 
-    /// The delay before the next attempt, then advance.
     pub fn next_delay(&mut self) -> Duration {
         let ceiling = self.ceiling();
         self.attempt = self.attempt.saturating_add(1);
@@ -38,7 +33,6 @@ impl Backoff {
         jitter(ceiling)
     }
 
-    /// The upper bound for the current attempt (before jitter).
     pub fn ceiling(&self) -> Duration {
         let factor = 2u32.saturating_pow(self.attempt.min(16));
 
@@ -49,7 +43,6 @@ impl Backoff {
         self.attempt
     }
 
-    /// A successful connection that lasted resets the schedule.
     pub fn reset(&mut self) {
         self.attempt = 0;
     }

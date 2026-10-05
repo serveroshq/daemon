@@ -1,12 +1,3 @@
-//! Files, within the roots the broker permits. The broker decides whether
-//! a path is allowed; this crate makes sure the path that is opened is the
-//! path that was checked, which symlinks would otherwise defeat.
-//!
-//! Every operation resolves the real path first (`canonicalize` of the
-//! parent plus the final component, without following a final symlink)
-//! and re-checks it against the roots. Writes are atomic (temp + rename),
-//! preceded by a disk-space check and, for existing files, a backup.
-
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -70,10 +61,8 @@ pub enum EntryKind {
 
 pub struct Files {
     roots: PermittedRoots,
-    /// Largest file the read operation will return inline.
     pub max_read: u64,
     pub max_write: u64,
-    /// Keep this much headroom on the filesystem after a write.
     pub min_free_bytes: u64,
 }
 
@@ -91,9 +80,6 @@ impl Files {
         &self.roots
     }
 
-    /// The real path for `requested`, which must exist except for its
-    /// final component. Refuses anything that lands outside the roots
-    /// after symlinks are resolved.
     pub fn resolve(&self, requested: &Path) -> Result<PathBuf> {
         if !self.roots.permits(requested) {
             return Err(FileError::OutsideRoots(requested.into()));
@@ -115,8 +101,6 @@ impl Files {
             return Err(FileError::SymlinkEscape(requested.into()));
         }
 
-        // A final-component symlink pointing out of the roots is refused
-        // too; one pointing inside is followed like any other path.
         if let Ok(meta) = fs::symlink_metadata(&real) {
             if meta.file_type().is_symlink() {
                 let target =
@@ -215,8 +199,6 @@ impl Files {
         Ok(buf)
     }
 
-    /// Write atomically. An existing file is copied to
-    /// `<name>.serveros-backup-<ts>` first and the backup path returned.
     pub fn write(&self, path: &Path, content: &[u8], mode: Option<u32>) -> Result<Option<PathBuf>> {
         if content.len() as u64 > self.max_write {
             return Err(FileError::TooLarge {
@@ -273,7 +255,6 @@ impl Files {
             set_mode(&temp, mode)?;
         }
 
-        // Keep the owner of the file being replaced.
         if let Ok(meta) = fs::metadata(&real) {
             let _ = set_owner(&temp, uid_of(&meta), gid_of(&meta));
         }
@@ -283,9 +264,6 @@ impl Files {
         Ok(backup)
     }
 
-    /// Delete a file or an empty directory. Non-empty directories are
-    /// refused: bulk deletion is a preview-and-confirm operation the panel
-    /// runs file by file.
     pub fn delete(&self, path: &Path) -> Result<()> {
         let real = self.resolve(path)?;
         let meta = fs::symlink_metadata(&real).map_err(|_| FileError::NotFound(path.into()))?;
@@ -330,8 +308,6 @@ impl Files {
         Ok(())
     }
 }
-
-// ------------------------------------------------------------- unix helpers
 
 #[cfg(unix)]
 fn mode_of(meta: &fs::Metadata) -> u32 {
@@ -394,8 +370,6 @@ fn set_owner(_: &Path, _: u32, _: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `/etc/passwd` lookup without libc's getpwnam, so behaviour is the same
-/// under musl and glibc and there is no NSS surprise.
 pub fn lookup_user(name: &str) -> Option<(u32, u32)> {
     let text = fs::read_to_string("/etc/passwd").ok()?;
 

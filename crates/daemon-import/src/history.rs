@@ -1,7 +1,3 @@
-//! What previous scans said, kept in `state.db`: the last full report,
-//! and which service each port belonged to, so port reuse over time is
-//! noticed instead of silently accepted.
-
 use std::collections::BTreeMap;
 
 use daemon_protocol::InventoryReport;
@@ -44,7 +40,6 @@ impl<'a> History<'a> {
         Ok(())
     }
 
-    /// Port → the name of whatever last owned it.
     pub fn port_owners(&self) -> Result<BTreeMap<u16, String>> {
         Ok(match self.state.kv_get(PORT_OWNERS)? {
             Some(json) => serde_json::from_str(&json).unwrap_or_default(),

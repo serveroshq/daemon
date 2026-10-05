@@ -1,15 +1,3 @@
-//! Jobs are durable. A command from the panel is written to `state.db`
-//! before it runs, re-delivery of the same id answers from the ledger,
-//! every job has a deadline, and its outcome names the phase that failed
-//! with the real output.
-//!
-//! This crate owns the mechanics; what each job type does lives with the
-//! subsystem that knows how (services, files, deploy, backup) and is wired
-//! in through [`Handler`] by the daemon binary. Job bodies run on their
-//! own task, and the daemon's heavy lifting is always an external process
-//! with a kill-on-timeout, so a wedged build cannot take the control loop
-//! with it.
-
 pub mod child;
 pub mod progress;
 pub mod runner;
@@ -21,7 +9,6 @@ pub use runner::{Handler, HandlerFuture, JobContext, Runner};
 use daemon_protocol::JobError;
 use thiserror::Error;
 
-/// The error a handler returns: which phase, what happened, what next.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[error("{phase}: {message}")]
 pub struct Failure {

@@ -1,18 +1,3 @@
-//! `actions.log`: the audit trail a suspicious sysadmin can `cat`.
-//!
-//! One line per action, plain text, no JSON, no codes:
-//!
-//! ```text
-//! 2026-09-13T14:02:11Z  user dylan@serveros.com  service.restart  nginx.service  ok  (1.2s)
-//! 2026-09-13T14:03:40Z  scheduler               backup.create    postgres       ok  (14.8s) 312 MB to local staging
-//! 2026-09-13T14:05:02Z  user dylan@serveros.com  file.write       /srv/app/.env  refused  outside permitted roots
-//! ```
-//!
-//! The file is append-only (O_APPEND, and `chattr +a` where the filesystem
-//! allows it), root-writable, world-readable. It is written before the
-//! action starts (`started`) and again when it ends (`ok`/`failed`/
-//! `refused`), so a crash mid-action still leaves a trace.
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -35,8 +20,6 @@ pub enum AuditError {
     Write(std::io::Error),
 }
 
-/// Who did it. Mirrors the protocol's `Actor` without depending on it, so
-/// local CLI actions and scheduler runs log the same way as panel ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Actor {
     pub kind: &'static str,
@@ -107,17 +90,13 @@ impl Outcome {
     }
 }
 
-/// One line's worth of facts.
 #[derive(Debug, Clone)]
 pub struct Entry<'a> {
     pub actor: &'a Actor,
-    /// Dotted verb, e.g. `service.restart`, `file.write`, `terminal.open`.
     pub action: &'a str,
-    /// What it acted on: a unit name, a path, a container id.
     pub target: &'a str,
     pub outcome: Outcome,
     pub duration: Option<Duration>,
-    /// Free text; redacted before it is written.
     pub note: Option<&'a str>,
 }
 
@@ -140,7 +119,6 @@ impl AuditLog {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Readable by anyone on the box; the whole point is that they can read it.
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
         }
 
@@ -165,8 +143,6 @@ impl AuditLog {
         file.flush().map_err(AuditError::Write)
     }
 
-    /// Log `started`, run `work`, then log the outcome with its duration.
-    /// The start line lands before any privileged work happens.
     pub fn around<T, E: std::fmt::Display>(
         &self,
         actor: &Actor,

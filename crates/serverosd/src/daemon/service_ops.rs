@@ -1,8 +1,3 @@
-//! Service operations beyond start/stop: running a one-off command inside
-//! a service's container, removing a service ServerOS created, and
-//! registering a deploy's containers as managed so the panel can drive
-//! them straight away.
-
 use std::time::Duration;
 
 use daemon_jobs::{run_child, ChildOutcome, Failure, JobContext};
@@ -13,10 +8,8 @@ use tokio::process::Command;
 
 use super::app::App;
 
-/// The longest a one-off command may run.
 const MAX_EXEC: Duration = Duration::from_secs(300);
 
-/// The container behind a managed service, if it has one.
 pub fn container_of(service: &ManagedService) -> Option<&str> {
     match &service.run_by {
         RunBy::Docker { container } | RunBy::Compose { container, .. } => Some(container),
@@ -24,8 +17,6 @@ pub fn container_of(service: &ManagedService) -> Option<&str> {
     }
 }
 
-/// `sh -c <command>` inside the container. Output streams into the job's
-/// log as it arrives; a non-zero exit is a result, not a failed job.
 pub async fn exec(
     ctx: &JobContext,
     container: &str,
@@ -63,8 +54,6 @@ pub async fn exec(
     }
 }
 
-/// Whether the container behind a `docker:<id>` key still exists. Only
-/// `false` when Docker answers that it doesn't.
 pub async fn container_exists(key: &str) -> bool {
     let Some(id) = key.strip_prefix("docker:") else {
         return true;
@@ -84,8 +73,6 @@ pub async fn container_exists(key: &str) -> bool {
     }
 }
 
-/// Remove a service's containers (and, with `delete_data`, its volumes),
-/// then forget it. Compose services go as a whole project.
 pub async fn remove(
     app: &App,
     ctx: &JobContext,
@@ -126,7 +113,6 @@ pub async fn remove(
                     .await;
             }
 
-            // Forget every container of the project, not just this one.
             for managed in registry.all().unwrap_or_default() {
                 if matches!(&managed.run_by, RunBy::Compose { project: p, .. } if p == project) {
                     let _ = registry.remove(&managed.key);
@@ -158,9 +144,6 @@ pub async fn remove(
     }
 }
 
-/// After a deploy, register each of its containers as a managed service
-/// ServerOS created, keyed the way discovery keys them. Containers from
-/// earlier releases of the same service are forgotten.
 pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> Vec<String> {
     let registry = Registry::new(&app.state);
     let project = format!("serveros-{}", sanitise(&spec.service));
@@ -233,7 +216,6 @@ pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> V
         keys.push(key);
     }
 
-    // Older releases' containers are gone or stopped; stop tracking them.
     let prefix = format!("{project}-");
     for managed in registry.all().unwrap_or_default() {
         let ours = match &managed.run_by {
@@ -249,10 +231,6 @@ pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> V
     keys
 }
 
-/// Containers from deploys made before deploys registered themselves:
-/// anything in a `serveros-…` Compose project, or a container named
-/// `serveros-…`. Registered as created by ServerOS, so they can be
-/// controlled and removed like new deploys. Runs once at startup.
 pub async fn register_earlier_deploys(app: &App) -> usize {
     let registry = Registry::new(&app.state);
     let now = daemon_state::State::now();
@@ -323,7 +301,6 @@ pub async fn register_earlier_deploys(app: &App) -> usize {
     count
 }
 
-/// Matches the deployer's naming: anything outside [A-Za-z0-9_-] becomes "-".
 fn sanitise(service: &str) -> String {
     service
         .chars()

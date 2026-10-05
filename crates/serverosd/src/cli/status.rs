@@ -1,5 +1,3 @@
-//! `serverosd status`: ask the running daemon over its local socket.
-
 use std::io::{Read, Write};
 
 use daemon_core::Paths;

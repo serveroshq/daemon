@@ -1,11 +1,3 @@
-//! The reverse proxy in front of deployed services. Caddy by default,
-//! because it obtains and renews TLS on its own (ACME HTTP-01); nginx for
-//! machines that already run it. Both work the same way: one file per
-//! service in a directory ServerOS owns, validated before reload, reverted
-//! if validation fails, and reload rather than restart so existing
-//! connections stay up. The choice is `[integrations] proxy` in
-//! `daemon.toml`.
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,9 +9,6 @@ pub const CADDYFILE: &str = "/etc/caddy/Caddyfile";
 pub const INCLUDE_DIR: &str = "/etc/caddy/serveros.d";
 const CADDY_IMPORT_LINE: &str = "import /etc/caddy/serveros.d/*.caddy";
 
-/// Installs Caddy from its official apt repository (Debian and Ubuntu),
-/// and opens 80 and 443 when ufw is active: Caddy needs both to answer the
-/// ACME HTTP-01 challenge and to redirect HTTP to HTTPS.
 const CADDY_INSTALL_SCRIPT: &str = r#"set -eu
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -42,8 +31,6 @@ fi
 systemctl enable --now caddy
 "#;
 
-/// The Caddyfile for a Caddy that ServerOS installed: only our sites, in
-/// place of the package's welcome page on :80.
 fn fresh_caddyfile() -> String {
     format!(
         "# Installed by ServerOS. Per-service sites live in serveros.d; Caddy\n# gets and renews their certificates on its own.\n{CADDY_IMPORT_LINE}\n"
@@ -56,7 +43,6 @@ const NGINX_INCLUDE_LINE: &str = "include /etc/nginx/serveros.d/*.conf;";
 
 pub struct Proxy {
     pub backend: ProxyBackend,
-    /// The main config file that must include our directory.
     pub main_config: PathBuf,
     pub include_dir: PathBuf,
 }
@@ -67,7 +53,6 @@ impl Default for Proxy {
     }
 }
 
-/// The Caddy site block for a service.
 pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
     validate_domains(domains)?;
 
@@ -77,9 +62,6 @@ pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure>
     ))
 }
 
-/// The nginx server block for a service. Plain HTTP on 80; TLS is left to
-/// whatever the operator already uses (certbot --nginx keeps working, as
-/// it edits this file in place and the next deploy rewrites only ours).
 pub fn render_nginx(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
     validate_domains(domains)?;
 
@@ -89,8 +71,6 @@ pub fn render_nginx(domains: &[String], upstream_port: u16) -> Result<String, Fa
     ))
 }
 
-/// Domains are validated to hostname characters so a stray brace or
-/// semicolon cannot change the config's shape.
 fn validate_domains(domains: &[String]) -> Result<(), Failure> {
     if domains.is_empty() {
         return Err(
@@ -146,9 +126,6 @@ impl Proxy {
             .with_next_step("Set `[integrations] proxy = \"caddy\"` or `\"nginx\"` in daemon.toml, or publish the port yourself.")
     }
 
-    /// Install Caddy when the machine doesn't have it yet, so a deploy
-    /// with a domain gets HTTPS without any setup on the machine. Returns
-    /// `true` when it was installed. nginx is never installed for you.
     pub async fn ensure_installed(
         &self,
         cancel: &mut watch::Receiver<bool>,
@@ -182,7 +159,6 @@ impl Proxy {
                 ));
         }
 
-        // Replace the package's welcome page with just our sites.
         std::fs::write(&self.main_config, fresh_caddyfile()).map_err(|e| {
             Failure::new(
                 "proxy",
@@ -193,8 +169,6 @@ impl Proxy {
         Ok(true)
     }
 
-    /// Make sure the main config imports our directory. Returns `true`
-    /// when a line was added (so the caller records it in the manifest).
     pub fn ensure_import(&self) -> Result<bool, Failure> {
         if self.backend == ProxyBackend::None {
             return Err(Self::none_configured());
@@ -227,8 +201,6 @@ impl Proxy {
         Ok(true)
     }
 
-    /// Write the site, validate, reload. On validation failure the
-    /// previous file is restored and the proxy is never reloaded.
     pub async fn publish(
         &self,
         service: &str,
@@ -330,7 +302,6 @@ impl Proxy {
         progress: &Progress,
     ) -> Result<(), Failure> {
         let main = self.main_config.to_string_lossy().into_owned();
-        // Reload, never restart: existing connections stay up.
         let (program, args, unit): (&str, Vec<&str>, &str) = match self.backend {
             ProxyBackend::Nginx => ("nginx", vec!["-s", "reload", "-c", &main], "nginx"),
             _ => (
@@ -368,7 +339,6 @@ fn on_path(program: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Append the Caddy import line unless it is already there.
 fn add_caddy_import(existing: &str) -> Option<String> {
     if existing.lines().any(|l| l.trim() == CADDY_IMPORT_LINE) {
         return None;
@@ -385,10 +355,6 @@ fn add_caddy_import(existing: &str) -> Option<String> {
     Some(updated)
 }
 
-/// Add our include inside nginx's `http { … }` block: just before the
-/// closing brace of the block, which is the last `}` at column zero in a
-/// stock nginx.conf. A file without an http block is left alone and the
-/// include is reported as not added.
 fn add_nginx_include(existing: &str) -> Option<String> {
     if existing.lines().any(|l| l.trim() == NGINX_INCLUDE_LINE) {
         return None;
@@ -416,7 +382,6 @@ mod tests {
         let caddyfile = fresh_caddyfile();
 
         assert!(caddyfile.lines().any(|l| l == CADDY_IMPORT_LINE));
-        // Nothing to add: the import is already there.
         assert!(add_caddy_import(&caddyfile).is_none());
         assert!(!caddyfile.contains(":80"));
     }

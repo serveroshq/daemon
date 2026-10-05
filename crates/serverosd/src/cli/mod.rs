@@ -5,7 +5,6 @@ pub mod status;
 pub mod uninstall;
 pub mod update;
 
-/// Most commands need root: they touch /etc/serveros and the unit.
 pub fn require_root(what: &str) -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         anyhow::bail!("{what} needs root. Re-run with sudo.");

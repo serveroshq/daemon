@@ -1,22 +1,14 @@
-//! Derived signals: the trends that deserve an event. Each is computed
-//! from samples the daemon already has; none needs extra collection.
-//! Every signal is rate-limited so a disk hovering at a threshold does not
-//! page someone every ten seconds.
-
 use std::collections::BTreeMap;
 
 use daemon_protocol::{Event, EventKind, Sample, Severity};
 
-/// How long to stay quiet about a signal after raising it.
 const QUIET_PERIOD_SECS: i64 = 6 * 60 * 60;
-/// Sustained-load window: load above the core count for this long.
 const SUSTAINED_LOAD_SECS: i64 = 15 * 60;
 
 #[derive(Debug, Default)]
 pub struct SignalState {
     last_raised: BTreeMap<String, i64>,
     load_high_since: Option<i64>,
-    /// (ts, used_bytes) history per mount, for the fill projection.
     disk_history: BTreeMap<String, Vec<(i64, u64)>>,
 }
 
@@ -24,7 +16,6 @@ pub struct Signals {
     pub cores: u32,
     pub disk_warn_percent: u8,
     pub disk_critical_percent: u8,
-    /// Warn when a disk is projected to fill within this many days.
     pub projection_days: f64,
 }
 
@@ -40,7 +31,6 @@ impl Default for Signals {
 }
 
 impl Signals {
-    /// Evaluate one sample. Returns the events to raise now.
     pub fn evaluate(
         &self,
         state: &mut SignalState,
@@ -238,8 +228,6 @@ impl Signals {
     }
 }
 
-/// Linear fit over the history: days until `free_bytes` is consumed at
-/// the observed growth rate, or `None` when the disk is not growing.
 pub fn project_full_in_days(history: &[(i64, u64)], free_bytes: u64) -> Option<f64> {
     if history.len() < 2 {
         return None;
@@ -249,7 +237,6 @@ pub fn project_full_in_days(history: &[(i64, u64)], free_bytes: u64) -> Option<f
     let (t1, u1) = *history.last()?;
     let span_secs = (t1 - t0) as f64;
 
-    // Need at least an hour of history before extrapolating.
     if span_secs < 3600.0 || u1 <= u0 {
         return None;
     }
@@ -348,7 +335,6 @@ mod tests {
 
     #[test]
     fn projects_when_a_disk_will_fill() {
-        // 1 GB used per hour, 24 GB free → about a day.
         let history: Vec<(i64, u64)> = (0..=2)
             .map(|h| (h * 3600, (h as u64) * 1_000_000_000))
             .collect();

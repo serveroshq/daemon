@@ -1,7 +1,3 @@
-//! Driving systemd units with `systemctl` and reading them with
-//! `journalctl`. The verbs are the four the protocol allows; there is no
-//! way to pass an arbitrary subcommand through.
-
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -22,8 +18,6 @@ impl Default for SystemdAdapter {
     }
 }
 
-/// Unit names are validated before they reach a command line: systemd's
-/// own character set, no spaces, no leading dashes.
 pub fn valid_unit_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() < 256
@@ -81,8 +75,6 @@ impl Lifecycle for SystemdAdapter {
             ServiceAction::Start => "start",
             ServiceAction::Stop => "stop",
             ServiceAction::Restart => "restart",
-            // reload-or-restart: units without ExecReload get a restart, and
-            // the caller sees which happened in the status afterwards.
             ServiceAction::Reload => "reload-or-restart",
         };
 
@@ -98,7 +90,6 @@ impl Lifecycle for SystemdAdapter {
             )));
         }
 
-        // `is-active` exits non-zero for inactive units, so read `show`.
         let shown = self
             .run(
                 "systemctl",

@@ -1,6 +1,3 @@
-//! The control loop: keep a link up, drain the outbox when it comes up,
-//! and dispatch what the panel sends.
-
 use std::sync::Arc;
 
 use daemon_protocol::driver::{Inbound, Outbound};
@@ -42,7 +39,6 @@ pub async fn run(app: Arc<App>, mut outbound: mpsc::Receiver<Outbound>) {
                     s.reconnect_attempt = backoff.attempt();
                 }
                 warn!(error = %e, retry_in = ?delay, "control channel down");
-                // Keep persisting durable messages while we wait.
                 let sleep = tokio::time::sleep(delay);
                 tokio::pin!(sleep);
                 loop {
@@ -109,7 +105,6 @@ async fn on_connected(app: &App, link: &Link) {
     app.broker
         .set_read_only(matches!(link.ack.mode, PanelMode::ReadOnly));
 
-    // A new binary that got this far is confirmed.
     if let Some(marker) = app.guard.confirm() {
         app.raise(Event {
             kind: EventKind::UpdateApplied,
@@ -123,7 +118,6 @@ async fn on_connected(app: &App, link: &Link) {
         .await;
     }
 
-    // Durable messages first, in order.
     loop {
         let items = match app.state.outbox_peek(100) {
             Ok(items) if !items.is_empty() => items,
@@ -157,7 +151,6 @@ async fn on_connected(app: &App, link: &Link) {
         let _ = app.state.outbox_ack(&acked);
     }
 
-    // Telemetry the panel missed, newest first, bounded.
     let last_sent = app
         .state
         .kv_get("telemetry.last_sent_ts")
@@ -201,9 +194,6 @@ async fn backfill(app: &App, link: &Link, from: i64, to: i64) {
     }
 }
 
-/// Durable kinds go to the outbox while the link is down; live-only
-/// kinds are dropped (telemetry is in the ring buffer, inventory is
-/// re-sent on the next scan).
 fn persist(app: &App, message: Outbound) {
     let (kind, payload) = match &message {
         Outbound::JobUpdate(u) => ("job_update", serde_json::to_string(u)),
@@ -365,8 +355,6 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
     }
 }
 
-/// Apply the update policy to an offer. Installs happen in the update
-/// worker once no job is running; here we only decide and record.
 pub async fn consider_update(app: &Arc<App>, candidate: Candidate, approved: bool) {
     let policy = Policy::from(&app.config.read().unwrap().updates);
     let local_minutes = time::OffsetDateTime::now_local()

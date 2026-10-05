@@ -1,7 +1,3 @@
-//! Download, verify, swap. The old binary is kept as `serverosd.previous`
-//! and a marker records the switch so the rollback guard can act if the
-//! new binary never comes up.
-
 use std::path::Path;
 
 use daemon_http::{Client, Trust};
@@ -18,9 +14,6 @@ pub struct Installed {
     pub previous_binary: std::path::PathBuf,
 }
 
-/// Fetch `candidate`, verify it, and put it in place of `binary`. The
-/// running process is not restarted here; the caller exits so systemd
-/// starts the new binary.
 pub async fn install(
     binary: &Path,
     state_dir: &Path,
@@ -60,7 +53,6 @@ pub async fn install(
 
     write_executable(&staged, &response.body)?;
 
-    // Keep the old binary for rollback, then swap atomically.
     if binary.exists() {
         std::fs::rename(binary, &previous)?;
     }

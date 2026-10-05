@@ -1,16 +1,9 @@
-//! Filling in what a scan leaves blank, without reading anything a
-//! customer would mind: versions from `--version` banners, well-known
-//! config paths that exist, data directory size and mount, and the
-//! warnings the spec's messy-server list calls for.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use daemon_inventory::exec;
 use daemon_protocol::{DiscoveredService, ServiceKind, ServiceManager};
 
-/// Where each kind of service keeps its configuration, in the order
-/// distributions use. Only paths that exist are reported.
 pub fn known_config_paths(service: &DiscoveredService) -> Vec<PathBuf> {
     let candidates: &[&str] = match service.name.as_str() {
         "postgresql" => &[
@@ -55,7 +48,6 @@ pub fn known_config_paths(service: &DiscoveredService) -> Vec<PathBuf> {
         .filter(|p| p.exists())
         .collect();
 
-    // Whatever the unit or container already told us.
     for existing in &service.config_paths {
         let p = PathBuf::from(existing);
         if p.exists() && !paths.contains(&p) {
@@ -63,7 +55,6 @@ pub fn known_config_paths(service: &DiscoveredService) -> Vec<PathBuf> {
         }
     }
 
-    // Compose projects: the compose file in the project directory.
     if service.manager == ServiceManager::Compose {
         if let Some(dir) = &service.working_dir {
             for name in [
@@ -84,7 +75,6 @@ pub fn known_config_paths(service: &DiscoveredService) -> Vec<PathBuf> {
     paths
 }
 
-/// The binary and flag that print a version for each kind of service.
 fn version_probe(service: &DiscoveredService) -> Option<(&'static str, &'static [&'static str])> {
     Some(match service.name.as_str() {
         "postgresql" => ("postgres", &["--version"]),
@@ -103,14 +93,9 @@ fn version_probe(service: &DiscoveredService) -> Option<(&'static str, &'static 
     })
 }
 
-/// Version from the binary the service actually runs, falling back to
-/// whatever is first on PATH. `nginx -v` prints to stderr, so that one
-/// is probed with `-V` semantics via the exe itself where possible.
 pub async fn detect_version(service: &DiscoveredService) -> Option<String> {
     let (default_program, args) = version_probe(service)?;
 
-    // Prefer the exact binary the process runs, so a second install does
-    // not lie to us.
     let program: String = service
         .exec
         .as_deref()
@@ -120,7 +105,6 @@ pub async fn detect_version(service: &DiscoveredService) -> Option<String> {
         .unwrap_or_else(|| default_program.to_string());
 
     let banner = match service.name.as_str() {
-        // nginx and apache write their version to stderr; capture both.
         "nginx" | "apache" => exec::output_stderr_ok(&program, args, Duration::from_secs(5)).await,
         _ => exec::output(&program, args, Duration::from_secs(5)).await,
     }?;
@@ -133,13 +117,9 @@ pub struct DataDirInfo {
     pub path: PathBuf,
     pub bytes: u64,
     pub mount: PathBuf,
-    /// The data sits on a different filesystem from `/`, which matters
-    /// for backups and disk projections.
     pub separate_mount: bool,
 }
 
-/// Size a data directory by walking it, capped at `max_entries` files so
-/// a million-file directory reports "at least" rather than stalling.
 pub fn data_dir_info(path: &Path, mounts: &[PathBuf], max_entries: usize) -> Option<DataDirInfo> {
     if !path.is_dir() {
         return None;
@@ -190,7 +170,6 @@ fn dir_size(path: &Path, max_entries: usize) -> u64 {
     total
 }
 
-/// The messy-server notes: each is a plain sentence the preview shows.
 pub fn warnings(
     service: &DiscoveredService,
     data: Option<&DataDirInfo>,

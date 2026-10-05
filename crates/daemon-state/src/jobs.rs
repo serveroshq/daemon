@@ -1,7 +1,3 @@
-//! The job ledger. A job is written here before any work happens, so a
-//! re-delivered command finds its record and a crash mid-job leaves a
-//! `running` row the supervisor can close out honestly on restart.
-
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -88,8 +84,6 @@ impl JobRecord {
 const COLUMNS: &str = "id, received_at, actor, kind, payload, status, phase, started_at, finished_at, result, error, log";
 
 impl State {
-    /// Record a freshly received job. Returns `false` (and changes nothing)
-    /// when the id is already known: that is a re-delivery.
     pub fn record_job(&self, id: Uuid, actor: &str, kind: &str, payload: &str) -> Result<bool> {
         self.with(|c| {
             let inserted = c.execute(
@@ -132,8 +126,6 @@ impl State {
         })
     }
 
-    /// Append log lines, keeping only the last `keep` bytes so a chatty
-    /// build cannot grow the ledger without bound.
     pub fn append_job_log(&self, id: Uuid, lines: &[String], keep: usize) -> Result<()> {
         self.with(|c| {
             let existing: String = c
@@ -153,8 +145,6 @@ impl State {
 
             if log.len() > keep {
                 let cut = log.len() - keep;
-                // Keep whole lines: if the cut lands mid-line, drop the rest
-                // of that line too.
                 let boundary = if cut == 0 || log.as_bytes()[cut - 1] == b'\n' {
                     cut
                 } else {
@@ -189,7 +179,6 @@ impl State {
         })
     }
 
-    /// Jobs that were running when the daemon last stopped.
     pub fn unfinished_jobs(&self) -> Result<Vec<JobRecord>> {
         self.with(|c| {
             let mut stmt = c.prepare(&format!("SELECT {COLUMNS} FROM jobs WHERE status IN ('accepted', 'running') ORDER BY received_at"))?;
@@ -199,7 +188,6 @@ impl State {
         })
     }
 
-    /// Drop terminal jobs older than `before_ts`, keeping the ledger bounded.
     pub fn prune_jobs(&self, before_ts: i64) -> Result<usize> {
         self.with(|c| {
             Ok(c.execute(

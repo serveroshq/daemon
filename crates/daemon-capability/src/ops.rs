@@ -1,6 +1,3 @@
-//! The complete list of privileged operations, grouped as the spec groups
-//! them. If it is not here, the daemon cannot do it.
-
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,73 +15,30 @@ pub enum MachineOp {
     ListUnits,
     ListContainers,
     QueryPackageUpdates,
-    /// Explicit instruction required.
-    ApplyPackageUpdates {
-        security_only: bool,
-    },
-    /// Explicit instruction required.
+    ApplyPackageUpdates { security_only: bool },
     Reboot,
     ReadFirewall,
-    WriteFirewall {
-        rule: String,
-    },
-    /// Only for users ServerOS manages.
-    ManageSshKeys {
-        user: String,
-    },
-    ReadJournal {
-        unit: Option<String>,
-    },
-    /// Only files named in a managed service's manifest or the config.
-    ReadNamedLog {
-        path: PathBuf,
-    },
+    WriteFirewall { rule: String },
+    ManageSshKeys { user: String },
+    ReadJournal { unit: Option<String> },
+    ReadNamedLog { path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceOp {
-    Start {
-        service: String,
-    },
-    Stop {
-        service: String,
-    },
-    Restart {
-        service: String,
-    },
-    Reload {
-        service: String,
-    },
-    ReadLogs {
-        service: String,
-    },
-    ReadUsage {
-        service: String,
-    },
-    ReadConfig {
-        service: String,
-        path: PathBuf,
-    },
-    /// Only services ServerOS created.
-    Create {
-        service: String,
-    },
-    Update {
-        service: String,
-    },
-    Remove {
-        service: String,
-    },
-    Adopt {
-        service: String,
-    },
-    Unadopt {
-        service: String,
-    },
-    /// Run a one-off command inside a service's container.
-    Exec {
-        service: String,
-    },
+    Start { service: String },
+    Stop { service: String },
+    Restart { service: String },
+    Reload { service: String },
+    ReadLogs { service: String },
+    ReadUsage { service: String },
+    ReadConfig { service: String, path: PathBuf },
+    Create { service: String },
+    Update { service: String },
+    Remove { service: String },
+    Adopt { service: String },
+    Unadopt { service: String },
+    Exec { service: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,42 +54,19 @@ pub enum DeployOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataOp {
-    Snapshot {
-        service: String,
-    },
-    /// Explicit instruction required.
-    Restore {
-        service: String,
-        snapshot: String,
-    },
-    UploadSnapshot {
-        service: String,
-    },
-    Browse {
-        path: PathBuf,
-    },
-    ReadFile {
-        path: PathBuf,
-    },
-    WriteFile {
-        path: PathBuf,
-    },
-    DeleteFile {
-        path: PathBuf,
-    },
-    Chmod {
-        path: PathBuf,
-    },
-    Chown {
-        path: PathBuf,
-    },
-    OpenTerminal {
-        user: String,
-    },
+    Snapshot { service: String },
+    Restore { service: String, snapshot: String },
+    UploadSnapshot { service: String },
+    Browse { path: PathBuf },
+    ReadFile { path: PathBuf },
+    WriteFile { path: PathBuf },
+    DeleteFile { path: PathBuf },
+    Chmod { path: PathBuf },
+    Chown { path: PathBuf },
+    OpenTerminal { user: String },
 }
 
 impl Operation {
-    /// The dotted verb written to actions.log.
     pub fn verb(&self) -> &'static str {
         match self {
             Operation::Machine(m) => match m {
@@ -191,7 +122,6 @@ impl Operation {
         }
     }
 
-    /// What the line in actions.log names as the target.
     pub fn target(&self) -> String {
         match self {
             Operation::Machine(m) => match m {
@@ -247,7 +177,6 @@ impl Operation {
         }
     }
 
-    /// Operations that change something, refused in read-only mode.
     pub fn mutates(&self) -> bool {
         match self {
             Operation::Machine(m) => matches!(
@@ -268,8 +197,6 @@ impl Operation {
         }
     }
 
-    /// Operations that must carry a confirmed, user-initiated instruction.
-    /// The panel sends `confirmed: true` only after a preview.
     pub fn requires_confirmation(&self) -> bool {
         matches!(
             self,
@@ -282,7 +209,6 @@ impl Operation {
         )
     }
 
-    /// The path an operation touches, if any, for the permitted-roots check.
     pub fn path(&self) -> Option<&std::path::Path> {
         match self {
             Operation::Machine(MachineOp::ReadNamedLog { path }) => Some(path),

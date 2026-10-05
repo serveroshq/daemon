@@ -1,17 +1,3 @@
-//! `state.db`: what the daemon must not forget across a crash, a restart,
-//! or a long disconnect.
-//!
-//! - **jobs**: every command the panel sent, recorded before it runs, with
-//!   its terminal result so re-delivery of the same id answers from here.
-//! - **samples**: the telemetry ring buffer (24 hours by default) the panel
-//!   backfills from after a disconnect.
-//! - **outbox**: job updates and events queued while the panel was away,
-//!   delivered in order on reconnect.
-//! - **kv**: small facts (last inventory hash, last update check).
-//!
-//! SQLite in WAL mode, one connection behind a mutex. The daemon is not a
-//! database; this is a ledger.
-
 use std::path::Path;
 use std::sync::Mutex;
 

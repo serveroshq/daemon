@@ -1,12 +1,3 @@
-//! Uninstall and the manifest that makes it honest.
-//!
-//! Everything ServerOS creates outside its own directories is written to
-//! `manifest.json` at the moment it is created: the systemd unit, the
-//! Caddy import line, proxy includes, users, cron entries, deploy keys.
-//! Uninstall removes exactly those, then its own directories, and prints
-//! both lists. Customer services, data, apps, databases, and certificates
-//! are never on the list, so they are never touched.
-
 use std::path::{Path, PathBuf};
 
 use daemon_core::Paths;
@@ -15,33 +6,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Artifact {
-    File {
-        path: PathBuf,
-    },
-    Directory {
-        path: PathBuf,
-    },
-    /// A line ServerOS appended to a file it does not own.
-    LineInFile {
-        path: PathBuf,
-        line: String,
-    },
-    SystemdUnit {
-        name: String,
-    },
-    User {
-        name: String,
-    },
-    CronEntry {
-        path: PathBuf,
-        marker: String,
-    },
-    Container {
-        name: String,
-    },
-    Image {
-        tag: String,
-    },
+    File { path: PathBuf },
+    Directory { path: PathBuf },
+    LineInFile { path: PathBuf, line: String },
+    SystemdUnit { name: String },
+    User { name: String },
+    CronEntry { path: PathBuf, marker: String },
+    Container { name: String },
+    Image { tag: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -64,7 +36,6 @@ impl Manifest {
         std::fs::write(path, serde_json::to_vec_pretty(self).unwrap())
     }
 
-    /// Record an artifact the moment it is made. Idempotent.
     pub fn record(path: &Path, artifact: Artifact) -> std::io::Result<()> {
         let mut manifest = Self::load(path);
         if !manifest.created.contains(&artifact) {
@@ -105,7 +76,6 @@ impl Report {
     }
 }
 
-/// Plan the removal without doing it: what would go, what would stay.
 pub fn plan(paths: &Paths, manifest: &Manifest, managed_services: &[String]) -> Report {
     let mut report = Report::default();
 
@@ -158,7 +128,6 @@ fn describe(artifact: &Artifact) -> String {
     }
 }
 
-/// Remove an artifact. Returns a human line for the report.
 pub fn remove_artifact(
     artifact: &Artifact,
     run: &dyn Fn(&str, &[&str]) -> bool,
@@ -212,7 +181,6 @@ fn remove_marked_lines(path: &Path, marker: &str) -> bool {
     std::fs::write(path, kept.join("\n") + "\n").is_ok()
 }
 
-/// Remove the daemon's own directories, last.
 pub fn remove_own(paths: &Paths) -> Vec<Result<String, String>> {
     let mut results = Vec::new();
 

@@ -1,8 +1,3 @@
-//! Stream tickets. The panel signs `machine|session|expires` with the
-//! shared secret; the gateway recomputes it, so attaching a browser to a
-//! stream costs no round trip to the panel and the panel never sees PTY
-//! bytes.
-
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -16,7 +11,6 @@ pub enum TicketError {
     Signature,
 }
 
-/// `expires.hex(hmac-sha256(secret, "machine|session|expires"))`.
 pub fn verify(
     secret: &str,
     machine: &str,
@@ -48,7 +42,6 @@ pub fn verify(
     Ok(())
 }
 
-/// The panel-side signing, kept here so the tests prove both ends agree.
 pub fn sign(secret: &str, machine: &str, session: &str, expires: i64) -> String {
     let mac = hmac_sha256(
         secret.as_bytes(),
@@ -132,7 +125,6 @@ mod tests {
 
     #[test]
     fn matches_the_panel_side_php_signature() {
-        // hash_hmac('sha256', 'abc|def|1700000000', 'secret') as PHP renders it.
         let ticket = sign("secret", "abc", "def", 1_700_000_000);
 
         assert_eq!(

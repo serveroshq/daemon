@@ -1,6 +1,3 @@
-//! The daemon's own log: `daemon.log`, redacted at write time, plus
-//! stderr when running in a terminal.
-
 use std::io::Write;
 use std::path::Path;
 use std::sync::Mutex;
@@ -8,8 +5,6 @@ use std::sync::Mutex;
 use daemon_core::redact::redact;
 use tracing_subscriber::EnvFilter;
 
-/// A writer that scrubs each line before it reaches the file, so a
-/// secret that slips into a log call is caught once.
 struct RedactingFile {
     file: Mutex<std::fs::File>,
     partial: Mutex<Vec<u8>>,

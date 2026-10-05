@@ -1,11 +1,3 @@
-//! Services ServerOS manages, whether it created them or adopted them.
-//!
-//! Adoption is the riskiest moment in the product, so the rules are code:
-//! no restart, no config rewrite, preview before commit, reversible, and
-//! partial adoption is fine. The [`registry`] remembers what was adopted
-//! and what each service can do; the [`systemd`] and [`docker`] adapters
-//! do the actual starting, stopping, and log reading.
-
 pub mod adoption;
 pub mod docker;
 pub mod registry;
@@ -39,8 +31,6 @@ pub enum ServiceError {
 
 pub type Result<T> = std::result::Result<T, ServiceError>;
 
-/// What every adapter can do. Implemented for systemd units and Docker
-/// containers; everything else is observe-only.
 #[allow(async_fn_in_trait)]
 pub trait Lifecycle {
     async fn act(&self, target: &str, action: ServiceAction) -> Result<()>;

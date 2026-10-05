@@ -1,7 +1,3 @@
-//! Every job type, wired to its subsystem through the broker. This is the
-//! one place a command from the panel becomes an action on the machine,
-//! and every branch goes: authorise → do → report.
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,8 +65,6 @@ async fn managed(app: &App, key: &str) -> Result<ManagedService, Failure> {
         return Ok(service);
     }
 
-    // A container ServerOS created but never registered (its deploy was
-    // interrupted, say) is ours all the same: register it and carry on.
     if key.starts_with("docker:") && super::service_ops::register_earlier_deploys(app).await > 0 {
         if let Some(service) = lookup()? {
             return Ok(service);
@@ -217,8 +211,6 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         } => {
             let managed = match managed(&app, &service).await {
                 Ok(managed) => managed,
-                // Already gone, with the rest of its Compose project or by
-                // hand: removing it again has nothing left to do.
                 Err(_) if !super::service_ops::container_exists(&service).await => {
                     ctx.progress
                         .line(format!("{service} was already removed"))

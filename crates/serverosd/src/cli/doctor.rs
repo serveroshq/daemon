@@ -1,5 +1,3 @@
-//! `serverosd doctor`: checks with a fix attached to each failure.
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;

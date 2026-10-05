@@ -1,6 +1,3 @@
-//! `serverosd enrol`: the nine steps from the spec, each printed before it
-//! happens, each failure telling a person what to do.
-
 use std::path::Path;
 
 use daemon_core::{BuildInfo, Config, Paths};
@@ -35,7 +32,6 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     println!("  5. run a first read-only scan of what is running here");
     println!();
 
-    // 1. Platform.
     let facts = daemon_telemetry::gather_facts();
 
     if !cfg!(target_os = "linux") {
@@ -74,7 +70,6 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
         return Ok(());
     }
 
-    // 2. Directories and key.
     for (dir, mode) in paths.owned_directories() {
         std::fs::create_dir_all(&dir)?;
         set_mode(&dir, mode);
@@ -83,7 +78,6 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     let key = KeyMaterial::generate()?;
     println!("  generated keypair");
 
-    // 3. Enrol.
     let rt = runtime()?;
     let (answer, identity) = rt.block_on(enrol(
         panel,
@@ -106,7 +100,6 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     config.save(&paths.config_file())?;
     println!("  enrolled as machine {}", answer.machine_id);
 
-    // 4. systemd.
     let unit_path = paths.systemd_unit();
     std::fs::write(&unit_path, unit_file(&paths.binary))?;
     Manifest::record(
@@ -120,7 +113,6 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     run_quiet("systemctl", &["enable", "--now", UNIT_NAME])?;
     println!("  {UNIT_NAME} enabled and started");
 
-    // 5. First scan happens inside the daemon on connect; say so.
     println!();
     println!("Done. The machine will show as connected in the panel within a few seconds,");
     println!("and its first service scan will follow.");

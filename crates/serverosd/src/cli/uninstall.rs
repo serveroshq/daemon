@@ -1,5 +1,3 @@
-//! `serverosd disconnect` and `serverosd uninstall`.
-
 use daemon_audit::{Actor, AuditLog, Entry, Outcome};
 use daemon_core::Paths;
 use daemon_uninstall::{plan, remove_artifact, remove_own, Manifest, Report};
@@ -100,7 +98,6 @@ pub fn run(paths: Paths, yes: bool, plan_only: bool) -> anyhow::Result<()> {
         failed: Vec::new(),
     };
 
-    // Stop ourselves first so nothing is written while we remove things.
     run_tool("systemctl", &["disable", "--now", super::enrol::UNIT_NAME]);
 
     for artifact in &manifest.created {

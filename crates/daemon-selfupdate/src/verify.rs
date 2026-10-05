@@ -1,7 +1,3 @@
-//! Checksum and signature. The public key is baked in at build time
-//! (`SERVEROS_RELEASE_PUBKEY`, hex); a build without one cannot update
-//! itself, which is the safe failure.
-
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 

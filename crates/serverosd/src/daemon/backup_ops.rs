@@ -1,11 +1,3 @@
-//! Backups that leave the machine: snapshot a service, then send the
-//! snapshot to S3-compatible storage or over SFTP to another machine the
-//! panel set up as a receiver.
-//!
-//! Container services are backed up by their volumes and bind mounts,
-//! which is where a game world or a database's files live; the image
-//! itself can be pulled again.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,11 +12,9 @@ use tokio::process::Command;
 use super::app::App;
 use super::service_ops::container_of;
 
-/// The user another machine's backups arrive as.
 pub const RECEIVER_USER: &str = "serveros-backups";
 const RECEIVER_HOME: &str = "/var/lib/serveros-backups";
 
-/// Where distributions keep OpenSSH's SFTP server.
 const SFTP_SERVERS: &[&str] = &[
     "/usr/lib/openssh/sftp-server",
     "/usr/libexec/openssh/sftp-server",
@@ -32,7 +22,6 @@ const SFTP_SERVERS: &[&str] = &[
     "/usr/libexec/sftp-server",
 ];
 
-/// Values to scrub from the job's log and errors.
 pub fn secrets(destination: &BackupDestination) -> Vec<String> {
     match destination {
         BackupDestination::S3 { secret_key, .. } => vec![secret_key.clone()],
@@ -40,7 +29,6 @@ pub fn secrets(destination: &BackupDestination) -> Vec<String> {
     }
 }
 
-/// Snapshot `service` and send it to `destination`.
 pub async fn backup_to(
     app: &App,
     ctx: &JobContext,
@@ -158,7 +146,6 @@ fn summary(manifest: &Manifest, location: &str) -> Value {
     })
 }
 
-/// `<prefix>/<service>/<snapshot>`, without empty segments.
 fn object_base(prefix: &str, service: &str, snapshot: &str) -> String {
     let service: String = service
         .chars()
@@ -178,8 +165,6 @@ fn object_base(prefix: &str, service: &str, snapshot: &str) -> String {
         .join("/")
 }
 
-/// How to snapshot a service. A container is its volumes and bind
-/// mounts; anything else uses the daemon's usual strategies.
 async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
     let Some(container) = container_of(service) else {
         return Strategy::for_service(service).ok_or_else(|| {
@@ -223,7 +208,6 @@ async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
     Ok(Strategy::Files { paths })
 }
 
-/// Mount sources worth keeping: no sockets or system paths.
 fn mount_paths(inspect: &str) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = inspect
         .lines()
@@ -238,9 +222,6 @@ fn mount_paths(inspect: &str) -> Vec<PathBuf> {
     paths
 }
 
-/// Put the snapshot's files under `base` in the receiver's home, with
-/// sftp in batch mode. The key and host key live in 0600 files for the
-/// length of the upload.
 #[allow(clippy::too_many_arguments)]
 async fn sftp_upload(
     ctx: &JobContext,
@@ -362,9 +343,6 @@ fn write_private(path: &Path, contents: &str) -> Result<(), Failure> {
         .map_err(|e| Failure::new("upload", format!("{}: {e}", path.display())))
 }
 
-/// Set this machine up to receive backups: a `serveros-backups` user whose
-/// only key may run the SFTP server and nothing else. Returns the
-/// machine's SSH host key so senders can pin it.
 pub async fn receiver(public_key: &str) -> Result<Value, Failure> {
     if !super::machine::valid_public_key(public_key) {
         return Err(Failure::new(
@@ -395,7 +373,6 @@ pub async fn receiver(public_key: &str) -> Result<Value, Failure> {
         )
         .await?;
     }
-    // No password, but not locked: sshd refuses locked accounts.
     run("usermod", &["-p", "*", RECEIVER_USER]).await?;
 
     let (uid, gid, home, _) = daemon_streams::pty::lookup(RECEIVER_USER)

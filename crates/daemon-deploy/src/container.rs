@@ -1,7 +1,3 @@
-//! Building images and running containers through the Docker CLI as a
-//! child process with a timeout and streamed output. Builds run under a
-//! resource cap so a compile cannot starve production.
-
 use std::path::Path;
 use std::time::Duration;
 
@@ -57,8 +53,6 @@ fn failure_from(phase: &str, outcome: ChildOutcome, what: &str) -> Failure {
     }
 }
 
-/// `docker build` in the workspace, capped by `limits` via `systemd-run`
-/// when available (a transient scope with CPUQuota and MemoryMax).
 pub async fn build(
     workspace: &Path,
     dockerfile: Option<&str>,
@@ -126,9 +120,6 @@ pub async fn build(
     }
 }
 
-/// Start a container for a release on `port`, with the env file mounted
-/// as its environment. Restart policy `unless-stopped` so it survives a
-/// reboot; the daemon decides when it stops.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     name: &str,
@@ -261,9 +252,6 @@ pub async fn remove_image(tag: &str, progress: &Progress) {
     .await;
 }
 
-/// Compose projects deploy as a unit: `up -d --build` in the project
-/// directory. That restarts the project's containers, which the result
-/// says plainly.
 pub async fn compose_up(
     dir: &Path,
     file: &str,

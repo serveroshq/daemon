@@ -1,8 +1,3 @@
-//! Read only provider instance metadata. Every request goes directly to the
-//! link-local address, with a fixed path, a small response cap and no proxy
-//! or redirect support. Never request user-data, credentials or tokens other
-//! than the short-lived metadata session tokens needed for identification.
-
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -15,8 +10,6 @@ const TIMEOUT: Duration = Duration::from_millis(150);
 const MAX_RESPONSE: u64 = 16 * 1024;
 
 pub(super) fn detect() -> HostingFacts {
-    // Containers do not represent their host's VPS. In particular, Docker
-    // bridge access to IMDS could otherwise misattribute a container.
     if std::path::Path::new("/.dockerenv").exists()
         || std::path::Path::new("/run/.containerenv").exists()
     {

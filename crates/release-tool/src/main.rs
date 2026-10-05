@@ -1,17 +1,3 @@
-//! `serveros-release`: the CI side of signed releases.
-//!
-//! ```text
-//! serveros-release keygen --out release.key          # once; keep the private half in CI secrets
-//! serveros-release sign --key release.key --file serverosd-1.2.0-linux-amd64
-//! serveros-release manifest --version 1.2.0 --channel stable --min-from 1.0.0 \
-//!     --url https://releases.serveros.com/1.2.0/serverosd-1.2.0-linux-amd64 \
-//!     --file serverosd-1.2.0-linux-amd64 --key release.key > manifest-amd64.json
-//! ```
-//!
-//! The public half is baked into the daemon at build time via
-//! `SERVEROS_RELEASE_PUBKEY` (hex), so a daemon only ever installs what
-//! this key signed.
-
 use std::path::PathBuf;
 
 use base64::Engine;
@@ -28,24 +14,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a signing keypair. Prints the public key (hex) to embed.
     Keygen {
         #[arg(long)]
         out: PathBuf,
     },
-    /// Sign a binary; prints the base64 signature.
     Sign {
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
         file: PathBuf,
     },
-    /// Print the public key (hex) for a private key file.
     Pubkey {
         #[arg(long)]
         key: PathBuf,
     },
-    /// Write the release manifest the daemon's update check consumes.
     Manifest {
         #[arg(long)]
         version: String,

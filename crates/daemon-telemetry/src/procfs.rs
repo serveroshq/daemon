@@ -1,10 +1,5 @@
-//! Parsers for the handful of procfs and sysfs files telemetry reads.
-//! Each takes the file's text and returns numbers; none does IO.
-
 use std::collections::BTreeMap;
 
-/// CPU time counters from `/proc/stat`, in jiffies. The first entry is the
-/// aggregate; the rest are per core in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CpuTimes {
     pub user: u64,
@@ -33,7 +28,6 @@ impl CpuTimes {
         self.total() - self.idle - self.iowait
     }
 
-    /// Busy percentage between two readings.
     pub fn percent_since(&self, earlier: &CpuTimes) -> f32 {
         let total = self.total().saturating_sub(earlier.total());
 
@@ -119,7 +113,6 @@ impl MemInfo {
     }
 }
 
-/// `/proc/meminfo`, values converted from kB to bytes.
 pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     let mut values: BTreeMap<&str, u64> = BTreeMap::new();
 
@@ -138,7 +131,6 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     Some(MemInfo {
         total,
         free,
-        // Older kernels lack MemAvailable; approximate it the way `free` does.
         available: values
             .get("MemAvailable")
             .copied()
@@ -150,7 +142,6 @@ pub fn parse_meminfo(text: &str) -> Option<MemInfo> {
     })
 }
 
-/// `/proc/loadavg`: the three averages and the running/total process counts.
 pub fn parse_loadavg(text: &str) -> Option<([f32; 3], u32, u32)> {
     let mut parts = text.split_whitespace();
     let load = [
@@ -171,7 +162,6 @@ pub struct NetCounters {
     pub tx_errors: u64,
 }
 
-/// `/proc/net/dev` summed over every interface but loopback.
 pub fn parse_net_dev(text: &str) -> NetCounters {
     let mut totals = NetCounters::default();
 
@@ -209,8 +199,6 @@ pub struct Mount {
     pub fs_type: String,
 }
 
-/// Real filesystems from `/proc/mounts`; pseudo and overlay mounts are
-/// skipped because their usage says nothing about the disk.
 pub fn parse_mounts(text: &str) -> Vec<Mount> {
     const SKIP_TYPES: &[&str] = &[
         "proc",
@@ -271,8 +259,6 @@ pub struct DiskIo {
     pub write_bytes: u64,
 }
 
-/// `/proc/diskstats` sectors read/written per device name, in bytes
-/// (sectors are 512 bytes in this file regardless of the disk).
 pub fn parse_diskstats(text: &str) -> BTreeMap<String, DiskIo> {
     text.lines()
         .filter_map(|line| {
@@ -296,12 +282,10 @@ pub fn parse_diskstats(text: &str) -> BTreeMap<String, DiskIo> {
         .collect()
 }
 
-/// The device name `/proc/diskstats` uses for a mount's device path.
 pub fn device_short_name(device: &str) -> &str {
     device.rsplit('/').next().unwrap_or(device)
 }
 
-/// `/proc/pressure/memory` "some avg10=1.23 ..." → avg10 for `some`.
 pub fn parse_psi_some_avg10(text: &str) -> Option<f32> {
     text.lines()
         .find(|l| l.starts_with("some"))?
@@ -309,7 +293,6 @@ pub fn parse_psi_some_avg10(text: &str) -> Option<f32> {
         .find_map(|kv| kv.strip_prefix("avg10=")?.parse().ok())
 }
 
-/// `/proc/PID/stat` fields we care about: state, ppid, utime+stime, rss pages, start time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PidStat {
     pub comm: String,
@@ -321,7 +304,6 @@ pub struct PidStat {
 }
 
 pub fn parse_pid_stat(text: &str) -> Option<PidStat> {
-    // comm can contain spaces and parens; it is bounded by the last ')'.
     let open = text.find('(')?;
     let close = text.rfind(')')?;
     let comm = text[open + 1..close].to_string();

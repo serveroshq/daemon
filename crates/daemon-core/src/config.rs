@@ -1,15 +1,9 @@
-//! `daemon.toml`: everything about this installation that is not a
-//! secret. Secrets (the private key, the client certificate) live in their
-//! own root-only files and are never written here.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The current schema. Bumped only for incompatible changes; additive
-/// fields carry a `#[serde(default)]` instead.
 pub const CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -60,8 +54,6 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PanelConfig {
-    /// The API host the daemon connects out to, e.g. `api.serveros.com`.
-    /// Always port 443; the daemon never listens.
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
@@ -70,9 +62,7 @@ pub struct PanelConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MachineConfig {
-    /// The panel's identifier for this machine, issued at enrolment.
     pub id: String,
-    /// A human label shown in the panel; the hostname unless overridden.
     #[serde(default)]
     pub label: Option<String>,
 }
@@ -80,16 +70,10 @@ pub struct MachineConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateConfig {
-    /// `stable` follows releases; `canary` takes prereleases first.
     pub channel: String,
-    /// Pin to an exact version for change-controlled environments. Panel
-    /// pushed updates are refused while a pin is set.
     pub pinned_version: Option<String>,
-    /// Whether the daemon may update itself at all.
     pub automatic: bool,
     pub check_interval_secs: u64,
-    /// Hosts a release may be downloaded from, besides the panel itself.
-    /// An entry starting with `.` matches every subdomain.
     pub allowed_hosts: Vec<String>,
 }
 
@@ -106,7 +90,6 @@ impl Default for UpdateConfig {
 }
 
 impl UpdateConfig {
-    /// Whether a release URL's host is one we will download from.
     pub fn permits_host(&self, panel_host: &str, host: &str) -> bool {
         host == panel_host
             || self
@@ -119,39 +102,25 @@ impl UpdateConfig {
     }
 }
 
-/// Which reverse proxy ServerOS Deploy publishes sites through.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyBackend {
-    /// Caddy: automatic TLS, one include directory. The default.
     #[default]
     Caddy,
-    /// nginx: a server block per site under conf.d, `nginx -t` before
-    /// reload. TLS is whatever certbot or the operator set up.
     Nginx,
-    /// No proxy: deploys succeed, but no site is published and the job
-    /// says so.
     None,
 }
 
-/// Which tool firewall rules are applied with.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FirewallBackend {
-    /// ufw, with rules passed through in ufw's own syntax. The default.
     #[default]
     Ufw,
-    /// nftables, in a table ServerOS owns (`inet serveros`).
     Nftables,
-    /// iptables, appended to INPUT. Not persistent across reboots unless
-    /// netfilter-persistent is installed.
     Iptables,
     None,
 }
 
-/// Which host tools ServerOS drives for the things it does not do itself.
-/// Every default is the tool the installer would pick on a fresh Ubuntu
-/// box; an existing server keeps what it has by changing these.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct IntegrationsConfig {
@@ -164,7 +133,6 @@ pub struct IntegrationsConfig {
 pub struct TelemetryConfig {
     pub sample_interval_secs: u64,
     pub transmit_interval_secs: u64,
-    /// How much history the local ring buffer keeps for backfill.
     pub retention_hours: u64,
 }
 
@@ -183,17 +151,13 @@ impl Default for TelemetryConfig {
 pub struct DiscoveryConfig {
     pub enabled: bool,
     pub interval_secs: u64,
-    /// Hard ceiling on one scan; a scan that overruns reports what it has.
     pub budget_secs: u64,
 }
 
-/// Shipping service logs to the panel, where they are kept and searchable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LogsConfig {
     pub enabled: bool,
-    /// Lines per second any one service may ship; the rest are counted and
-    /// replaced by a marker line.
     pub lines_per_second: u32,
 }
 
@@ -220,21 +184,16 @@ impl Default for DiscoveryConfig {
 #[serde(deny_unknown_fields, default)]
 #[derive(Default)]
 pub struct FilesConfig {
-    /// Directories the panel's file browser may reach beyond managed
-    /// service directories. Empty by default; `/` is never permitted.
     pub extra_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsConfig {
-    /// Refuse backups, restores, and builds that would push disk use past this.
     pub disk_high_water_percent: u8,
-    /// Ceiling on CPU share for builds, as a percentage of one core.
     pub build_cpu_percent: u32,
     pub build_memory_mb: u64,
     pub job_timeout_secs: u64,
-    /// Idle terminal sessions are closed after this.
     pub terminal_idle_timeout_secs: u64,
 }
 
@@ -254,8 +213,6 @@ fn default_port() -> u16 {
     443
 }
 
-/// `host[:port]` → (host, port), defaulting to 443. A bare IPv6 literal
-/// is left alone.
 fn split_host_port(value: &str) -> (String, u16) {
     let trimmed = value.trim().trim_end_matches('/');
 
@@ -269,8 +226,6 @@ fn split_host_port(value: &str) -> (String, u16) {
 }
 
 impl Config {
-    /// A fresh config for a machine that just enrolled. `panel_host` may
-    /// carry a port (`gateway.example:8443`) for panels not on 443.
     pub fn new(panel_host: impl Into<String>, machine_id: impl Into<String>) -> Self {
         let (host, port) = split_host_port(&panel_host.into());
 

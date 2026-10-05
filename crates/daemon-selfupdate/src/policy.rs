@@ -1,20 +1,15 @@
-//! Whether an offered release may be installed right now, and if not, why.
-
 use daemon_core::buildinfo::parse_semver;
 use daemon_core::config::UpdateConfig;
 use serde::{Deserialize, Serialize};
 
-/// What the panel (or a manual check) offers.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Candidate {
     pub version: String,
     pub url: String,
     pub sha256: String,
-    /// base64 ed25519 signature over the binary bytes.
     pub signature: String,
     #[serde(default = "default_channel")]
     pub channel: String,
-    /// Oldest version this release upgrades cleanly from.
     #[serde(default)]
     pub min_from: Option<String>,
     #[serde(default)]
@@ -30,9 +25,7 @@ pub struct Policy {
     pub automatic: bool,
     pub channel: String,
     pub pinned_version: Option<String>,
-    /// `HH:MM-HH:MM` local; installs wait for the window.
     pub window: Option<(u8, u8, u8, u8)>,
-    /// Whether a major-version jump may install without a person.
     pub allow_major_automatically: bool,
 }
 
@@ -51,18 +44,11 @@ impl From<&UpdateConfig> for Policy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Install,
-    /// A person must approve; the panel shows a button, the daemon waits.
     NeedsApproval(String),
-    /// Not now, but later (outside the window, jobs running).
     Defer(String),
-    /// Never, for this candidate.
     Refuse(String),
 }
 
-/// `explicit` means a person asked for this exact version (panel button
-/// with confirmation, or `serverosd update --to`), which overrides the
-/// automatic gate and the major-jump gate but never the signature, the
-/// pin, or `min_from`.
 pub fn decide(
     policy: &Policy,
     current: &str,
@@ -164,7 +150,6 @@ fn in_window(now: u16, from: u16, to: u16) -> bool {
     }
 }
 
-/// Parse `HH:MM-HH:MM`.
 pub fn parse_window(text: &str) -> Option<(u8, u8, u8, u8)> {
     let (a, b) = text.split_once('-')?;
     let (ah, am) = a.split_once(':')?;

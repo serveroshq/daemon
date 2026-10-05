@@ -1,6 +1,3 @@
-//! The only place telemetry touches the filesystem. Every path is listed
-//! here so the Trust page's "what we read" is a copy of this list.
-
 use std::path::Path;
 
 use crate::TelemetryError;
@@ -32,7 +29,6 @@ pub fn read_optional(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// `statvfs` for a mount: (total, free-for-unprivileged, free, inodes total, inodes free).
 #[cfg(unix)]
 pub fn statvfs(mount: &Path) -> Option<FsUsage> {
     use std::ffi::CString;
@@ -84,7 +80,6 @@ pub fn is_linux() -> bool {
     cfg!(target_os = "linux")
 }
 
-/// Clock ticks per second, for jiffy arithmetic.
 #[cfg(unix)]
 pub fn clock_ticks() -> u64 {
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };

@@ -1,6 +1,3 @@
-//! Runs every source under one time budget at low priority, assembles
-//! the report, and diffs it against the last one to emit change events.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,8 +25,6 @@ impl Default for Scanner {
 }
 
 impl Scanner {
-    /// One full scan. Never fails: a source that errors or overruns is
-    /// noted in `warnings` and the rest of the report stands.
     pub async fn scan(&self) -> InventoryReport {
         let started = Instant::now();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
@@ -141,20 +136,14 @@ impl Scanner {
     }
 }
 
-/// Discovery runs niced with lowered IO priority so a scan on a busy box
-/// costs the customer's services nothing noticeable.
 fn lower_priority() {
     #[cfg(target_os = "linux")]
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-        // ioprio_set(IOPRIO_WHO_PROCESS, 0, IOPRIO_CLASS_IDLE << 13)
         libc::syscall(libc::SYS_ioprio_set, 1, 0, 3 << 13);
     }
 }
 
-/// Change events between two reports: services that appeared, went away,
-/// or changed status. Plus every pre-existing failure the first scan sees,
-/// timestamped and neutral, before ServerOS takes responsibility.
 pub fn diff(previous: Option<&InventoryReport>, current: &InventoryReport) -> Vec<Event> {
     let mut events = Vec::new();
     let before: BTreeMap<&str, &DiscoveredService> = previous

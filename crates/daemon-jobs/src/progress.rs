@@ -1,6 +1,3 @@
-//! The handle a handler reports through. Everything it says is redacted,
-//! stored in the ledger, and forwarded to the panel as a job update.
-
 use daemon_core::redact::redact;
 use daemon_protocol::{JobState, JobUpdate};
 use daemon_state::State;
@@ -8,7 +5,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// How much log a job keeps in the ledger.
 const LOG_KEEP_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
@@ -38,7 +34,6 @@ impl Progress {
         self.job_id
     }
 
-    /// Announce the phase the job is in (`fetch`, `build`, `health`...).
     pub async fn phase(&self, phase: &str, percent: Option<u8>) {
         let _ = self.state.set_job_phase(self.job_id, phase);
         self.send(JobUpdate {
@@ -53,7 +48,6 @@ impl Progress {
         .await;
     }
 
-    /// Log lines, batched. Redacted at write time.
     pub async fn log(&self, lines: impl IntoIterator<Item = String>) {
         let clean: Vec<String> = lines.into_iter().map(|l| self.scrub(&l)).collect();
 
@@ -86,9 +80,6 @@ impl Progress {
     }
 
     pub(crate) async fn send(&self, update: JobUpdate) {
-        // A full channel means the panel is far behind; dropping a progress
-        // frame is better than stalling the job. Terminal updates go through
-        // the runner, which always waits.
         let _ = self.updates.try_send(update);
     }
 }

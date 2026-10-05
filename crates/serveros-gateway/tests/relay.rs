@@ -1,8 +1,3 @@
-//! End to end: a real daemon transport link dials the gateway with a
-//! CA-issued client certificate, the gateway asks a fake panel who it is,
-//! commands flow in through the internal API, envelopes flow out to the
-//! panel, and a browser attaches to a stream with a signed ticket.
-
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,8 +67,6 @@ fn make_pki() -> Pki {
     }
 }
 
-/// A client-auth certificate with a chosen serial, the way the panel's CA
-/// issues one at enrolment.
 fn issue_daemon(
     ca: &rcgen::Certificate,
     ca_key: &rcgen::KeyPair,
@@ -95,7 +88,6 @@ struct PanelLog {
     closed: Vec<String>,
 }
 
-/// Just enough of the panel's gateway API, over TLS, to answer the gateway.
 async fn fake_panel(cert_pem: &str, key_pem: &str, log: Arc<Mutex<PanelLog>>) -> u16 {
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<_, _>>()
@@ -311,7 +303,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
     let panel_port = fake_panel(&pki.panel_cert, &pki.panel_key, Arc::clone(&log)).await;
     let (daemon_port, internal_port, context) = gateway(&pki, panel_port).await;
 
-    // Nothing connected yet: the panel's view is empty and auth is enforced.
     let (status, _) = internal_request(internal_port, "GET", "/machines", None, None).await;
     assert_eq!(status, 401);
     let (status, body) =
@@ -343,7 +334,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
     assert_eq!(status, 200);
     assert_eq!(body["machines"], serde_json::json!(["m-1"]));
 
-    // A command from the panel lands on the daemon with the panel's job id.
     let job_id = uuid::Uuid::new_v4();
     let (status, body) = internal_request(
         internal_port,
@@ -370,7 +360,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
         other => panic!("expected a command, got {other:?}"),
     }
 
-    // A command for a machine that is not connected is refused with 404.
     let (status, _) = internal_request(
         internal_port,
         "POST",
@@ -381,7 +370,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
     .await;
     assert_eq!(status, 404);
 
-    // Daemon events reach the panel in the next batch.
     link.tx
         .send(Outbound::Event(Event {
             kind: EventKind::DiskThreshold,
@@ -404,7 +392,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
     })
     .await;
 
-    // A browser attaches with a ticket the panel signed.
     let session = uuid::Uuid::new_v4();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -479,7 +466,6 @@ async fn a_daemon_connects_gets_commands_and_streams_to_a_browser() {
         other => panic!("expected pty input, got {other:?}"),
     }
 
-    // Hanging up tells the panel and empties the registry.
     drop(browser);
     drop(link);
 
@@ -497,8 +483,6 @@ async fn a_certificate_the_panel_does_not_know_is_refused() {
     let panel_port = fake_panel(&pki.panel_cert, &pki.panel_key, Arc::clone(&log)).await;
     let (daemon_port, _internal_port, context) = gateway(&pki, panel_port).await;
 
-    // Signed by the same CA, but a serial the panel never enrolled (a
-    // revoked or re-enrolled machine's old certificate looks like this).
     let (cert_pem, key_pem) = issue_daemon(&pki.ca, &pki.ca_key, vec![0x99, 0x99]);
     let identity = daemon_identity::Identity {
         key_pem,

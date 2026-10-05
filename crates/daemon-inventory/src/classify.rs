@@ -1,7 +1,3 @@
-//! Turning raw findings into services. Each rule names what it matched on
-//! and how sure it is; anything below the bar is reported as unknown
-//! rather than dressed up.
-
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -15,10 +11,8 @@ use crate::listeners::ProcessInfo;
 use crate::systemd::Unit;
 use crate::webservers::VirtualHost;
 
-/// Confidence below which a service is listed under "unknown".
 pub const KNOWN_THRESHOLD: u8 = 50;
 
-/// What a binary name says about a service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Signature {
     pub kind: ServiceKind,
@@ -29,7 +23,6 @@ pub struct Signature {
     pub default_data_dir: Option<&'static str>,
 }
 
-/// Executable name → what it is. Order matters only for readability.
 pub fn signature_for_exe(comm: &str) -> Option<Signature> {
     let name = comm.trim_end_matches(".exe");
 
@@ -216,7 +209,6 @@ pub fn signature_for_exe(comm: &str) -> Option<Signature> {
     Some(sig)
 }
 
-/// Java processes running a known game jar.
 pub fn game_jar(cmdline: &[String]) -> Option<(&'static str, u8)> {
     let joined = cmdline.join(" ").to_ascii_lowercase();
     let jars = [
@@ -238,7 +230,6 @@ pub fn game_jar(cmdline: &[String]) -> Option<(&'static str, u8)> {
         .map(|(_, label)| (*label, 90))
 }
 
-/// App fingerprints in a working directory: which framework lives here.
 pub fn app_fingerprint(dir: &Path) -> Option<(&'static str, Vec<AdoptedCapability>)> {
     let has = |f: &str| dir.join(f).exists();
 
@@ -328,15 +319,12 @@ pub fn app_fingerprint(dir: &Path) -> Option<(&'static str, Vec<AdoptedCapabilit
     }
 }
 
-/// Pterodactyl and Wings-style layouts: a volume directory with a
-/// server.properties or eula.txt is a game server whatever runs it.
 pub fn looks_like_game_volume(dir: &Path) -> bool {
     dir.starts_with("/var/lib/pterodactyl/volumes")
         || dir.join("eula.txt").exists()
         || dir.join("server.properties").exists()
 }
 
-/// The value after a flag in a command line (`-D /x`, `-D/x`, `--datadir=/x`).
 pub fn flag_value(cmdline: &[String], flag: &str) -> Option<String> {
     for (i, arg) in cmdline.iter().enumerate() {
         if arg == flag {
@@ -352,7 +340,6 @@ pub fn flag_value(cmdline: &[String], flag: &str) -> Option<String> {
     None
 }
 
-/// The capability matrix for a service, derived from how it is run.
 pub fn capabilities(
     manager: ServiceManager,
     kind: ServiceKind,
@@ -369,8 +356,6 @@ pub fn capabilities(
             caps.push(AdoptedCapability::Lifecycle);
             caps.push(AdoptedCapability::Logs);
         }
-        // A process nobody supervises can be observed but not restarted
-        // safely: we would not know how to bring it back.
         ServiceManager::Screen
         | ServiceManager::Manual
         | ServiceManager::Cron
@@ -404,7 +389,6 @@ pub fn capabilities(
     caps
 }
 
-/// Everything a scan gathered, before classification.
 #[derive(Default)]
 pub struct Findings {
     pub listeners: Vec<Listener>,
@@ -424,7 +408,6 @@ pub fn classify(findings: &Findings) -> Classified {
     let mut claimed_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut claimed_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
 
-    // Containers first: a port published by Docker belongs to the container.
     for container in &findings.containers {
         let manager = if container.compose_project.is_some() {
             ServiceManager::Compose
@@ -492,7 +475,6 @@ pub fn classify(findings: &Findings) -> Classified {
         });
     }
 
-    // systemd units: the unit is the service; its main pid claims listeners.
     for unit in &findings.units {
         if crate::systemd::is_system_plumbing(&unit.name)
             || !(unit.is_running() || unit.active == "failed" || unit.user_created())
@@ -660,8 +642,6 @@ pub fn classify(findings: &Findings) -> Classified {
         });
     }
 
-    // Whatever still listens belongs to nobody we recognise as a manager:
-    // pm2, screen, a hand-started binary. Classify by the process.
     let mut unknown = Vec::new();
 
     for listener in &findings.listeners {
@@ -700,8 +680,6 @@ pub fn classify(findings: &Findings) -> Classified {
             .and_then(|d| app_fingerprint(Path::new(d)));
         let attribution = manager_for_process(process, &findings.processes);
         let manager = attribution.manager;
-        // Something a person put under pm2, screen, or a supervisor is a
-        // service on purpose, whatever the binary is.
         let deliberately_run = !matches!(manager, ServiceManager::Manual | ServiceManager::Unknown);
 
         let (kind, label, confidence) = match (signature, game) {
@@ -781,7 +759,6 @@ pub fn classify(findings: &Findings) -> Classified {
             status: ServiceStatus::Running,
             version: None,
             ports: {
-                // One entry per port, however many address families it binds.
                 let mut ports: Vec<u16> = findings
                     .listeners
                     .iter()
@@ -838,16 +815,12 @@ fn kind_for_image(image: &str) -> ServiceKind {
     }
 }
 
-/// Who started an unsupervised process, and what they called it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Attribution {
     manager: ServiceManager,
-    /// pm2's app name or the screen session name, when there is one.
     label: Option<String>,
 }
 
-/// From the process's ancestry: pm2 sets the app name in the child's
-/// environment; screen carries the session name in its own arguments.
 fn manager_for_process(process: &ProcessInfo, all: &HashMap<u32, ProcessInfo>) -> Attribution {
     let mut cursor = process.ppid;
     let mut hops = 0;
@@ -858,8 +831,6 @@ fn manager_for_process(process: &ProcessInfo, all: &HashMap<u32, ProcessInfo>) -
         }
 
         if let Some(parent) = all.get(&ppid) {
-            // pm2 runs under node with a rewritten process title, so look at
-            // the title and the script path as well as the binary.
             let title = parent.cmdline.first().map(String::as_str).unwrap_or("");
             let exe = parent.exe.as_deref().unwrap_or("");
             let comm = parent.comm().unwrap_or("");
@@ -906,7 +877,6 @@ fn manager_for_process(process: &ProcessInfo, all: &HashMap<u32, ProcessInfo>) -
     }
 }
 
-/// The `-S name` (or `-dmS name`) a screen session was given.
 fn screen_session_name(cmdline: &[String]) -> Option<String> {
     let words: Vec<&str> = cmdline.iter().flat_map(|c| c.split_whitespace()).collect();
 

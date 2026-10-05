@@ -1,6 +1,3 @@
-//! Terminal sessions: who opened them, when, for how long, and the pumps
-//! between the PTY and the control channel.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,8 +48,6 @@ impl TerminalSession {
 pub struct Sessions {
     open: Mutex<HashMap<Uuid, Arc<TerminalSession>>>,
     pub idle_timeout: Option<Duration>,
-    /// Off by default; an account-level opt-in turns it on and the panel
-    /// shows a banner in every recorded session.
     pub recording: bool,
 }
 
@@ -77,8 +72,6 @@ impl Sessions {
             .cloned()
     }
 
-    /// Open a shell as `user` for `actor`. Output frames go to `out`; the
-    /// session ends on shell exit, idle timeout, or close.
     pub fn open(
         &self,
         id: Uuid,
@@ -163,8 +156,6 @@ impl Sessions {
         Ok(session)
     }
 
-    /// Remove a session from the table (after its pump has ended) and
-    /// return it so the caller can log actor and duration.
     pub fn take(&self, id: Uuid) -> Option<Arc<TerminalSession>> {
         self.open
             .lock()
@@ -172,7 +163,6 @@ impl Sessions {
             .remove(&id)
     }
 
-    /// Route an inbound frame from the panel to its session.
     pub async fn handle_frame(&self, frame: &StreamFrame) {
         let Some(session) = self.get(frame.session) else {
             return;

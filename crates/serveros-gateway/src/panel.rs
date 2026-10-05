@@ -1,7 +1,3 @@
-//! The gateway's client for the panel: who is this certificate, here is a
-//! batch of envelopes, that machine hung up. Authenticated with the shared
-//! secret in `X-Gateway-Secret`.
-
 use daemon_http::{Client, HttpError, Trust};
 use daemon_protocol::{Envelope, Hello, HelloAck};
 use serde::Deserialize;
@@ -9,8 +5,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PanelError {
-    /// The panel answered, and said no. `code` is the machine-readable
-    /// reason (certificate_unknown, certificate_expired, protocol_unsupported).
     #[error("{message} ({code})")]
     Refused {
         status: u16,

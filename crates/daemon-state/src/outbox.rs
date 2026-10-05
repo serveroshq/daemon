@@ -1,7 +1,3 @@
-//! The outbox: outbound messages that must reach the panel even if it is
-//! away right now. Job updates and events are pushed here first, sent from
-//! here, and deleted only once the transport has written them.
-
 use rusqlite::params;
 
 use crate::{Result, State};
@@ -25,7 +21,6 @@ impl State {
         })
     }
 
-    /// Oldest first, so the panel sees things in the order they happened.
     pub fn outbox_peek(&self, limit: usize) -> Result<Vec<OutboxItem>> {
         self.with(|c| {
             let mut stmt =
@@ -58,8 +53,6 @@ impl State {
         })
     }
 
-    /// Bound the outbox: if the panel has been away for days, keep the
-    /// newest `keep` items rather than every heartbeat-era event.
     pub fn outbox_trim(&self, keep: usize) -> Result<usize> {
         self.with(|c| {
             Ok(c.execute(

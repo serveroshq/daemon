@@ -1,8 +1,3 @@
-//! The rollback guard. After an install, `update.json` sits in the state
-//! directory until the new binary proves itself by connecting to the
-//! panel. Each start without proof counts an attempt; after three, the
-//! previous binary is put back.
-
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -44,17 +39,16 @@ impl Marker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BootDecision {
-    /// No update in progress.
     Normal,
-    /// A new binary is on trial; run, and confirm once connected.
     OnTrial {
         from: String,
         to: String,
         attempt: u32,
     },
-    /// Too many failed starts: the old binary has been restored and the
-    /// process should exit so systemd starts it.
-    RolledBack { from: String, to: String },
+    RolledBack {
+        from: String,
+        to: String,
+    },
 }
 
 pub struct RollbackGuard {
@@ -63,14 +57,11 @@ pub struct RollbackGuard {
 }
 
 impl RollbackGuard {
-    /// Called first thing at start-up, before anything that could hang.
     pub fn on_boot(&self, running_version: &str) -> BootDecision {
         let Some(mut marker) = Marker::read(&self.state_dir) else {
             return BootDecision::Normal;
         };
 
-        // The old binary is running again (a manual restore, or systemd
-        // beat us to it): nothing to guard.
         if marker.to != running_version {
             if marker.from == running_version {
                 warn!(from = %marker.from, to = %marker.to, "previous binary is running; clearing update marker");
@@ -113,7 +104,6 @@ impl RollbackGuard {
         }
     }
 
-    /// The new binary connected and was acknowledged: the update stuck.
     pub fn confirm(&self) -> Option<Marker> {
         let marker = Marker::read(&self.state_dir)?;
         Marker::clear(&self.state_dir);
@@ -137,8 +127,6 @@ impl RollbackGuard {
         std::fs::rename(&previous, &self.binary)
     }
 
-    /// Once an update has been confirmed for a while, the previous binary
-    /// is dead weight.
     pub fn prune_previous(&self) {
         let _ = std::fs::remove_file(self.binary.with_extension("previous"));
         let _ = std::fs::remove_file(self.binary.with_extension("failed"));

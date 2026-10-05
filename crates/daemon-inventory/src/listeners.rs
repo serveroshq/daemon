@@ -1,14 +1,8 @@
-//! Listening sockets and the processes behind them, from `/proc` alone.
-//! No `ss`, no `lsof`: the parsers read `/proc/net/tcp{,6}` and map the
-//! socket inode to a pid by walking `/proc/*/fd`, which is bounded by the
-//! process count and costs nothing on a normal machine.
-
 use std::collections::HashMap;
 use std::path::Path;
 
 use daemon_protocol::Listener;
 
-/// One row of `/proc/net/tcp` or `/proc/net/tcp6` in LISTEN state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Socket {
     pub address: String,
@@ -18,7 +12,6 @@ pub struct Socket {
     pub v6: bool,
 }
 
-/// TCP state 0A is LISTEN.
 pub fn parse_proc_net_tcp(text: &str, v6: bool) -> Vec<Socket> {
     text.lines()
         .skip(1)
@@ -51,7 +44,6 @@ fn decode_address(hex: &str, v6: bool) -> Option<String> {
             return None;
         }
 
-        // Four little-endian 32-bit words.
         let mut bytes = [0u8; 16];
 
         for (i, chunk) in hex.as_bytes().chunks(8).enumerate() {
@@ -73,7 +65,6 @@ fn decode_address(hex: &str, v6: bool) -> Option<String> {
     }
 }
 
-/// What `/proc/<pid>` tells us about a process, read once per pid.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -83,9 +74,7 @@ pub struct ProcessInfo {
     pub user: Option<String>,
     pub uid: Option<u32>,
     pub ppid: Option<u32>,
-    /// `/proc/<pid>/comm`: the kernel's 15-character name.
     pub kernel_comm: Option<String>,
-    /// The `name` pm2 sets in the environment of the apps it runs.
     pub pm2_name: Option<String>,
 }
 
@@ -94,10 +83,6 @@ impl ProcessInfo {
         self.cmdline.join(" ")
     }
 
-    /// The program name, without its path. The first argument wins when it
-    /// is a plain name (`redis-server`, even though the binary on disk is
-    /// the multi-call `redis-check-rdb`); then the kernel's comm; then the
-    /// executable, for processes that rewrote their title.
     pub fn comm(&self) -> Option<&str> {
         let plain =
             |s: &str| !s.is_empty() && !s.contains(char::is_whitespace) && !s.ends_with(':');
@@ -117,9 +102,6 @@ impl ProcessInfo {
     }
 }
 
-/// The one thing we take from a process environment: pm2's app name. The
-/// rest of the environment is dropped unread into anything; it holds
-/// secrets.
 pub fn pm2_name_from_environ(raw: &[u8]) -> Option<String> {
     let entries: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
     let under_pm2 = entries
@@ -144,7 +126,6 @@ pub fn parse_cmdline(raw: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// `Uid:` and `PPid:` lines from `/proc/<pid>/status`.
 pub fn parse_status(text: &str) -> (Option<u32>, Option<u32>) {
     let mut uid = None;
     let mut ppid = None;
@@ -160,7 +141,6 @@ pub fn parse_status(text: &str) -> (Option<u32>, Option<u32>) {
     (uid, ppid)
 }
 
-/// `/etc/passwd` uid → name.
 pub fn parse_passwd(text: &str) -> HashMap<u32, String> {
     text.lines()
         .filter_map(|line| {
@@ -173,8 +153,6 @@ pub fn parse_passwd(text: &str) -> HashMap<u32, String> {
         .collect()
 }
 
-/// Read everything about one process. Any unreadable piece is `None`
-/// rather than a failure; a process may exit mid-scan.
 pub fn read_process(proc_root: &Path, pid: u32, users: &HashMap<u32, String>) -> ProcessInfo {
     let dir = proc_root.join(pid.to_string());
     let (uid, ppid) = std::fs::read_to_string(dir.join("status"))
@@ -207,9 +185,6 @@ pub fn read_process(proc_root: &Path, pid: u32, users: &HashMap<u32, String>) ->
     }
 }
 
-/// Map socket inodes to pids by walking `/proc/*/fd`. Bounded: at most
-/// `max_processes` are inspected, newest pids first, since a runaway
-/// machine with tens of thousands of processes should not stall discovery.
 pub fn map_inodes_to_pids(
     proc_root: &Path,
     wanted: &[u64],
@@ -256,7 +231,6 @@ pub fn map_inodes_to_pids(
     found
 }
 
-/// The full listener picture for the machine.
 pub fn discover(proc_root: &Path) -> (Vec<Listener>, HashMap<u32, ProcessInfo>) {
     let users = std::fs::read_to_string("/etc/passwd")
         .map(|t| parse_passwd(&t))
@@ -280,8 +254,6 @@ pub fn discover(proc_root: &Path) -> (Vec<Listener>, HashMap<u32, ProcessInfo>) 
             .or_insert_with(|| read_process(proc_root, *pid, &users));
     }
 
-    // Ancestors too: who started a listener (pm2, screen, cron) is only
-    // visible up the parent chain, and parents rarely listen themselves.
     let owners_only: Vec<u32> = processes.keys().copied().collect();
     for pid in owners_only {
         let mut cursor = processes.get(&pid).and_then(|p| p.ppid);
@@ -336,8 +308,6 @@ pub fn discover(proc_root: &Path) -> (Vec<Listener>, HashMap<u32, ProcessInfo>) 
     (dedupe(listeners), processes)
 }
 
-/// A dual-stack listener shows up once for v4 and once for v6 on the
-/// same port and pid; keep one row.
 fn dedupe(listeners: Vec<Listener>) -> Vec<Listener> {
     let mut seen = std::collections::HashSet::new();
 

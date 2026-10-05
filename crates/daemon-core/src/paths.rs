@@ -1,29 +1,5 @@
-//! The on-disk layout. One place to change it, one place to read it.
-//!
-//! ```text
-//! /usr/local/bin/serverosd               binary
-//! /etc/serveros/
-//!   daemon.toml                          config (non-secret)
-//!   daemon.key                           private key, 0600 root
-//!   daemon.crt                           client cert
-//!   ca.crt                               pinned CA
-//! /var/lib/serveros/
-//!   state.db                             local state (SQLite)
-//!   inventory.json                       last known service inventory
-//!   jobs/                                job workspaces
-//!   backups/                             local snapshot staging
-//!   manifest.json                        everything ServerOS created (for uninstall)
-//! /var/log/serveros/
-//!   daemon.log                           the daemon's own log
-//!   actions.log                          append-only human-readable audit
-//! /run/serveros/
-//!   daemon.sock                          local control socket (root only)
-//! ```
-
 use std::path::{Path, PathBuf};
 
-/// Absolute paths for one installation. Tests and the `--root` flag point
-/// the whole tree somewhere else; production uses the defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub binary: PathBuf,
@@ -46,7 +22,6 @@ impl Default for Paths {
 }
 
 impl Paths {
-    /// The whole layout re-rooted under `root`, for tests and dry runs.
     pub fn under(root: &Path) -> Self {
         let defaults = Self::default();
         let rebase = |p: &Path| root.join(p.strip_prefix("/").unwrap_or(p));
@@ -92,8 +67,6 @@ impl Paths {
         self.state_dir.join("backups")
     }
 
-    /// Every artifact ServerOS created outside its own directories, so
-    /// uninstall can remove exactly those and nothing else.
     pub fn manifest_file(&self) -> PathBuf {
         self.state_dir.join("manifest.json")
     }
@@ -114,9 +87,6 @@ impl Paths {
         PathBuf::from("/etc/systemd/system/serverosd.service")
     }
 
-    /// The directories the daemon owns, in creation order, with the mode
-    /// each should carry. Config and state are root-only; logs are readable
-    /// so a sysadmin can `cat actions.log` without sudo gymnastics.
     pub fn owned_directories(&self) -> Vec<(PathBuf, u32)> {
         vec![
             (self.config_dir.clone(), 0o700),

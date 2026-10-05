@@ -1,7 +1,3 @@
-//! The background loops: telemetry, discovery, self-health, updates, and
-//! the two forwarders that turn job updates and stream frames into
-//! outbound messages.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,7 +71,6 @@ async fn close_stream(app: &App, frame: &StreamFrame) {
             }
         }
         StreamKind::LogLine => {
-            // Take the tail out under the lock, stop it after the lock is gone.
             let tail = app
                 .tails
                 .lock()
@@ -148,7 +143,6 @@ async fn discovery(app: Arc<App>) {
 
     let interval = app.config.read().unwrap().discovery_interval();
 
-    // First scan once the panel is reachable, so it lands on a live link.
     for _ in 0..60 {
         if app.status.read().unwrap().connected {
             break;
@@ -169,7 +163,6 @@ async fn discovery(app: Arc<App>) {
             Err(e) => warn!(error = %e, "discovery scan failed"),
         }
 
-        // Facts can drift (kernel, disks); resend when they do.
         let fresh = daemon_telemetry::gather_facts();
         let changed = *app.facts.read().unwrap() != fresh;
         if changed {
@@ -317,7 +310,6 @@ async fn housekeeping(app: Arc<App>) {
         let _ = app.state.prune_jobs(now - 30 * 86_400);
         let _ = app.state.outbox_trim(5_000);
 
-        // A confirmed update's previous binary is safe to drop after a day.
         if app.on_trial.is_none() && app.guard.confirm().is_none() {
             let previous = app.paths.binary.with_extension("previous");
             if let Ok(meta) = std::fs::metadata(&previous) {

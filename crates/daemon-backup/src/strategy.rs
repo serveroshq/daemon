@@ -1,6 +1,3 @@
-//! How each kind of service is snapshotted and restored. Native tools
-//! for databases (consistent dumps), tar for everything else.
-
 use std::path::PathBuf;
 
 use daemon_protocol::ServiceKind;
@@ -8,14 +5,9 @@ use daemon_services::ManagedService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
-    /// `pg_dumpall` as the postgres user; restored with `psql`.
     Postgres { user: String },
-    /// `mysqldump --all-databases --single-transaction`; restored with `mysql`.
     Mysql,
-    /// `redis-cli --rdb` to pull a consistent RDB; restored by replacing
-    /// the dump file with the service stopped.
     Redis { data_dir: PathBuf },
-    /// `tar` of the service's directories with cache-like paths excluded.
     Files { paths: Vec<PathBuf> },
 }
 
@@ -51,7 +43,6 @@ impl Strategy {
         }
     }
 
-    /// The tool that must be present for the strategy to work.
     pub fn required_tool(&self) -> &'static str {
         match self {
             Strategy::Postgres { .. } => "pg_dumpall",
@@ -61,7 +52,6 @@ impl Strategy {
         }
     }
 
-    /// Paths tar should skip: caches and build output nobody wants back.
     pub fn tar_excludes() -> &'static [&'static str] {
         &[
             "node_modules",

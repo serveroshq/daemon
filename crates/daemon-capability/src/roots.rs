@@ -1,6 +1,3 @@
-//! Where file operations may reach. Managed service directories, job
-//! workspaces, and whatever the user explicitly added. Never `/`.
-
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -19,8 +16,6 @@ impl PermittedRoots {
         permitted
     }
 
-    /// Add a root. `/` is silently dropped: it is never a valid root, and a
-    /// config that asks for it fails validation earlier anyway.
     pub fn add(&mut self, root: PathBuf) {
         let root = normalize(&root);
 
@@ -37,9 +32,6 @@ impl PermittedRoots {
         self.roots.iter().map(PathBuf::as_path)
     }
 
-    /// Whether `path` is inside a permitted root. Resolved lexically
-    /// (`..` collapsed) so `/srv/app/../../etc/shadow` is `/etc/shadow`.
-    /// Symlinks are checked by the file layer at open time.
     pub fn permits(&self, path: &Path) -> bool {
         let candidate = normalize(path);
 
@@ -47,7 +39,6 @@ impl PermittedRoots {
     }
 }
 
-/// Collapse `.` and `..` without touching the filesystem.
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
 

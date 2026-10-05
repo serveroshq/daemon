@@ -1,5 +1,3 @@
-//! Machine facts: the slow-changing description sent on connect.
-
 use daemon_protocol::{DiskFact, InterfaceFact, MachineFacts};
 
 use crate::platform;
@@ -59,7 +57,6 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// `KEY="value"` or `KEY=value` from os-release.
 pub fn os_release_field(text: &str, key: &str) -> Option<String> {
     text.lines().find_map(|line| {
         let (k, v) = line.split_once('=')?;
@@ -68,7 +65,6 @@ pub fn os_release_field(text: &str, key: &str) -> Option<String> {
 }
 
 fn kernel_version() -> String {
-    // "Linux version 6.8.0-45-generic (buildd@...) ..." → 6.8.0-45-generic
     platform::read_optional(platform::PROC_VERSION)
         .and_then(|v| v.split_whitespace().nth(2).map(str::to_string))
         .unwrap_or_default()
@@ -103,7 +99,6 @@ fn timezone() -> String {
         return tz.trim().to_string();
     }
 
-    // /etc/localtime → /usr/share/zoneinfo/Europe/London
     std::fs::read_link(platform::LOCALTIME)
         .ok()
         .and_then(|p| {
@@ -123,9 +118,6 @@ fn init_system() -> String {
     }
 }
 
-/// Interfaces and their addresses. Read from sysfs and the `ip` output
-/// is deliberately avoided: `/sys/class/net/*/address` gives MACs and
-/// `getifaddrs` gives addresses without spawning anything.
 fn interfaces() -> Vec<InterfaceFact> {
     #[cfg(unix)]
     {

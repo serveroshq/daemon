@@ -27,14 +27,11 @@ pub enum IdentityError {
     CertificateExpired,
 }
 
-/// A freshly generated private key, held only long enough to enrol and
-/// write it to disk.
 pub struct KeyMaterial {
     key_pair: KeyPair,
 }
 
 impl KeyMaterial {
-    /// ECDSA P-256. Small, fast, and what every TLS stack accepts.
     pub fn generate() -> Result<Self, IdentityError> {
         KeyPair::generate()
             .map(|key_pair| Self { key_pair })
@@ -54,8 +51,6 @@ impl KeyMaterial {
         self.key_pair.serialize_pem()
     }
 
-    /// A CSR naming the machine. The panel decides what the certificate
-    /// actually says; the CN here is a hint for its logs.
     pub fn certificate_request(
         &self,
         machine_id: &str,
@@ -76,13 +71,11 @@ impl KeyMaterial {
             .map_err(|e| IdentityError::Csr(e.to_string()))
     }
 
-    /// Write the key with mode 0600, root-owned by virtue of who runs this.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
         write_private(path, self.private_key_pem().as_bytes())
     }
 }
 
-/// The full credential set the transport loads on every start.
 #[derive(Clone)]
 pub struct Identity {
     pub key_pem: String,
@@ -155,8 +148,6 @@ impl Identity {
         Ok(certs)
     }
 
-    /// When the client certificate stops being valid, so the daemon can
-    /// warn ahead of time and ask for a rotation.
     pub fn certificate_not_after(&self) -> Result<i64, IdentityError> {
         let chain = self.cert_chain_der()?;
         let (_, cert) = x509_parser::parse_x509_certificate(&chain[0]).map_err(|_| {
@@ -271,7 +262,6 @@ mod tests {
         let paths = Paths::under(dir.path());
         std::fs::create_dir_all(&paths.config_dir).unwrap();
 
-        // Self-signed stand-in for what the panel would issue.
         let key = KeyPair::generate().unwrap();
         let params = CertificateParams::new(vec!["vps.example".into()]).unwrap();
         let cert = params.self_signed(&key).unwrap();

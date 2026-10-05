@@ -1,7 +1,3 @@
-//! Adoption: preview, commit, and reversal. None of these touch the
-//! service itself. Adoption writes a registry row; un-adoption deletes it
-//! and whatever ServerOS added in between.
-
 use std::path::PathBuf;
 
 use daemon_protocol::{AdoptedCapability, DiscoveredService, ServiceOrigin};
@@ -10,23 +6,16 @@ use serde::Serialize;
 use crate::registry::{ManagedService, Registry, RunBy};
 use crate::Result;
 
-/// What the panel shows before the user commits.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AdoptionPreview {
     pub key: String,
     pub name: String,
     pub run_by: String,
-    /// Controls that will light up.
     pub will_manage: Vec<AdoptedCapability>,
-    /// Files and directories ServerOS will read but never rewrite.
     pub left_alone: Vec<String>,
-    /// Controls that stay unavailable and why.
     pub unavailable: Vec<(AdoptedCapability, String)>,
-    /// Always false today: adoption never restarts. Kept in the shape so
-    /// the panel can render an honest estimate if that ever changes.
     pub restart_required: bool,
     pub estimated_downtime_secs: u64,
-    /// Things worth knowing before taking responsibility.
     pub warnings: Vec<String>,
 }
 
@@ -105,7 +94,6 @@ pub fn preview(service: &DiscoveredService) -> AdoptionPreview {
     }
 }
 
-/// Record the adoption. Nothing on the machine changes.
 pub fn commit(
     registry: &Registry<'_>,
     service: &DiscoveredService,
@@ -132,8 +120,6 @@ pub fn commit(
     Ok(managed)
 }
 
-/// Reverse an adoption. Returns the artifacts to delete (only what
-/// ServerOS added) so the caller can remove them and report each one.
 pub fn unadopt(registry: &Registry<'_>, key: &str) -> Result<Vec<PathBuf>> {
     Ok(registry
         .remove(key)?

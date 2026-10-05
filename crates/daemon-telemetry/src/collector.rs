@@ -1,6 +1,3 @@
-//! Takes one sample. Keeps the previous CPU, disk, and network counters so
-//! each sample carries rates rather than raw counters.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -22,8 +19,6 @@ impl Collector {
         Self::default()
     }
 
-    /// One machine-wide sample. The first call establishes the CPU
-    /// baseline and reports 0% rather than a made-up number.
     pub fn sample(&mut self, now_ts: i64) -> Result<Sample, TelemetryError> {
         if !platform::is_linux() {
             return Err(TelemetryError::Unsupported);
@@ -118,7 +113,6 @@ impl Collector {
         })
     }
 
-    /// Memory pressure (PSI `some avg10`), when the kernel exposes it.
     pub fn memory_pressure(&self) -> Option<f32> {
         platform::read_optional(platform::PROC_PRESSURE_MEMORY)
             .and_then(|t| procfs::parse_psi_some_avg10(&t))

@@ -1,7 +1,3 @@
-//! Who is connected right now, and how to reach them. Purely in-memory;
-//! the panel is the durable record and asks `GET /machines` when it wants
-//! the live view.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,13 +8,10 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// A message the gateway wants delivered to a daemon. The connection task
-/// sequences and frames it.
 #[derive(Debug, Clone)]
 pub struct Outgoing {
     pub kind: Kind,
     pub payload: Value,
-    /// Commands carry the panel's job id so updates correlate.
     pub id: Option<Uuid>,
 }
 
@@ -28,8 +21,6 @@ pub struct MachineHandle {
     pub major: u16,
     pub daemon_version: String,
     pub connected_at: i64,
-    /// Unique per connection; a replaced handle must not be unregistered
-    /// by the connection it replaced.
     pub generation: u64,
     pub tx: mpsc::Sender<Outgoing>,
     streams: Mutex<HashMap<Uuid, mpsc::Sender<StreamFrame>>>,
@@ -76,9 +67,6 @@ impl Registry {
         })
     }
 
-    /// Register a connection. A machine that reconnects before its old
-    /// socket died replaces it; the old handle's sender is dropped so its
-    /// task ends.
     pub fn register(&self, handle: Arc<MachineHandle>) -> Option<Arc<MachineHandle>> {
         self.machines
             .write()
@@ -86,7 +74,6 @@ impl Registry {
             .insert(handle.uid.clone(), handle)
     }
 
-    /// Remove the connection only if it is still the current one.
     pub fn unregister(&self, uid: &str, generation: u64) -> bool {
         let mut machines = self.machines.write().unwrap_or_else(|e| e.into_inner());
 
@@ -154,9 +141,6 @@ impl MachineHandle {
             .remove(session);
     }
 
-    /// Deliver a frame from the daemon to whichever browser holds the
-    /// session. Returns false when nobody is attached (the frame is
-    /// dropped: PTY output has no meaning without a viewer).
     pub fn route_stream(&self, frame: StreamFrame) -> bool {
         let sender = self
             .streams

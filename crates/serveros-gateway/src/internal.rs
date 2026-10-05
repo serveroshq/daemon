@@ -1,16 +1,3 @@
-//! The loopback side: the panel's internal API and browser stream
-//! attachments. One small HTTP/1.1 parser, because the surface is four
-//! routes and a WebSocket upgrade.
-//!
-//! ```text
-//! GET  /healthz                         liveness, no auth
-//! GET  /machines                        X-Gateway-Secret
-//! POST /machines/{uid}/commands         X-Gateway-Secret  {id, command}
-//! POST /machines/{uid}/control          X-Gateway-Secret  {control}
-//! GET  /streams/{session}?machine=&ticket=   WebSocket, ticket-authenticated
-//! ```
-
-// tungstenite's handshake callbacks return its own (large) error response type.
 #![allow(clippy::result_large_err)]
 
 use std::net::SocketAddr;
@@ -37,7 +24,6 @@ use crate::Context;
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// A browser that goes quiet for this long is detached.
 const STREAM_IDLE: Duration = Duration::from_secs(30 * 60);
 
 struct Head {
@@ -48,7 +34,6 @@ struct Head {
     secret: Option<String>,
     websocket: bool,
     raw: Vec<u8>,
-    /// Bytes of the body that arrived with the head.
     overflow: Vec<u8>,
 }
 
@@ -172,9 +157,6 @@ struct ControlBody {
     control: Value,
 }
 
-/// A browser attaching to one stream session. Frames from the daemon for
-/// that session arrive as JSON text; input from the browser is wrapped in
-/// a `StreamFrame` and sent to the daemon.
 async fn stream_session(
     stream: Replay<TcpStream>,
     peer: SocketAddr,
@@ -300,7 +282,6 @@ async fn stream_session(
 
     handle.detach_stream(&session);
 
-    // Tell the daemon the viewer went away so it can close the PTY.
     if let Ok(payload) = serde_json::to_value(StreamFrame {
         session,
         kind: StreamKind::PtyInput,
@@ -320,8 +301,6 @@ async fn stream_session(
     Ok(())
 }
 
-/// The handshake callback: accept, or answer with the refusal before any
-/// upgrade happens so the browser sees a status code, not a dead socket.
 fn gate(
     decision: &Result<(), (u16, String)>,
     response: Response,

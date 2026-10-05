@@ -1,7 +1,3 @@
-//! Driving containers through the Docker socket: start, stop, restart,
-//! HUP for reload, and the log stream. A few HTTP calls over the unix
-//! socket; the Docker CLI is never invoked.
-
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -24,7 +20,6 @@ impl Default for DockerAdapter {
     }
 }
 
-/// Container ids and names, as Docker allows them.
 pub fn valid_container_ref(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -134,7 +129,6 @@ impl Lifecycle for DockerAdapter {
 
         let reply = request(&self.socket, "POST", &path, self.timeout).await?;
 
-        // 304: already in that state, which is fine.
         match reply.status {
             204 | 304 => Ok(()),
             _ => Err(docker_error(&reply, &format!("{action:?} {container}"))),
@@ -206,9 +200,6 @@ pub fn status_from_inspect(value: &serde_json::Value) -> ServiceStatus {
     }
 }
 
-/// Docker multiplexes stdout and stderr with 8-byte frame headers when
-/// the container has no TTY: `[stream, 0, 0, 0, len_be32]` then bytes.
-/// A TTY container sends raw text instead; detect which by the header.
 pub fn demux_log_stream(raw: &[u8]) -> String {
     let framed = raw.len() >= 8 && matches!(raw[0], 0..=2) && raw[1..4] == [0, 0, 0];
 
