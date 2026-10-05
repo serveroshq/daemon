@@ -735,6 +735,10 @@ pub struct LogEntry {
     /// The service the line came from, keyed as discovery keys it
     /// (`docker:<short id>`, `systemd:<unit>`).
     pub service: String,
+    /// The container's or unit's name, which, unlike a container id,
+    /// survives a redeploy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// When the service wrote it, unix milliseconds.
     pub ts: i64,
     /// `stdout` or `stderr` for containers; journald lines are `journal`.

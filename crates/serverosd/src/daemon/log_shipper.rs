@@ -5,7 +5,7 @@
 //! batched, and sent as `logs` messages while the link is up; lines written
 //! while it is down are not kept (the services' own logs still have them).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,14 +69,14 @@ pub async fn run(app: Arc<App>) {
         // Containers.
         if let Some(running) = running_containers().await {
             containers.retain(|id, task| {
-                let keep = running.contains(id) && !task.is_finished();
+                let keep = running.contains_key(id) && !task.is_finished();
                 if !keep {
                     task.abort();
                 }
                 keep
             });
 
-            for id in running {
+            for (id, name) in running {
                 if containers.contains_key(&id) {
                     continue;
                 }
@@ -84,7 +84,7 @@ pub async fn run(app: Arc<App>) {
                 let since = shipper.since(&key, first);
                 containers.insert(
                     id.clone(),
-                    tokio::spawn(shipper.clone().container(id, since)),
+                    tokio::spawn(shipper.clone().container(id, name, since)),
                 );
             }
         }
@@ -139,7 +139,7 @@ impl Shipper {
         }
     }
 
-    async fn container(self, id: String, since_ms: i64) {
+    async fn container(self, id: String, name: String, since_ms: i64) {
         let key = format!("docker:{id}");
         let since = format!("{}.{:03}", since_ms / 1000, since_ms % 1000);
         let Ok(mut child) = Command::new("docker")
@@ -157,6 +157,7 @@ impl Shipper {
         let out = child.stdout.take().map(|s| {
             tokio::spawn(self.clone().docker_stream(
                 key.clone(),
+                name.clone(),
                 LogStream::Stdout,
                 s,
                 Arc::clone(&limiter),
@@ -165,6 +166,7 @@ impl Shipper {
         let err = child.stderr.take().map(|s| {
             tokio::spawn(self.clone().docker_stream(
                 key.clone(),
+                name.clone(),
                 LogStream::Stderr,
                 s,
                 Arc::clone(&limiter),
@@ -188,6 +190,7 @@ impl Shipper {
     async fn docker_stream(
         self,
         key: String,
+        name: String,
         stream: LogStream,
         reader: impl AsyncRead + Unpin,
         limiter: Arc<Mutex<RateLimiter>>,
@@ -197,7 +200,7 @@ impl Shipper {
         while let Ok(Some(raw)) = lines.next_line().await {
             let (ts, line) = split_docker_timestamp(&raw);
             let admit = limiter.lock().unwrap().admit();
-            if !self.ship(&key, ts, stream, None, line, admit).await {
+            if !self.ship(&key, &name, ts, stream, None, line, admit).await {
                 return;
             }
         }
@@ -254,6 +257,7 @@ impl Shipper {
             if !self
                 .ship(
                     &key,
+                    &entry.unit,
                     entry.ts,
                     LogStream::Journal,
                     entry.priority,
@@ -270,9 +274,11 @@ impl Shipper {
     }
 
     /// Queue one line. False once the batcher is gone.
+    #[allow(clippy::too_many_arguments)]
     async fn ship(
         &self,
         key: &str,
+        name: &str,
         ts: Option<i64>,
         stream: LogStream,
         priority: Option<u8>,
@@ -289,6 +295,7 @@ impl Shipper {
             }
             Admit::Summarise(n) => entries.push(LogEntry {
                 service: key.to_string(),
+                name: Some(name.to_string()),
                 ts,
                 stream,
                 priority: Some(4),
@@ -301,6 +308,7 @@ impl Shipper {
         }
         entries.push(LogEntry {
             service: key.to_string(),
+            name: Some(name.to_string()),
             ts,
             stream,
             priority,
@@ -355,10 +363,10 @@ async fn batcher(app: Arc<App>, mut rx: mpsc::Receiver<LogEntry>, dropped: Arc<A
     }
 }
 
-/// Short ids of the running containers, or None when Docker can't say.
-async fn running_containers() -> Option<BTreeSet<String>> {
+/// The running containers, short id to name, or None when Docker can't say.
+async fn running_containers() -> Option<BTreeMap<String, String>> {
     let ps = Command::new("docker")
-        .args(["ps", "-q"])
+        .args(["ps", "--format", "{{.ID}} {{.Names}}"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true)
@@ -375,8 +383,11 @@ async fn running_containers() -> Option<BTreeSet<String>> {
     Some(
         String::from_utf8_lossy(&output.stdout)
             .lines()
-            .map(|id| id.trim().chars().take(12).collect::<String>())
-            .filter(|id| !id.is_empty())
+            .filter_map(|row| {
+                let (id, name) = row.trim().split_once(' ')?;
+                let id: String = id.chars().take(12).collect();
+                Some((id, name.split(',').next().unwrap_or(name).to_string()))
+            })
             .collect(),
     )
 }
