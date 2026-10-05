@@ -56,14 +56,30 @@ fn denied(d: daemon_capability::Denied) -> Failure {
     )
 }
 
-fn managed(app: &App, key: &str) -> Result<ManagedService, Failure> {
-    Registry::new(&app.state)
-        .get(key)
-        .map_err(|e| Failure::new("registry", e.to_string()))?
-        .ok_or_else(|| {
-            Failure::new("service", format!("{key} is not managed by ServerOS"))
-                .with_next_step("Adopt it from the machine's Services tab first.")
-        })
+async fn managed(app: &App, key: &str) -> Result<ManagedService, Failure> {
+    let registry = Registry::new(&app.state);
+    let lookup = || {
+        registry
+            .get(key)
+            .map_err(|e| Failure::new("registry", e.to_string()))
+    };
+
+    if let Some(service) = lookup()? {
+        return Ok(service);
+    }
+
+    // A container ServerOS created but never registered (its deploy was
+    // interrupted, say) is ours all the same: register it and carry on.
+    if key.starts_with("docker:") && super::service_ops::register_earlier_deploys(app).await > 0 {
+        if let Some(service) = lookup()? {
+            return Ok(service);
+        }
+    }
+
+    Err(
+        Failure::new("service", format!("{key} is not managed by ServerOS"))
+            .with_next_step("Adopt it from the machine's Services tab first."),
+    )
 }
 
 async fn lifecycle(
@@ -147,7 +163,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         }
 
         Job::ServiceAction { service, action } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             let op = match action {
                 ServiceAction::Start => ServiceOp::Start {
                     service: managed.name.clone(),
@@ -173,7 +189,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             command,
             timeout_secs,
         } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             let container = super::service_ops::container_of(&managed)
                 .ok_or_else(|| {
                     Failure::new(
@@ -198,7 +214,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             service,
             delete_data,
         } => {
-            let managed = managed(&app, &service)?;
+            let managed = match managed(&app, &service).await {
+                Ok(managed) => managed,
+                // Already gone, with the rest of its Compose project or by
+                // hand: removing it again has nothing left to do.
+                Err(_) if !super::service_ops::container_exists(&service).await => {
+                    ctx.progress
+                        .line(format!("{service} was already removed"))
+                        .await;
+                    return Ok(json!({ "removed": 0, "volumes_deleted": 0 }));
+                }
+                Err(failure) => return Err(failure),
+            };
             let grant = authorize(Operation::Service(ServiceOp::Remove {
                 service: managed.key.clone(),
             }))?;
@@ -211,7 +238,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         }
 
         Job::ServiceLogs { service, lines } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             let grant = authorize(Operation::Service(ServiceOp::ReadLogs {
                 service: managed.name.clone(),
             }))?;
@@ -417,12 +444,12 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         }
 
         Job::Snapshots { service } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             Ok(json!({"snapshots": app.snapshotter.list(&managed.name)}))
         }
 
         Job::Backup { service, reason } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             let strategy = daemon_backup::Strategy::for_service(&managed).ok_or_else(|| {
                 Failure::new(
                     "backup",
@@ -463,7 +490,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         }
 
         Job::Restore { service, snapshot } => {
-            let managed = managed(&app, &service)?;
+            let managed = managed(&app, &service).await?;
             let strategy = daemon_backup::Strategy::for_service(&managed).ok_or_else(|| {
                 Failure::new(
                     "restore",

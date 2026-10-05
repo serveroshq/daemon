@@ -63,6 +63,27 @@ pub async fn exec(
     }
 }
 
+/// Whether the container behind a `docker:<id>` key still exists. Only
+/// `false` when Docker answers that it doesn't.
+pub async fn container_exists(key: &str) -> bool {
+    let Some(id) = key.strip_prefix("docker:") else {
+        return true;
+    };
+
+    match tokio::process::Command::new("docker")
+        .args(["container", "inspect", "--format", "{{.Id}}", id])
+        .kill_on_drop(true)
+        .output()
+        .await
+    {
+        Ok(out) => {
+            out.status.success()
+                || !String::from_utf8_lossy(&out.stderr).contains("No such container")
+        }
+        Err(_) => true,
+    }
+}
+
 /// Remove a service's containers (and, with `delete_data`, its volumes),
 /// then forget it. Compose services go as a whole project.
 pub async fn remove(

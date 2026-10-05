@@ -66,7 +66,7 @@ async fn probe(port: u16, check: &HealthCheck) -> Result<(), String> {
     let n = stream.read(&mut head).await.map_err(|e| e.to_string())?;
     let status = parse_status(&head[..n]).ok_or_else(|| "response was not HTTP".to_string())?;
 
-    if status == check.expected_status {
+    if is_healthy(status, check.expected_status) {
         Ok(())
     } else {
         Err(format!(
@@ -74,6 +74,12 @@ async fn probe(port: u16, check: &HealthCheck) -> Result<(), String> {
             check.path, check.expected_status
         ))
     }
+}
+
+/// The expected status, or for the default 200 a redirect too: apps that
+/// send `/` to their login or setup page (Uptime Kuma, paperless) are up.
+pub fn is_healthy(status: u16, expected: u16) -> bool {
+    status == expected || (expected == 200 && (300..400).contains(&status))
 }
 
 pub fn parse_status(head: &[u8]) -> Option<u16> {
@@ -95,5 +101,16 @@ mod tests {
         assert_eq!(parse_status(b"HTTP/1.1 200 OK\r\n"), Some(200));
         assert_eq!(parse_status(b"HTTP/1.0 503 Unavailable"), Some(503));
         assert_eq!(parse_status(b"not http"), None);
+    }
+
+    #[test]
+    fn a_redirect_counts_as_up_when_200_is_expected() {
+        assert!(is_healthy(200, 200));
+        assert!(is_healthy(302, 200));
+        assert!(is_healthy(308, 200));
+        assert!(!is_healthy(404, 200));
+        assert!(!is_healthy(502, 200));
+        // An explicit expectation stays exact.
+        assert!(!is_healthy(302, 204));
     }
 }

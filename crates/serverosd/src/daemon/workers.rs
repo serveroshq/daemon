@@ -176,7 +176,7 @@ async fn discovery(app: Arc<App>) {
             app.send(Outbound::Facts(fresh)).await;
         }
 
-        tokio::time::sleep(interval).await;
+        app.supervisor.idle("discovery", interval).await;
     }
 }
 

@@ -51,6 +51,21 @@ impl Supervisor {
             .insert(worker, Instant::now());
     }
 
+    /// Sleep between rounds of work while still ticking, so a worker that
+    /// runs hourly (discovery) isn't mistaken for a wedged one after
+    /// `WORKER_STALL` and the whole daemon restarted, mid-deploy.
+    pub async fn idle(&self, worker: &'static str, total: Duration) {
+        let heartbeat = WORKER_STALL / 4;
+        let mut remaining = total;
+
+        while !remaining.is_zero() {
+            let step = remaining.min(heartbeat);
+            tokio::time::sleep(step).await;
+            remaining -= step;
+            self.tick(worker);
+        }
+    }
+
     pub fn worker_health(&self) -> BTreeMap<&'static str, WorkerHealth> {
         self.ticks
             .lock()
@@ -191,6 +206,18 @@ impl StartHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_idle_worker_keeps_ticking() {
+        let supervisor = Supervisor::new();
+        supervisor.idle("discovery", Duration::from_millis(5)).await;
+
+        assert_eq!(
+            supervisor.worker_health().get("discovery"),
+            Some(&WorkerHealth::Ok)
+        );
+        assert_eq!(supervisor.assess(0), Verdict::Fine);
+    }
 
     #[test]
     fn memory_over_the_ceiling_asks_for_a_process_restart() {
