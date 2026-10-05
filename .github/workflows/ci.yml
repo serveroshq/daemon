@@ -46,9 +46,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
-      - run: cargo build --release --target ${{ matrix.target }} -p serverosd
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-      - run: file target/${{ matrix.target }}/release/serverosd | grep -q 'statically linked'
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # aarch64 builds with zig as the C compiler and linker, so bundled C
+      # (SQLite) compiles against musl's headers rather than glibc's.
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: mlugg/setup-zig@v2
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+      - run: cargo ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'zigbuild' || 'build' }} --release --target ${{ matrix.target }} -p serverosd
+      - run: file target/${{ matrix.target }}/release/serverosd | grep -qE 'statically linked|static-pie linked'

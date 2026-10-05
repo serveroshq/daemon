@@ -32,17 +32,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # aarch64 builds with zig as the C compiler and linker, so bundled C
+      # (SQLite) compiles against musl's headers rather than glibc's.
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: mlugg/setup-zig@v2
+      - if: matrix.target == 'aarch64-unknown-linux-musl'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p serverosd
+        run: cargo ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'zigbuild' || 'build' }} --release --target ${{ matrix.target }} -p serverosd
         env:
           SERVEROS_VERSION: ${{ github.ref_name }}
           SERVEROS_COMMIT: ${{ github.sha }}
           SERVEROS_CHANNEL: ${{ contains(github.ref_name, '-') && 'canary' || 'stable' }}
           SERVEROS_TARGET: linux-${{ matrix.arch }}
           SERVEROS_RELEASE_PUBKEY: ${{ vars.SERVEROS_RELEASE_PUBKEY }}
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
       - name: Stage
         run: |
           mkdir -p dist
