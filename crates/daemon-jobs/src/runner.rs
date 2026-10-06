@@ -345,6 +345,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::BackupReceiver { .. } => "backup_receiver",
         Job::Restore { .. } => "restore",
         Job::PackageUpdates { .. } => "package_updates",
+        Job::PackageInstall { .. } => "package_install",
         Job::Reboot => "reboot",
         Job::FirewallRule { .. } => "firewall_rule",
         Job::SshKey { .. } => "ssh_key",

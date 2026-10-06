@@ -203,6 +203,111 @@ pub async fn package_updates(
     })
 }
 
+const MAX_INSTALL_PACKAGES: usize = 500;
+
+fn valid_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 200
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+._:-~".contains(c))
+}
+
+pub async fn install_packages(
+    ctx: &JobContext,
+    packages: &[String],
+) -> Result<PackageReport, Failure> {
+    let manager = manager().ok_or_else(|| {
+        Failure::new(
+            "unsupported",
+            "no supported package manager (apt, dnf, yum) on this machine",
+        )
+    })?;
+    if packages.is_empty() || packages.len() > MAX_INSTALL_PACKAGES {
+        return Err(Failure::new(
+            "packages",
+            format!("name between 1 and {MAX_INSTALL_PACKAGES} packages"),
+        ));
+    }
+    if let Some(bad) = packages.iter().find(|p| !valid_package_name(p)) {
+        return Err(Failure::new(
+            "packages",
+            format!("{bad:?} isn't a package name"),
+        ));
+    }
+
+    let mut cancel = ctx.cancel.clone();
+    let progress = &ctx.progress;
+    progress.phase("apply", Some(30)).await;
+
+    let names: Vec<&str> = packages.iter().map(String::as_str).collect();
+    let outcome = if manager == "apt" {
+        let mut args = vec![
+            "install",
+            "--only-upgrade",
+            "-y",
+            "-q",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+        ];
+        args.extend(&names);
+        run_child(
+            "apt-get",
+            &args,
+            None,
+            &[("DEBIAN_FRONTEND", "noninteractive")],
+            ctx.timeout,
+            &mut cancel,
+            progress,
+            None,
+        )
+        .await
+    } else {
+        let mut args = vec!["-y", "-q", "upgrade"];
+        args.extend(&names);
+        run_child(
+            manager,
+            &args,
+            None,
+            &[],
+            ctx.timeout,
+            &mut cancel,
+            progress,
+            None,
+        )
+        .await
+    };
+
+    match outcome {
+        ChildOutcome::Exited { code: 0, .. } => {}
+        ChildOutcome::Cancelled { tail } => {
+            return Err(Failure::new("cancelled", "package upgrade cancelled").with_output(tail))
+        }
+        other => {
+            return Err(
+                Failure::new("apply", format!("{manager} upgrade did not complete"))
+                    .with_output(other.tail().to_vec())
+                    .with_next_step(
+                        "Check the output; a held or broken package usually needs a person.",
+                    ),
+            )
+        }
+    }
+
+    Ok(PackageReport {
+        manager: manager.into(),
+        upgradable: Vec::new(),
+        security: Vec::new(),
+        reboot_required: Path::new("/var/run/reboot-required").exists()
+            || Path::new("/run/reboot-required").exists(),
+        applied: true,
+    })
+}
+
 pub fn reboot_soon() {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -645,5 +750,27 @@ mod tests {
         assert!(!valid_public_key(
             "command=\"rm -rf\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmpAbc123def456ghi789jkl012"
         ));
+    }
+}
+
+#[cfg(test)]
+mod package_name_tests {
+    use super::valid_package_name;
+
+    #[test]
+    fn package_names_cant_pass_for_options() {
+        for ok in [
+            "openssl",
+            "libaudit1",
+            "linux-image-6.8.0-45-generic",
+            "g++",
+            "python3.12",
+            "libc6:amd64",
+        ] {
+            assert!(valid_package_name(ok), "{ok} was refused");
+        }
+        for bad in ["", "-y", "--reinstall", "a b", "pkg;rm", "$(x)", "../x"] {
+            assert!(!valid_package_name(bad), "{bad:?} was accepted");
+        }
     }
 }

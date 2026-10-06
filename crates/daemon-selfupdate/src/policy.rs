@@ -1,4 +1,4 @@
-use daemon_core::buildinfo::parse_semver;
+use daemon_core::buildinfo::{compare_versions, parse_semver};
 use daemon_core::config::UpdateConfig;
 use serde::{Deserialize, Serialize};
 
@@ -69,19 +69,21 @@ pub fn decide(
         ));
     };
 
+    let order = compare_versions(&candidate.version, current);
+
     if let Some(pin) = &policy.pinned_version {
-        if parse_semver(pin) != Some(candidate_v) {
+        if compare_versions(pin, &candidate.version) != Some(std::cmp::Ordering::Equal) {
             return Decision::Refuse(format!(
                 "this machine is pinned to {pin}; unpin it to update"
             ));
         }
     }
 
-    if candidate_v == current_v {
+    if order == Some(std::cmp::Ordering::Equal) {
         return Decision::Refuse(format!("{} is already installed", candidate.version));
     }
 
-    if candidate_v < current_v && !explicit {
+    if order == Some(std::cmp::Ordering::Less) && !explicit {
         return Decision::Refuse(format!(
             "{} is older than the installed {current}; downgrades need an explicit instruction",
             candidate.version

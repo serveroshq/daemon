@@ -29,6 +29,7 @@ pub fn spawn_all(app: Arc<App>) {
     });
     tokio::spawn(self_health(Arc::clone(&app)));
     tokio::spawn(updates(Arc::clone(&app)));
+    tokio::spawn(update_checks(Arc::clone(&app)));
     tokio::spawn(housekeeping(app));
 }
 
@@ -299,6 +300,74 @@ async fn updates(app: Arc<App>) {
             }
         }
     }
+}
+
+async fn update_checks(app: Arc<App>) {
+    tokio::time::sleep(Duration::from_secs(300 + jitter(600))).await;
+    let mut last_offered: Option<String> = None;
+
+    loop {
+        let (automatic, interval, url) = {
+            let config = app.config.read().unwrap();
+            (
+                config.updates.automatic,
+                config.updates.check_interval_secs.max(15 * 60),
+                format!(
+                    "https://{}/api/daemon/releases/latest?channel={}&arch={}",
+                    config.panel.host,
+                    config.updates.channel,
+                    std::env::consts::ARCH
+                ),
+            )
+        };
+
+        if automatic && !app.stopping() && app.pending_update.lock().unwrap().is_none() {
+            match check_once(&app, &url).await {
+                Ok(Some(candidate))
+                    if last_offered.as_deref() != Some(candidate.version.as_str()) =>
+                {
+                    last_offered = Some(candidate.version.clone());
+                    info!(version = %candidate.version, "a newer release is available");
+                    super::control::consider_update(&app, candidate, false).await;
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "update check failed; trying again later"),
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(interval + jitter(interval / 10))).await;
+    }
+}
+
+async fn check_once(app: &App, url: &str) -> anyhow::Result<Option<daemon_selfupdate::Candidate>> {
+    let client = daemon_http::Client::new(
+        daemon_http::Trust::WebPki,
+        format!("serverosd/{} (update-check)", app.build.version),
+    );
+    let response = client.get(url).await?;
+    match response.status {
+        200 => {}
+        404 => return Ok(None),
+        status => anyhow::bail!("the release feed answered HTTP {status}"),
+    }
+    let candidate: daemon_selfupdate::Candidate = response
+        .json()
+        .map_err(|e| anyhow::anyhow!("release feed was not understood: {e}"))?;
+
+    let newer = daemon_core::buildinfo::compare_versions(&candidate.version, app.build.version)
+        == Some(std::cmp::Ordering::Greater);
+    Ok(newer.then_some(candidate))
+}
+
+fn jitter(max: u64) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    nanos % max
 }
 
 async fn housekeeping(app: Arc<App>) {

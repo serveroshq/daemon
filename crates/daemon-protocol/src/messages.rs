@@ -455,6 +455,9 @@ pub enum Job {
         apply: bool,
         security_only: bool,
     },
+    PackageInstall {
+        packages: Vec<String>,
+    },
     Reboot,
     FirewallRule {
         action: FirewallAction,

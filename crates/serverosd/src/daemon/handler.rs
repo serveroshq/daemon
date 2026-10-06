@@ -594,6 +594,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
+        Job::PackageInstall { packages } => {
+            let grant = authorize(Operation::Machine(MachineOp::ApplyPackageUpdates {
+                security_only: false,
+            }))?;
+            let result = machine::install_packages(&ctx, &packages).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(format!("{} packages", packages.len())).as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
         Job::Reboot => {
             let grant = authorize(Operation::Machine(MachineOp::Reboot))?;
             machine::reboot_soon();
