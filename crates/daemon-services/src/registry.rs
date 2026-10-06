@@ -119,6 +119,43 @@ impl<'a> Registry<'a> {
         Ok(())
     }
 
+    pub fn follow_recreated(&self, live: &[DiscoveredService]) -> Result<usize> {
+        let mut all = self.all()?;
+        let live_keys: std::collections::BTreeSet<&str> =
+            live.iter().map(|s| s.key.as_str()).collect();
+        let mut moved = 0;
+
+        for service in live {
+            if !service.key.starts_with("docker:") || all.iter().any(|m| m.key == service.key) {
+                continue;
+            }
+            let Some(entry) = all.iter_mut().find(|m| {
+                m.key.starts_with("docker:")
+                    && m.name == service.name
+                    && !live_keys.contains(m.key.as_str())
+            }) else {
+                continue;
+            };
+
+            let container = service.key.trim_start_matches("docker:").to_string();
+            entry.key = service.key.clone();
+            match &mut entry.run_by {
+                RunBy::Docker { container: c } | RunBy::Compose { container: c, .. } => {
+                    *c = container
+                }
+                _ => {}
+            }
+            moved += 1;
+        }
+
+        if moved > 0 {
+            all.sort_by(|a, b| a.key.cmp(&b.key));
+            self.state.kv_set(KEY, &serde_json::to_string(&all)?)?;
+        }
+
+        Ok(moved)
+    }
+
     pub fn remove(&self, key: &str) -> Result<Option<ManagedService>> {
         let mut all = self.all()?;
         let removed = all.iter().position(|s| s.key == key).map(|i| all.remove(i));
@@ -156,6 +193,58 @@ mod tests {
             data_dir: Some(PathBuf::from("/var/lib/x")),
             added_artifacts: vec![],
         }
+    }
+
+    fn container(key: &str, name: &str) -> DiscoveredService {
+        serde_json::from_value(serde_json::json!({
+            "key": key,
+            "name": name,
+            "kind": "container",
+            "manager": "compose",
+            "status": "running",
+            "confidence": 90,
+            "capabilities": [],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn adoption_follows_a_recreated_container() {
+        let state = State::in_memory().unwrap();
+        let registry = Registry::new(&state);
+        let mut web = managed("docker:aaaaaaaaaaaa");
+        web.name = "shop-web-1".into();
+        web.run_by = RunBy::Compose {
+            container: "aaaaaaaaaaaa".into(),
+            project: "shop".into(),
+            dir: "/srv/shop".into(),
+            service: Some("web".into()),
+        };
+        registry.upsert(web).unwrap();
+
+        let live = vec![
+            container("docker:bbbbbbbbbbbb", "shop-web-1"),
+            container("docker:cccccccccccc", "other-1"),
+        ];
+        assert_eq!(registry.follow_recreated(&live).unwrap(), 1);
+
+        let moved = registry.get("docker:bbbbbbbbbbbb").unwrap().unwrap();
+        assert!(registry.get("docker:aaaaaaaaaaaa").unwrap().is_none());
+        assert_eq!(
+            moved.run_by,
+            RunBy::Compose {
+                container: "bbbbbbbbbbbb".into(),
+                project: "shop".into(),
+                dir: "/srv/shop".into(),
+                service: Some("web".into()),
+            }
+        );
+
+        let both = vec![
+            container("docker:bbbbbbbbbbbb", "shop-web-1"),
+            container("docker:dddddddddddd", "shop-web-1"),
+        ];
+        assert_eq!(registry.follow_recreated(&both).unwrap(), 0);
     }
 
     #[test]

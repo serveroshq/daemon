@@ -40,6 +40,10 @@ impl Importer {
         let history = History::new(&self.state);
         let previous = history.last_report()?;
         let owners = history.port_owners()?;
+        let followed = Registry::new(&self.state).follow_recreated(&report.services)?;
+        if followed > 0 {
+            info!(followed, "kept adoptions for recreated containers");
+        }
         let managed: std::collections::BTreeMap<String, ServiceOrigin> = Registry::new(&self.state)
             .all()?
             .into_iter()
