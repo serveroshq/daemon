@@ -433,6 +433,10 @@ pub enum Job {
     Rollback {
         service: String,
         release: Option<String>,
+        /// Data to put back once the code is rolled back: the snapshots taken
+        /// before the deploy that came after the release rolled back to.
+        #[serde(default)]
+        restore: Vec<SnapshotRef>,
     },
     Backup {
         service: String,
@@ -548,6 +552,17 @@ pub struct DeploySpec {
     pub domains: Vec<String>,
     #[serde(default)]
     pub port: Option<u16>,
+    /// Snapshot the app's data before deploying over it, so a deploy that
+    /// breaks it (a bad migration) can be rolled back with its data.
+    #[serde(default = "default_true")]
+    pub snapshot_before: bool,
+}
+
+/// One service's snapshot, by the service's key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotRef {
+    pub service: String,
+    pub snapshot: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -559,6 +574,10 @@ pub struct HealthCheck {
     pub timeout_secs: u64,
     #[serde(default = "default_health_retries")]
     pub retries: u32,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_expected_status() -> u16 {

@@ -165,7 +165,9 @@ fn object_base(prefix: &str, service: &str, snapshot: &str) -> String {
         .join("/")
 }
 
-async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
+/// How to copy a service's data, or why there's nothing to copy. Containers
+/// go by what they mount, read now; everything else by what's known about it.
+pub async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
     let Some(container) = container_of(service) else {
         return Strategy::for_service(service).ok_or_else(|| {
             Failure::new(
@@ -176,6 +178,31 @@ async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
         });
     };
 
+    let paths = container_mounts(container).await?;
+    if paths.is_empty() {
+        return Err(Failure::new(
+            "backup",
+            format!("{} keeps no data outside its container", service.name),
+        )
+        .with_next_step("There is nothing to back up; redeploying it gets it back."));
+    }
+
+    Ok(Strategy::Files { paths })
+}
+
+/// Like `strategy_for`, but None when there's simply nothing to copy, so a
+/// deploy can snapshot what has data and pass over what doesn't.
+pub async fn data_strategy(service: &ManagedService) -> Result<Option<Strategy>, Failure> {
+    match container_of(service) {
+        None => Ok(Strategy::for_service(service)),
+        Some(container) => {
+            let paths = container_mounts(container).await?;
+            Ok((!paths.is_empty()).then_some(Strategy::Files { paths }))
+        }
+    }
+}
+
+async fn container_mounts(container: &str) -> Result<Vec<PathBuf>, Failure> {
     let output = Command::new("docker")
         .args([
             "inspect",
@@ -196,16 +223,7 @@ async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
         ));
     }
 
-    let paths = mount_paths(&String::from_utf8_lossy(&output.stdout));
-    if paths.is_empty() {
-        return Err(Failure::new(
-            "backup",
-            format!("{} keeps no data outside its container", service.name),
-        )
-        .with_next_step("There is nothing to back up; redeploying it gets it back."));
-    }
-
-    Ok(Strategy::Files { paths })
+    Ok(mount_paths(&String::from_utf8_lossy(&output.stdout)))
 }
 
 fn mount_paths(inspect: &str) -> Vec<PathBuf> {

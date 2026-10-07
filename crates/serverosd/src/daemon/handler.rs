@@ -115,6 +115,64 @@ async fn lifecycle(
     }
 }
 
+/// Put a snapshot back, stopping and starting the service the way its
+/// manager does where the strategy needs it.
+async fn restore_one(
+    app: &App,
+    ctx: &JobContext,
+    managed: &ManagedService,
+    strategy: &daemon_backup::Strategy,
+    snapshot: &str,
+) -> Result<(String, daemon_backup::Manifest), Failure> {
+    let mut cancel = ctx.cancel.clone();
+    match &managed.run_by {
+        RunBy::Systemd { .. } => {
+            app.snapshotter
+                .restore(
+                    managed,
+                    strategy,
+                    snapshot,
+                    &SystemdAdapter::default(),
+                    &mut cancel,
+                    &ctx.progress,
+                )
+                .await
+        }
+        _ => {
+            app.snapshotter
+                .restore(
+                    managed,
+                    strategy,
+                    snapshot,
+                    &DockerAdapter::default(),
+                    &mut cancel,
+                    &ctx.progress,
+                )
+                .await
+        }
+    }
+}
+
+/// What a deploy replaces: the live release's container, or every container
+/// of a Compose app. Nothing on a first deploy.
+fn deploy_targets(app: &App, spec: &daemon_protocol::DeploySpec) -> Vec<ManagedService> {
+    let Some(current) = daemon_deploy::ReleaseLedger::new(&app.state).current(&spec.service) else {
+        return Vec::new();
+    };
+    let project = format!("serveros-{}", daemon_deploy::git::sanitise(&spec.service));
+
+    Registry::new(&app.state)
+        .all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| match &m.run_by {
+            RunBy::Compose { project: p, .. } => spec.compose_file.is_some() && p == &project,
+            RunBy::Docker { container } => container == &current.container,
+            _ => false,
+        })
+        .collect()
+}
+
 async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
     let actor = actor_of(&ctx);
     let confirmed = ctx.command.confirmed;
@@ -387,6 +445,71 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 service: spec.service.clone(),
                 workspace,
             }))?;
+            // Snapshot what this deploy replaces, so it can be rolled back
+            // with its data. If that fails, nothing is deployed.
+            let mut snapshots = Vec::new();
+            if spec.snapshot_before {
+                for target in deploy_targets(&app, &spec) {
+                    let strategy = match super::backup_ops::data_strategy(&target).await {
+                        Ok(Some(strategy)) => strategy,
+                        Ok(None) => continue,
+                        Err(failure) => {
+                            grant.finish(&Err(failure.clone()), None);
+                            return Err(failure);
+                        }
+                    };
+                    ctx.progress.phase("snapshot", Some(3)).await;
+                    let snap = authorize(Operation::Data(DataOp::Snapshot {
+                        service: target.name.clone(),
+                    }))?;
+                    let estimate = app
+                        .snapshotter
+                        .list(&target.name)
+                        .last()
+                        .map(|m| m.total_bytes)
+                        .unwrap_or(256 * 1024 * 1024);
+                    let mut cancel = ctx.cancel.clone();
+                    let taken = app
+                        .snapshotter
+                        .take(
+                            &target,
+                            &strategy,
+                            daemon_backup::PRE_DEPLOY,
+                            estimate,
+                            &mut cancel,
+                            &ctx.progress,
+                        )
+                        .await;
+                    snap.finish(
+                        &taken.as_ref().map(|_| ()),
+                        taken
+                            .as_ref()
+                            .ok()
+                            .map(|m| format!("pre-deploy snapshot {}", m.id))
+                            .as_deref(),
+                    );
+                    let manifest = match taken {
+                        Ok(manifest) => manifest,
+                        Err(failure) => {
+                            let failure = failure.with_next_step(
+                                "Nothing was deployed. Free some disk space, or deploy with the snapshot before deploying turned off.",
+                            );
+                            grant.finish(&Err(failure.clone()), None);
+                            return Err(failure);
+                        }
+                    };
+                    ctx.progress
+                        .line(format!("snapshot {} of {} taken", manifest.id, target.name))
+                        .await;
+                    snapshots.push(json!({
+                        "service": target.key,
+                        "name": target.name,
+                        "snapshot": manifest.id,
+                        "bytes": manifest.total_bytes,
+                    }));
+                }
+            }
+
             let result = app.deployer.deploy(&ctx, &spec).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
@@ -434,10 +557,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 );
             }
 
-            Ok(serde_json::to_value(result).unwrap_or(Value::Null))
+            let mut value = serde_json::to_value(result).unwrap_or(Value::Null);
+            if let Value::Object(fields) = &mut value {
+                fields.insert("pre_deploy_snapshots".into(), Value::Array(snapshots));
+            }
+            Ok(value)
         }
 
-        Job::Rollback { service, release } => {
+        Job::Rollback {
+            service,
+            release,
+            restore,
+        } => {
             let grant = authorize(Operation::Deploy(DeployOp::Rollback {
                 service: service.clone(),
             }))?;
@@ -453,7 +584,42 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 .rollback(&ctx, &service, release.as_deref(), &domains)
                 .await;
             grant.finish(&result.as_ref().map(|_| ()), None);
-            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+            let mut value = serde_json::to_value(result?).unwrap_or(Value::Null);
+
+            // Then the data, from before the deploy that's been undone. Each
+            // restore snapshots what's there first, so it can be undone too.
+            let mut restored = Vec::new();
+            for wanted in &restore {
+                let managed = managed(&app, &wanted.service).await?;
+                let strategy = super::backup_ops::strategy_for(&managed).await?;
+                let grant = authorize(Operation::Data(DataOp::Restore {
+                    service: managed.name.clone(),
+                    snapshot: wanted.snapshot.clone(),
+                }))?;
+                let result = restore_one(&app, &ctx, &managed, &strategy, &wanted.snapshot).await;
+                grant.finish(
+                    &result.as_ref().map(|_| ()),
+                    result
+                        .as_ref()
+                        .ok()
+                        .map(|(safety, _)| format!("pre-restore snapshot {safety}"))
+                        .as_deref(),
+                );
+                let (safety, manifest) = result.map_err(|f| {
+                    f.with_next_step(
+                        "The code is rolled back, but its data isn't. Restore the snapshot from the backups history.",
+                    )
+                })?;
+                restored.push(json!({
+                    "service": managed.key,
+                    "restored": manifest.id,
+                    "pre_restore_snapshot": safety,
+                }));
+            }
+            if let Value::Object(fields) = &mut value {
+                fields.insert("restored".into(), Value::Array(restored));
+            }
+            Ok(value)
         }
 
         Job::Snapshots { service } => {
@@ -463,13 +629,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::Backup { service, reason } => {
             let managed = managed(&app, &service).await?;
-            let strategy = daemon_backup::Strategy::for_service(&managed).ok_or_else(|| {
-                Failure::new(
-                    "backup",
-                    format!("ServerOS does not know how to snapshot {}", managed.name),
-                )
-                .with_next_step("Set a data directory for the service, or back it up by files.")
-            })?;
+            let strategy = super::backup_ops::strategy_for(&managed).await?;
             let grant = authorize(Operation::Data(DataOp::Snapshot {
                 service: managed.name.clone(),
             }))?;
@@ -538,43 +698,14 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::Restore { service, snapshot } => {
             let managed = managed(&app, &service).await?;
-            let strategy = daemon_backup::Strategy::for_service(&managed).ok_or_else(|| {
-                Failure::new(
-                    "restore",
-                    format!("ServerOS does not know how to restore {}", managed.name),
-                )
-            })?;
+            // Containers' data is in what they mount, which only inspecting
+            // them now tells; the same way the backup found it.
+            let strategy = super::backup_ops::strategy_for(&managed).await?;
             let grant = authorize(Operation::Data(DataOp::Restore {
                 service: managed.name.clone(),
                 snapshot: snapshot.clone(),
             }))?;
-            let mut cancel = ctx.cancel.clone();
-            let result = match &managed.run_by {
-                RunBy::Systemd { .. } => {
-                    app.snapshotter
-                        .restore(
-                            &managed,
-                            &strategy,
-                            &snapshot,
-                            &SystemdAdapter::default(),
-                            &mut cancel,
-                            &ctx.progress,
-                        )
-                        .await
-                }
-                _ => {
-                    app.snapshotter
-                        .restore(
-                            &managed,
-                            &strategy,
-                            &snapshot,
-                            &DockerAdapter::default(),
-                            &mut cancel,
-                            &ctx.progress,
-                        )
-                        .await
-                }
-            };
+            let result = restore_one(&app, &ctx, &managed, &strategy, &snapshot).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result

@@ -197,7 +197,19 @@ impl Snapshotter {
         .map_err(|e| Failure::new("record", e.to_string()))?;
 
         progress.phase("prune", Some(95)).await;
-        for old in retention::to_prune(&self.list(&service.name), self.retention) {
+        // Pre-deploy snapshots and everything else are kept separately.
+        let pre_deploy = reason == crate::PRE_DEPLOY;
+        let group: Vec<Manifest> = self
+            .list(&service.name)
+            .into_iter()
+            .filter(|m| (m.reason == crate::PRE_DEPLOY) == pre_deploy)
+            .collect();
+        let keep = if pre_deploy {
+            crate::PRE_DEPLOY_RETENTION
+        } else {
+            self.retention
+        };
+        for old in retention::to_prune(&group, keep) {
             let _ = std::fs::remove_dir_all(self.service_dir(&service.name).join(&old.id));
             progress.line(format!("pruned snapshot {}", old.id)).await;
         }
@@ -529,7 +541,7 @@ mod tests {
         let (_tx, mut cancel) = watch::channel(false);
         let progress = progress();
 
-        for reason in ["manual", "pre-deploy", "scheduled"] {
+        for reason in ["manual", "pre-deploy", "scheduled", "weekly"] {
             let manifest = snapshotter
                 .take(&service, &strategy, reason, 1024, &mut cancel, &progress)
                 .await
@@ -539,8 +551,12 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1100)).await;
         }
 
-        let kept = snapshotter.list("app");
-        assert_eq!(kept.len(), 2, "retention keeps two");
-        assert!(kept.iter().all(|m| m.reason != "manual"));
+        // Backups keep two; the pre-deploy snapshot is kept apart from them.
+        let kept: Vec<String> = snapshotter
+            .list("app")
+            .into_iter()
+            .map(|m| m.reason)
+            .collect();
+        assert_eq!(kept, vec!["pre-deploy", "scheduled", "weekly"]);
     }
 }
