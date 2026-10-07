@@ -306,7 +306,7 @@ pub async fn change(
             "port": port,
             "proto": proto,
             "exposure": Exposure::Docker,
-            "because": "published by Docker, whose rules come before the host firewall's",
+            "because": firewall::DOCKER_REASON,
             "changes": 0,
             "firewall": before.report(&listening, &docker_ports),
         }));

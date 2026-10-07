@@ -24,6 +24,14 @@ pub const MARK: &str = "ServerOS";
 pub const NFT_TABLE: &str = "serveros";
 pub const NFT_CHAIN: &str = "input";
 
+/// Why a port Docker publishes is reachable whatever the firewall says.
+pub const DOCKER_REASON: &str =
+    "Published by a Docker container: Docker lets it in before the firewall can block it";
+
+/// How a chain's default reads, so a reason given by a rule can be told
+/// apart from one given by the default.
+const BY_DEFAULT: &str = ": no rule ";
+
 const UFW: &[&str] = &["/usr/sbin/ufw"];
 const NFT: &[&str] = &["/usr/sbin/nft", "/sbin/nft"];
 const IPTABLES: &[&str] = &["/usr/sbin/iptables", "/sbin/iptables"];
@@ -64,6 +72,15 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// The chain as people know it: "ufw", "iptables" or an nftables chain.
+    fn label(&self) -> String {
+        match self.name.as_str() {
+            "ufw" => "ufw".into(),
+            "iptables INPUT" => "iptables".into(),
+            name => format!("nftables ({name})"),
+        }
+    }
+
     /// Whether this chain sees IPv4 or IPv6 traffic: nftables' `ip` and
     /// `ip6` tables see only theirs.
     pub fn sees(&self, v6: bool) -> bool {
@@ -132,7 +149,11 @@ impl Chain {
                 }
             }
 
-            let policy = format!("{}: by default {}", self.name, verdict_word(self.policy));
+            let policy = if self.policy.lets_in() {
+                format!("{} lets it in{BY_DEFAULT}blocks it", self.label())
+            } else {
+                format!("{} blocks it{BY_DEFAULT}lets it in", self.label())
+            };
             match (self.policy.lets_in(), allowed_from) {
                 (true, _) => (Exposure::Open, policy),
                 (false, Some(rule)) => (Exposure::Restricted, rule),
@@ -143,7 +164,7 @@ impl Chain {
         match (decided.0, maybe) {
             (Exposure::Blocked | Exposure::Restricted, Some(rule)) => (
                 Exposure::Unknown,
-                format!("{rule}: ServerOS can't read this rule, and it may let it in"),
+                format!("A rule ServerOS can't fully check may let it in: {rule}"),
             ),
             _ => decided,
         }
@@ -223,11 +244,20 @@ impl Ruleset {
     fn settled(&self) -> Option<(Exposure, String)> {
         let name = backend_name(self.backend);
         if !self.installed {
-            Some((Exposure::Open, format!("{name} is not installed")))
+            Some((
+                Exposure::Open,
+                format!("{name} isn't installed, so nothing blocks it"),
+            ))
         } else if !self.active {
-            Some((Exposure::Open, format!("{name} is not turned on")))
+            Some((
+                Exposure::Open,
+                format!("{name} is turned off, so nothing blocks it"),
+            ))
         } else if !self.readable {
-            Some((Exposure::Unknown, format!("couldn't read {name}'s rules")))
+            Some((
+                Exposure::Unknown,
+                format!("ServerOS couldn't read {name}'s rules"),
+            ))
         } else {
             None
         }
@@ -239,7 +269,7 @@ impl Ruleset {
         // ip6tables isn't read, so iptables can only speak for IPv4.
         if self.ipv6 && self.backend != FirewallBackend::Iptables {
             let (exposure, because) = self.family_exposure(port, proto, true);
-            families.push((exposure, format!("over IPv6, {because}")));
+            families.push((exposure, format!("Over IPv6: {because}")));
         }
         families
     }
@@ -254,14 +284,14 @@ impl Ruleset {
         };
         let mut decided = (
             Exposure::Open,
-            "no rules filter incoming connections".to_string(),
+            "No firewall rules check incoming connections".to_string(),
         );
         for (i, chain) in self.chains.iter().filter(|c| c.sees(v6)).enumerate() {
             let (exposure, because) = chain.decide(port, proto, v6);
             // Between equals, a rule says more than a chain's default.
             let says_more = rank(exposure) == rank(decided.0)
-                && decided.1.contains(": by default ")
-                && !because.contains(": by default ");
+                && decided.1.contains(BY_DEFAULT)
+                && !because.contains(BY_DEFAULT);
             if i == 0 || rank(exposure) > rank(decided.0) || says_more {
                 decided = (exposure, because);
             }
@@ -287,10 +317,7 @@ impl Ruleset {
                     .as_deref()
                     .is_some_and(|e| e.ends_with("docker-proxy"));
             let (exposure, because) = if docker {
-                (
-                    Exposure::Docker,
-                    "published by Docker, whose rules come before the host firewall's".into(),
-                )
+                (Exposure::Docker, DOCKER_REASON.into())
             } else {
                 self.exposure(listener.port, &proto)
             };
@@ -1470,7 +1497,10 @@ To                         Action      From
         assert_eq!(rules[1].info.verdict, FirewallVerdict::Deny);
         assert_eq!(
             ruleset.exposure(5432, "tcp"),
-            (Exposure::Open, "ip filter INPUT: by default allow".into())
+            (
+                Exposure::Open,
+                "nftables (ip filter INPUT) lets it in: no rule blocks it".into()
+            )
         );
     }
 
@@ -1486,7 +1516,7 @@ To                         Action      From
             nft.exposure(5432, "tcp"),
             (
                 Exposure::Open,
-                "no rules filter incoming connections".into()
+                "No firewall rules check incoming connections".into()
             )
         );
     }
@@ -1552,7 +1582,7 @@ To                         Action      From
             ruleset.exposure(8010, "tcp"),
             (
                 Exposure::Open,
-                "over IPv6, 8010/tcp (v6) ALLOW IN Anywhere (v6)".into()
+                "Over IPv6: 8010/tcp (v6) ALLOW IN Anywhere (v6)".into()
             )
         );
         assert_eq!(ruleset.least_exposure(8010, "tcp").0, Exposure::Blocked);
