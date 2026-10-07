@@ -420,6 +420,7 @@ dependencies = [
 name = "daemon-import"
 version = "0.1.0"
 dependencies = [
+ "daemon-backup",
  "daemon-capability",
  "daemon-core",
  "daemon-inventory",

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use daemon_protocol::ServiceKind;
-use daemon_services::ManagedService;
+use daemon_services::{ManagedService, RunBy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
@@ -43,6 +43,19 @@ impl Strategy {
         }
     }
 
+    /// How a managed service would be backed up, as the scan reports it: the
+    /// strategy's label, or None when there is nothing to copy. Containers go
+    /// by their mounts (`backup_paths` of what the scan saw), since the backup
+    /// itself inspects them the same way.
+    pub fn method_for(service: &ManagedService, container_mounts: &[&str]) -> Option<&'static str> {
+        match &service.run_by {
+            RunBy::Docker { .. } | RunBy::Compose { .. } => {
+                (!backup_paths(container_mounts.iter().copied()).is_empty()).then_some("tar")
+            }
+            _ => Self::for_service(service).map(|s| s.label()),
+        }
+    }
+
     pub fn required_tool(&self) -> &'static str {
         match self {
             Strategy::Postgres { .. } => "pg_dumpall",
@@ -64,6 +77,21 @@ impl Strategy {
             ".git/objects/pack/*.pack",
         ]
     }
+}
+
+/// A container's mounts worth backing up: host paths, without sockets or
+/// the system's own directories.
+pub fn backup_paths<'a>(mounts: impl Iterator<Item = &'a str>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = mounts
+        .map(str::trim)
+        .filter(|p| p.starts_with('/'))
+        .filter(|p| !p.ends_with(".sock"))
+        .filter(|p| !["/", "/proc", "/sys", "/dev", "/run", "/var/run", "/etc"].contains(p))
+        .map(PathBuf::from)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn service_kind(service: &ManagedService) -> ServiceKind {
@@ -96,6 +124,36 @@ mod tests {
             data_dir: data_dir.map(PathBuf::from),
             added_artifacts: vec![],
         }
+    }
+
+    #[test]
+    fn reports_how_a_service_would_be_backed_up() {
+        assert_eq!(
+            Strategy::method_for(&managed("postgresql", None, &[]), &[]),
+            Some("pg_dumpall")
+        );
+        assert_eq!(
+            Strategy::method_for(&managed("docker", None, &[]), &[]),
+            None
+        );
+        assert_eq!(
+            Strategy::method_for(&managed("caddy", None, &[]), &[]),
+            None
+        );
+
+        let mut container = managed("shop", None, &[]);
+        container.run_by = RunBy::Docker {
+            container: "shop-1".into(),
+        };
+        assert_eq!(
+            Strategy::method_for(&container, &["/srv/shop/data"]),
+            Some("tar")
+        );
+        assert_eq!(
+            Strategy::method_for(&container, &["/var/run/docker.sock", "/etc"]),
+            None
+        );
+        assert_eq!(Strategy::method_for(&container, &[]), None);
     }
 
     #[test]

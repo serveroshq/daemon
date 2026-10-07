@@ -44,20 +44,37 @@ impl Importer {
         if followed > 0 {
             info!(followed, "kept adoptions for recreated containers");
         }
-        let managed: std::collections::BTreeMap<String, ServiceOrigin> = Registry::new(&self.state)
-            .all()?
-            .into_iter()
-            .map(|m| (m.key, m.origin))
-            .collect();
+        let managed: std::collections::BTreeMap<String, ManagedService> =
+            Registry::new(&self.state)
+                .all()?
+                .into_iter()
+                .map(|m| (m.key.clone(), m))
+                .collect();
 
         for service in report.services.iter_mut() {
             self.enrich(service, &owners).await;
 
-            if let Some(origin) = managed.get(&service.key) {
+            if let Some(managed) = managed.get(&service.key) {
                 service.details.insert("managed".into(), "true".into());
-                if *origin == ServiceOrigin::Created {
+                if managed.origin == ServiceOrigin::Created {
                     service.origin = ServiceOrigin::Created;
                 }
+                // Whether a backup has anything to copy, so the panel can
+                // leave out what it can't back up (Docker itself, a proxy).
+                let mounts: Vec<&str> = service
+                    .details
+                    .get("mounts")
+                    // "source:destination" pairs; the host side is what's copied.
+                    .map(|m| {
+                        m.split(", ")
+                            .map(|pair| pair.split(':').next().unwrap_or(pair))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let method = daemon_backup::Strategy::method_for(managed, &mounts);
+                service
+                    .details
+                    .insert("backup".into(), method.unwrap_or("none").into());
             }
         }
 

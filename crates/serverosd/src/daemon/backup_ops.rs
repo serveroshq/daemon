@@ -209,17 +209,7 @@ async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
 }
 
 fn mount_paths(inspect: &str) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = inspect
-        .lines()
-        .map(str::trim)
-        .filter(|p| p.starts_with('/'))
-        .filter(|p| !p.ends_with(".sock"))
-        .filter(|p| !["/", "/proc", "/sys", "/dev", "/run", "/var/run", "/etc"].contains(p))
-        .map(PathBuf::from)
-        .collect();
-    paths.sort();
-    paths.dedup();
-    paths
+    daemon_backup::strategy::backup_paths(inspect.lines())
 }
 
 #[allow(clippy::too_many_arguments)]

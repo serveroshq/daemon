@@ -11,6 +11,7 @@ daemon-protocol.workspace = true
 daemon-state.workspace = true
 daemon-inventory.workspace = true
 daemon-services.workspace = true
+daemon-backup.workspace = true
 daemon-capability.workspace = true
 thiserror.workspace = true
 serde.workspace = true
