@@ -39,6 +39,41 @@ impl PermittedRoots {
     }
 }
 
+/// System locations that are never opened as a whole, even when a container
+/// mounts them: the machine's config, kernel and device trees, the runtime
+/// directory (which holds the Docker socket), boot files and root's home.
+const SYSTEM_ROOTS: &[&str] = &[
+    "/etc",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/var/run",
+    "/boot",
+    "/root",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib64",
+    "/usr",
+    "/var/lib/docker/containers",
+];
+
+/// Whether a folder a container mounts may become a place ServerOS opens:
+/// not the root, not a system location or anything inside one, and not a
+/// parent of one (mounting /var would otherwise open /var/run).
+pub fn mountable_root(path: &Path) -> bool {
+    let path = normalize(path);
+    if !path.is_absolute() || path == Path::new("/") {
+        return false;
+    }
+
+    !SYSTEM_ROOTS.iter().any(|system| {
+        let system = Path::new(system);
+        path.starts_with(system) || system.starts_with(&path)
+    })
+}
+
 pub fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
 
@@ -62,6 +97,21 @@ pub fn normalize(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_mounts_can_be_opened_but_never_system_locations() {
+        assert!(mountable_root(Path::new("/var/lib/serveros/volumes/8f2c")));
+        assert!(mountable_root(Path::new(
+            "/var/lib/docker/volumes/shop_data/_data"
+        )));
+        assert!(mountable_root(Path::new("/srv/app/storage")));
+        assert!(!mountable_root(Path::new("/")));
+        assert!(!mountable_root(Path::new("/etc/nginx")));
+        assert!(!mountable_root(Path::new("/var/run/docker.sock")));
+        assert!(!mountable_root(Path::new("/var")));
+        assert!(!mountable_root(Path::new("/proc/1")));
+        assert!(!mountable_root(Path::new("/srv/../etc")));
+    }
 
     #[test]
     fn root_slash_is_never_permitted() {

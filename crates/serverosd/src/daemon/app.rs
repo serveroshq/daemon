@@ -209,6 +209,41 @@ impl App {
         self.broker.set_adopted_services(adopted);
     }
 
+    /// Folders mounted into the containers ServerOS manages (created or
+    /// adopted), as the latest scan saw them: where their files actually
+    /// live. System locations are never added.
+    pub fn add_mount_roots(&self, report: &daemon_protocol::InventoryReport) {
+        let managed: std::collections::BTreeSet<String> =
+            daemon_services::Registry::new(&self.state)
+                .all()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|m| m.key)
+                .collect();
+        let known = self
+            .files
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .roots()
+            .clone();
+
+        let fresh: Vec<PathBuf> = report
+            .services
+            .iter()
+            .filter(|s| s.key.starts_with("docker:") && managed.contains(&s.key))
+            .flat_map(|s| mount_sources(s.details.get("mounts").map(String::as_str).unwrap_or("")))
+            .filter(|path| {
+                daemon_capability::roots::mountable_root(path)
+                    && path.is_dir()
+                    && !known.permits(path)
+            })
+            .collect();
+
+        if !fresh.is_empty() {
+            self.add_roots(&fresh);
+        }
+    }
+
     pub fn add_roots(&self, roots: &[PathBuf]) {
         for root in roots {
             self.broker.add_root(root.clone());
@@ -232,5 +267,29 @@ impl App {
             .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
             .map(|s| s as u64)
             .unwrap_or(0)
+    }
+}
+
+/// The host side of each mount in a scan's "src:dst, src:dst" list.
+pub fn mount_sources(mounts: &str) -> Vec<PathBuf> {
+    mounts
+        .split(", ")
+        .filter_map(|mount| mount.rsplit_once(':').map(|(source, _)| source.trim()))
+        .filter(|source| source.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(test)]
+mod mount_tests {
+    use super::*;
+
+    #[test]
+    fn mount_sources_are_the_host_side() {
+        assert_eq!(
+            mount_sources("/var/lib/serveros/volumes/8f2c:/home/container, /run/wings/machine-id/8f2c:/etc/machine-id"),
+            vec![PathBuf::from("/var/lib/serveros/volumes/8f2c"), PathBuf::from("/run/wings/machine-id/8f2c")]
+        );
+        assert!(mount_sources("").is_empty());
     }
 }
