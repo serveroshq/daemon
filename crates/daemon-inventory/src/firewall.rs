@@ -26,11 +26,11 @@ pub const NFT_CHAIN: &str = "input";
 
 /// Why a port Docker publishes is reachable whatever the firewall says.
 pub const DOCKER_REASON: &str =
-    "Published by a Docker container: Docker lets it in before the firewall can block it";
+    "Published by a Docker container, so connections get in before the firewall can block them";
 
 /// How a chain's default reads, so a reason given by a rule can be told
 /// apart from one given by the default.
-const BY_DEFAULT: &str = ": no rule ";
+const BY_DEFAULT: &str = " anything no rule ";
 
 const UFW: &[&str] = &["/usr/sbin/ufw"];
 const NFT: &[&str] = &["/usr/sbin/nft", "/sbin/nft"];
@@ -150,9 +150,9 @@ impl Chain {
             }
 
             let policy = if self.policy.lets_in() {
-                format!("{} lets it in{BY_DEFAULT}blocks it", self.label())
+                format!("{} allows{BY_DEFAULT}blocks", self.label())
             } else {
-                format!("{} blocks it{BY_DEFAULT}lets it in", self.label())
+                format!("{} blocks{BY_DEFAULT}allows", self.label())
             };
             match (self.policy.lets_in(), allowed_from) {
                 (true, _) => (Exposure::Open, policy),
@@ -164,7 +164,7 @@ impl Chain {
         match (decided.0, maybe) {
             (Exposure::Blocked | Exposure::Restricted, Some(rule)) => (
                 Exposure::Unknown,
-                format!("A rule ServerOS can't fully check may let it in: {rule}"),
+                format!("This rule may let connections in, but it depends on a network interface or another chain that ServerOS doesn't check: {rule}"),
             ),
             _ => decided,
         }
@@ -246,12 +246,12 @@ impl Ruleset {
         if !self.installed {
             Some((
                 Exposure::Open,
-                format!("{name} isn't installed, so nothing blocks it"),
+                format!("{name} isn't installed, so nothing is blocked"),
             ))
         } else if !self.active {
             Some((
                 Exposure::Open,
-                format!("{name} is turned off, so nothing blocks it"),
+                format!("{name} is turned off, so nothing is blocked"),
             ))
         } else if !self.readable {
             Some((
@@ -1499,7 +1499,7 @@ To                         Action      From
             ruleset.exposure(5432, "tcp"),
             (
                 Exposure::Open,
-                "nftables (ip filter INPUT) lets it in: no rule blocks it".into()
+                "nftables (ip filter INPUT) allows anything no rule blocks".into()
             )
         );
     }
