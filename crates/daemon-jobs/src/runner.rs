@@ -353,6 +353,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Unadopt { .. } => "unadopt",
         Job::ServiceExec { .. } => "service_exec",
         Job::ServiceRemove { .. } => "service_remove",
+        Job::ServiceRepair { .. } => "service_repair",
         Job::OpenTerminal { .. } => "open_terminal",
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",

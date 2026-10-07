@@ -436,6 +436,13 @@ pub fn classify(findings: &Findings) -> Classified {
         if !container.mounts.is_empty() {
             details.insert("mounts".into(), container.mounts.join(", "));
         }
+        if container.mounts.iter().any(|m| {
+            m.split(':').next().is_some_and(|source| {
+                source.starts_with("/run/wings/") && !Path::new(source).exists()
+            })
+        }) {
+            details.insert("needs_repair".into(), "wings".into());
+        }
 
         for port in &container.ports {
             claimed_ports.insert(*port);
@@ -1143,6 +1150,34 @@ mod tests {
             classified.unknown.is_empty(),
             "docker's published port is not an unknown listener"
         );
+    }
+
+    #[test]
+    fn pterodactyl_containers_missing_their_wings_files_need_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut findings = Findings::default();
+        for (id, name, source) in [
+            (
+                "aaaaaaaaaaaa1",
+                "gone-1",
+                "/run/wings/machine-id/aaaa".to_string(),
+            ),
+            ("bbbbbbbbbbbb1", "plain-1", dir.path().display().to_string()),
+        ] {
+            findings.containers.push(Container {
+                id: id.into(),
+                name: name.into(),
+                image: "ghcr.io/ptero-eggs/yolks:nodejs_22".into(),
+                state: "exited".into(),
+                mounts: vec![format!("{source}:/etc/machine-id")],
+                ..Default::default()
+            });
+        }
+
+        let classified = classify(&findings);
+
+        assert_eq!(classified.services[0].details["needs_repair"], "wings");
+        assert!(!classified.services[1].details.contains_key("needs_repair"));
     }
 
     #[test]

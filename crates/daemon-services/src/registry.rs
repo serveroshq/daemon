@@ -156,6 +156,25 @@ impl<'a> Registry<'a> {
         Ok(moved)
     }
 
+    pub fn rekey(&self, old_key: &str, new_key: &str, container: &str) -> Result<bool> {
+        let mut all = self.all()?;
+        let Some(entry) = all.iter_mut().find(|m| m.key == old_key) else {
+            return Ok(false);
+        };
+
+        entry.key = new_key.to_string();
+        match &mut entry.run_by {
+            RunBy::Docker { container: c } | RunBy::Compose { container: c, .. } => {
+                *c = container.to_string()
+            }
+            _ => {}
+        }
+        all.sort_by(|a, b| a.key.cmp(&b.key));
+        self.state.kv_set(KEY, &serde_json::to_string(&all)?)?;
+
+        Ok(true)
+    }
+
     pub fn remove(&self, key: &str) -> Result<Option<ManagedService>> {
         let mut all = self.all()?;
         let removed = all.iter().position(|s| s.key == key).map(|i| all.remove(i));
@@ -245,6 +264,33 @@ mod tests {
             container("docker:dddddddddddd", "shop-web-1"),
         ];
         assert_eq!(registry.follow_recreated(&both).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_repaired_container_keeps_its_adoption() {
+        let state = State::in_memory().unwrap();
+        let registry = Registry::new(&state);
+        let mut bot = managed("docker:aaaaaaaaaaaa");
+        bot.run_by = RunBy::Docker {
+            container: "aaaaaaaaaaaa".into(),
+        };
+        registry.upsert(bot).unwrap();
+
+        assert!(registry
+            .rekey("docker:aaaaaaaaaaaa", "docker:bbbbbbbbbbbb", "bbbbbbbbbbbb")
+            .unwrap());
+        assert!(!registry
+            .rekey("docker:aaaaaaaaaaaa", "docker:cccccccccccc", "cccccccccccc")
+            .unwrap());
+
+        let moved = registry.get("docker:bbbbbbbbbbbb").unwrap().unwrap();
+        assert_eq!(moved.origin, ServiceOrigin::Discovered);
+        assert_eq!(
+            moved.run_by,
+            RunBy::Docker {
+                container: "bbbbbbbbbbbb".into()
+            }
+        );
     }
 
     #[test]

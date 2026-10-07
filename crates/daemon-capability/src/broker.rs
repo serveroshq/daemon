@@ -187,7 +187,9 @@ impl Broker {
                     _ => false,
                 },
                 Check::CreatedOrAdopted => match op {
-                    Operation::Service(ServiceOp::Remove { service }) => {
+                    Operation::Service(
+                        ServiceOp::Remove { service } | ServiceOp::Repair { service },
+                    ) => {
                         !state.created.services.contains(service)
                             && !state.adopted.contains(service)
                     }

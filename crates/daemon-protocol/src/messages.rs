@@ -482,6 +482,9 @@ pub enum Job {
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
+    ServiceRepair {
+        service: String,
+    },
     ServiceRemove {
         service: String,
         #[serde(default)]

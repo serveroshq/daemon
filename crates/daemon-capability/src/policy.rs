@@ -114,7 +114,9 @@ pub fn checks_for(op: &Operation) -> Vec<Check> {
 
     match op {
         Operation::Service(s) if !allowed_on_adopted(s) => checks.push(Check::CreatedByUs),
-        Operation::Service(ServiceOp::Remove { .. }) => checks.push(Check::CreatedOrAdopted),
+        Operation::Service(ServiceOp::Remove { .. } | ServiceOp::Repair { .. }) => {
+            checks.push(Check::CreatedOrAdopted)
+        }
         Operation::Machine(MachineOp::ManageSshKeys { .. }) => checks.push(Check::ManagedUser),
         Operation::Data(DataOp::OpenTerminal { .. }) => checks.push(Check::ReadOnlyMode),
         _ => {}
@@ -225,6 +227,18 @@ mod tests {
         assert!(checks.contains(&Check::ReadOnlyMode));
         assert!(checks.contains(&Check::CreatedOrAdopted));
         assert!(!checks.contains(&Check::CreatedByUs));
+    }
+
+    #[test]
+    fn repairing_is_confirmed_and_limited_to_created_or_adopted_services() {
+        let repair = Operation::Service(ServiceOp::Repair {
+            service: "docker:82cfe2569cd4".into(),
+        });
+        let checks = checks_for(&repair);
+
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+        assert!(checks.contains(&Check::CreatedOrAdopted));
     }
 
     #[test]

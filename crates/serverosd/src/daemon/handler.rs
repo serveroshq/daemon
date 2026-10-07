@@ -77,6 +77,21 @@ async fn managed(app: &App, key: &str) -> Result<ManagedService, Failure> {
     )
 }
 
+fn explain_wings_mount(failure: Failure) -> Failure {
+    if !failure
+        .message
+        .contains("bind source path does not exist: /run/wings/")
+    {
+        return failure;
+    }
+
+    Failure::new(
+        "service",
+        "This container was set up by Pterodactyl and needs a file Wings used to create, so Docker won't start it.",
+    )
+    .with_next_step("Repair it from its service page: ServerOS recreates it without that file and keeps its data.")
+}
+
 async fn lifecycle(
     service: &ManagedService,
     action: Option<ServiceAction>,
@@ -232,9 +247,71 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 },
             };
             let grant = authorize(Operation::Service(op))?;
-            let result = lifecycle(&managed, Some(action), None).await;
+            let result = lifecycle(&managed, Some(action), None)
+                .await
+                .map_err(explain_wings_mount);
             grant.finish(&result.as_ref().map(|_| ()), None);
             result
+        }
+
+        Job::ServiceRepair { service } => {
+            let managed = managed(&app, &service).await?;
+            let container = super::service_ops::container_of(&managed)
+                .ok_or_else(|| {
+                    Failure::new(
+                        "repair",
+                        format!(
+                            "{} isn't a container, so there's nothing to repair",
+                            managed.name
+                        ),
+                    )
+                })?
+                .to_string();
+            let grant = authorize(Operation::Service(ServiceOp::Repair {
+                service: managed.key.clone(),
+            }))?;
+            ctx.progress
+                .line(format!(
+                    "recreating {} without the Wings mounts",
+                    managed.name
+                ))
+                .await;
+            let result = DockerAdapter::default()
+                .repair_wings(&container)
+                .await
+                .map_err(|e| Failure::new("repair", e.to_string()));
+            if let Ok(repaired) = &result {
+                let short = &repaired.new_id[..repaired.new_id.len().min(12)];
+                let _ = Registry::new(&app.state).rekey(
+                    &managed.key,
+                    &format!("docker:{short}"),
+                    short,
+                );
+                app.sync_adopted();
+                for dropped in &repaired.dropped {
+                    ctx.progress.line(format!("dropped {dropped}")).await;
+                }
+                if repaired.old_kept {
+                    ctx.progress
+                        .line(format!(
+                            "the old container is still there as {}-before-repair",
+                            repaired.name
+                        ))
+                        .await;
+                }
+            }
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some("restart: unless-stopped"),
+            );
+            let repaired = result?;
+            let short = &repaired.new_id[..repaired.new_id.len().min(12)];
+            Ok(json!({
+                "service": format!("docker:{short}"),
+                "previous": managed.key,
+                "dropped": repaired.dropped,
+                "old_kept": repaired.old_kept,
+            }))
         }
 
         Job::ServiceExec {

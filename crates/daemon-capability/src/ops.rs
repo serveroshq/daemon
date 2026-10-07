@@ -36,6 +36,7 @@ pub enum ServiceOp {
     Create { service: String },
     Update { service: String },
     Remove { service: String },
+    Repair { service: String },
     Adopt { service: String },
     Unadopt { service: String },
     Exec { service: String },
@@ -94,6 +95,7 @@ impl Operation {
                 ServiceOp::Create { .. } => "service.create",
                 ServiceOp::Update { .. } => "service.update",
                 ServiceOp::Remove { .. } => "service.remove",
+                ServiceOp::Repair { .. } => "service.repair",
                 ServiceOp::Adopt { .. } => "service.adopt",
                 ServiceOp::Unadopt { .. } => "service.unadopt",
                 ServiceOp::Exec { .. } => "service.exec",
@@ -147,6 +149,7 @@ impl Operation {
                 | ServiceOp::Create { service }
                 | ServiceOp::Update { service }
                 | ServiceOp::Remove { service }
+                | ServiceOp::Repair { service }
                 | ServiceOp::Adopt { service }
                 | ServiceOp::Unadopt { service }
                 | ServiceOp::Exec { service } => service.clone(),
@@ -204,6 +207,7 @@ impl Operation {
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })
+                | Operation::Service(ServiceOp::Repair { .. })
                 | Operation::Service(ServiceOp::Exec { .. })
                 | Operation::Data(DataOp::DeleteFile { .. })
         )
