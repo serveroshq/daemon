@@ -40,7 +40,7 @@ pub enum Step {
 pub fn plan(ruleset: &Ruleset, port: u16, proto: &str, open: bool) -> Result<Vec<Step>, String> {
     let (exposure, because) = ruleset.exposure(port, proto);
     let done = if open {
-        exposure == Exposure::Open
+        ruleset.least_exposure(port, proto).0 == Exposure::Open
     } else {
         matches!(exposure, Exposure::Blocked | Exposure::Restricted)
     };
@@ -71,26 +71,48 @@ pub fn plan(ruleset: &Ruleset, port: u16, proto: &str, open: bool) -> Result<Vec
 
     match ruleset.backend {
         FirewallBackend::Ufw => {
-            let mut left = ruleset.chains[0].clone();
-            left.rules.retain(|rule| {
+            let mut left = ruleset.clone();
+            left.chains[0].rules.retain(|rule| {
                 let remove = rule.just(port, proto) && rule.info.verdict.lets_in() != open;
-                if remove {
-                    steps.push(Step::UfwDelete(rule.spec.clone()));
+                // Deleting a rule deletes its IPv6 copy too, or the IPv6 rule
+                // alone when that's all there is. ufw won't put a deny ahead
+                // of an IPv6 allow for the same port, so it has to go.
+                let step = Step::UfwDelete(rule.spec.clone());
+                if remove && !steps.contains(&step) {
+                    steps.push(step);
                 }
                 !remove
             });
-            let (now, _) = left.decide(port, proto);
-            if open && now != Exposure::Open {
-                steps.push(Step::UfwAdd {
-                    args: words(&["allow", &spec, "comment", MARK]),
-                    first: false,
+            let (now, _) = left.exposure(port, proto);
+            let add = if open && left.least_exposure(port, proto).0 != Exposure::Open {
+                // Added last, an allow only beats the default. A rule that
+                // blocks it for everyone, like a deny for a range, would
+                // still come first, so the allow goes ahead of it.
+                let blocked_by_rule = left.chains[0].rules.iter().any(|r| {
+                    r.covers(port, proto) && r.info.source.is_none() && !r.info.verdict.lets_in()
                 });
+                Some(("allow", blocked_by_rule))
             } else if !open && !matches!(now, Exposure::Blocked | Exposure::Restricted) {
                 // Open, or a rule ServerOS can't read may let it in: a deny
                 // ahead of everything settles it either way.
+                Some(("deny", !left.chains[0].rules.is_empty()))
+            } else {
+                None
+            };
+            if let Some((verdict, first)) = add {
+                if first {
+                    // ufw skips a rule it already has further down, so that
+                    // one goes before it's put first.
+                    for rule in left.chains[0].rules.iter().filter(|r| r.just(port, proto)) {
+                        let step = Step::UfwDelete(rule.spec.clone());
+                        if !steps.contains(&step) {
+                            steps.push(step);
+                        }
+                    }
+                }
                 steps.push(Step::UfwAdd {
-                    args: words(&["deny", &spec, "comment", MARK]),
-                    first: !left.rules.is_empty(),
+                    args: words(&[verdict, &spec, "comment", MARK]),
+                    first,
                 });
             }
         }
@@ -103,15 +125,19 @@ pub fn plan(ruleset: &Ruleset, port: u16, proto: &str, open: bool) -> Result<Vec
             }
             if open {
                 // An accept here can't undo a drop in another table: every
-                // input chain has to let it through.
-                if let Some((_, why)) = ruleset
-                    .chains
-                    .iter()
-                    .filter(|c| !c.managed)
-                    .map(|c| c.decide(port, proto))
-                    .find(|(e, _)| *e != Exposure::Open)
-                {
-                    return Err(format!("{spec} is blocked by nftables rules outside ServerOS's own ({why}). Change it where those are set up, usually /etc/nftables.conf."));
+                // input chain has to let it through. When other tables let
+                // it in over IPv4 or IPv6, ServerOS's own drops still go,
+                // and the check afterwards says what's still blocked.
+                let mut others = ruleset.clone();
+                others.chains.retain(|c| !c.managed);
+                match others.exposure(port, proto) {
+                    (Exposure::Open | Exposure::Docker, _) => {}
+                    (Exposure::Restricted, why) => {
+                        return Err(format!("{spec} is allowed only from some addresses by nftables rules outside ServerOS's own ({why}). Change it where those are set up, usually /etc/nftables.conf."));
+                    }
+                    (_, why) => {
+                        return Err(format!("{spec} is blocked by nftables rules outside ServerOS's own ({why}). Change it where those are set up, usually /etc/nftables.conf."));
+                    }
                 }
             } else {
                 let already = ours.is_some_and(|c| {
@@ -127,8 +153,8 @@ pub fn plan(ruleset: &Ruleset, port: u16, proto: &str, open: bool) -> Result<Vec
             }
         }
         FirewallBackend::Iptables => {
-            let mut left = ruleset.chains[0].clone();
-            left.rules.retain(|rule| {
+            let mut left = ruleset.clone();
+            left.chains[0].rules.retain(|rule| {
                 let remove = rule.just(port, proto)
                     && rule.info.verdict.lets_in() != open
                     && (open || rule.info.managed);
@@ -137,10 +163,14 @@ pub fn plan(ruleset: &Ruleset, port: u16, proto: &str, open: bool) -> Result<Vec
                 }
                 !remove
             });
-            let (now, _) = left.decide(port, proto);
-            if open && now != Exposure::Open {
+            if open && left.least_exposure(port, proto).0 != Exposure::Open {
                 steps.push(Step::IptInsert(iptables_rule(port, proto, "ACCEPT")));
-            } else if !open {
+            } else if !open
+                && !matches!(
+                    left.exposure(port, proto).0,
+                    Exposure::Blocked | Exposure::Restricted
+                )
+            {
                 steps.push(Step::IptInsert(iptables_rule(port, proto, "DROP")));
             }
         }
@@ -270,6 +300,17 @@ pub async fn change(
 
     ctx.progress.phase("reading the firewall", Some(10)).await;
     let before = firewall::read(backend, Duration::from_secs(15)).await;
+    if open && docker_ports.contains(&port) {
+        // Docker's own rules already let it in, whatever the firewall says.
+        return Ok(json!({
+            "port": port,
+            "proto": proto,
+            "exposure": Exposure::Docker,
+            "because": "published by Docker, whose rules come before the host firewall's",
+            "changes": 0,
+            "firewall": before.report(&listening, &docker_ports),
+        }));
+    }
     let steps = plan(&before, port, &proto, open).map_err(|e| Failure::new("firewall", e))?;
 
     ctx.progress.phase("changing the firewall", Some(40)).await;
@@ -282,7 +323,12 @@ pub async fn change(
 
     ctx.progress.phase("checking", Some(90)).await;
     let after = firewall::read(backend, Duration::from_secs(15)).await;
-    let (exposure, because) = after.exposure(port, &proto);
+    // Opened means open over IPv4 and IPv6; closed means closed over both.
+    let (exposure, because) = if open {
+        after.least_exposure(port, &proto)
+    } else {
+        after.exposure(port, &proto)
+    };
     let worked = match exposure {
         Exposure::Open => open,
         Exposure::Blocked | Exposure::Restricted => !open,
@@ -503,6 +549,122 @@ To                         Action      From
     }
 
     #[test]
+    fn a_rule_for_both_protocols_is_left_alone_so_the_other_keeps_working() {
+        let ruleset = parse_ufw(
+            "Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+53                         ALLOW IN    Anywhere
+8001                       DENY IN     Anywhere
+",
+        );
+
+        assert_eq!(
+            plan(&ruleset, 53, "tcp", false).unwrap(),
+            [ufw_add(&["deny", "53/tcp", "comment", "ServerOS"], true)]
+        );
+        assert_eq!(
+            plan(&ruleset, 8001, "tcp", true).unwrap(),
+            [ufw_add(&["allow", "8001/tcp", "comment", "ServerOS"], true)]
+        );
+    }
+
+    #[test]
+    fn opening_inside_a_denied_range_puts_the_allow_first() {
+        let ruleset = parse_ufw(
+            "Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+8040:8060/tcp              DENY IN     Anywhere
+8070/tcp                   DENY IN     10.0.0.0/8
+",
+        );
+
+        assert_eq!(
+            plan(&ruleset, 8050, "tcp", true).unwrap(),
+            [ufw_add(&["allow", "8050/tcp", "comment", "ServerOS"], true)]
+        );
+        assert_eq!(
+            plan(&ruleset, 8070, "tcp", true).unwrap(),
+            [ufw_add(
+                &["allow", "8070/tcp", "comment", "ServerOS"],
+                false
+            )],
+            "a deny for some addresses doesn't stop an allow for everyone"
+        );
+    }
+
+    #[test]
+    fn a_port_open_only_over_ipv6_is_closed_for_both() {
+        let mut ruleset = parse_ufw(
+            "Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+8010/tcp (v6)              ALLOW IN    Anywhere (v6)
+8030/tcp                   ALLOW IN    Anywhere
+8030/tcp (v6)              DENY IN     Anywhere (v6)
+",
+        );
+        ruleset.ipv6 = true;
+
+        assert_eq!(
+            plan(&ruleset, 8010, "tcp", false).unwrap(),
+            [Step::UfwDelete(words(&["allow", "8010/tcp"]))]
+        );
+        assert_eq!(
+            plan(&ruleset, 8030, "tcp", true).unwrap(),
+            [
+                Step::UfwDelete(words(&["deny", "8030/tcp"])),
+                ufw_add(&["allow", "8030/tcp", "comment", "ServerOS"], false)
+            ],
+            "open over IPv4 isn't open until IPv6 is too"
+        );
+        assert_eq!(
+            plan(
+                &parse_ufw(&format!(
+                    "{UFW}5432/tcp (v6)              ALLOW IN    Anywhere (v6)\n"
+                )),
+                5432,
+                "tcp",
+                false
+            )
+            .unwrap(),
+            [Step::UfwDelete(words(&["allow", "5432/tcp"]))],
+            "a rule and its IPv6 copy go in one delete"
+        );
+    }
+
+    #[test]
+    fn a_rule_put_first_replaces_the_same_rule_further_down() {
+        let mut ruleset = parse_ufw(
+            "Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+8000/tcp                   ALLOW IN    Anywhere
+7990:8009/tcp (v6)         DENY IN     Anywhere (v6)
+8000/tcp (v6)              ALLOW IN    Anywhere (v6)
+",
+        );
+        ruleset.ipv6 = true;
+
+        assert_eq!(
+            plan(&ruleset, 8000, "tcp", true).unwrap(),
+            [
+                Step::UfwDelete(words(&["allow", "8000/tcp"])),
+                ufw_add(&["allow", "8000/tcp", "comment", "ServerOS"], true)
+            ]
+        );
+    }
+
+    #[test]
     fn ufw_turned_off_is_refused_rather_than_pretending() {
         let ruleset = parse_ufw("Status: inactive\n");
 
@@ -563,6 +725,51 @@ To                         Action      From
         assert!(plan(&ruleset, 8080, "tcp", true)
             .unwrap_err()
             .contains("/etc/nftables.conf"));
+    }
+
+    #[test]
+    fn reopening_on_nftables_removes_serveros_drop_even_if_ipv6_stays_blocked() {
+        let json: Value = serde_json::from_str(r#"{"nftables":[
+            {"chain":{"family":"inet","table":"serveros","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}},
+            {"rule":{"family":"inet","table":"serveros","chain":"input","handle":9,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8003}},{"drop":null}]}},
+            {"chain":{"family":"ip6","table":"v6only","name":"input","type":"filter","hook":"input","prio":0,"policy":"accept"}},
+            {"rule":{"family":"ip6","table":"v6only","chain":"input","handle":3,"expr":[{"match":{"op":"==","left":{"payload":{"protocol":"tcp","field":"dport"}},"right":8003}},{"drop":null}]}}
+        ]}"#).unwrap();
+        let mut ruleset = parse_nft(&json);
+        ruleset.ipv6 = true;
+
+        assert_eq!(
+            plan(&ruleset, 8003, "tcp", true).unwrap(),
+            [Step::NftDelete(9)]
+        );
+    }
+
+    #[test]
+    fn closing_on_iptables_only_removes_serveros_accept_when_that_is_enough() {
+        let ruleset = parse_iptables(
+            "-P INPUT ACCEPT
+-A INPUT -p tcp -m tcp --dport 8005 -m comment --comment ServerOS -j ACCEPT
+-A INPUT -p tcp -m multiport --dports 8005,8006 -j DROP
+",
+        );
+
+        assert_eq!(
+            plan(&ruleset, 8005, "tcp", false).unwrap(),
+            [Step::IptDelete(words(&[
+                "-p",
+                "tcp",
+                "-m",
+                "tcp",
+                "--dport",
+                "8005",
+                "-m",
+                "comment",
+                "--comment",
+                "ServerOS",
+                "-j",
+                "ACCEPT"
+            ]))]
+        );
     }
 
     #[test]

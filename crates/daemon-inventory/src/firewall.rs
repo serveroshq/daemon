@@ -43,14 +43,14 @@ impl Rule {
             && (self.info.ports.is_empty() || self.info.ports.iter().any(|r| r.contains(port)))
     }
 
-    /// About exactly this one port, from anywhere: safe to remove without
-    /// touching any other port.
+    /// About exactly this one port and protocol, from anywhere, over IPv4
+    /// or IPv6: safe to remove without touching any other port. A rule for both TCP and UDP
+    /// isn't, since removing it would change the other protocol too.
     pub fn just(&self, port: u16, proto: &str) -> bool {
         self.info.source.is_none()
-            && !self.info.ipv6
             && !self.info.opaque
             && self.info.ports == [PortRange::single(port)]
-            && self.info.proto.as_deref().is_none_or(|p| p == proto)
+            && self.info.proto.as_deref() == Some(proto)
     }
 }
 
@@ -64,16 +64,55 @@ pub struct Chain {
 }
 
 impl Chain {
-    /// Whether this chain lets the internet reach the port, and why.
+    /// Whether this chain sees IPv4 or IPv6 traffic: nftables' `ip` and
+    /// `ip6` tables see only theirs.
+    pub fn sees(&self, v6: bool) -> bool {
+        !self.name.starts_with(if v6 { "ip " } else { "ip6 " })
+    }
+
+    /// ufw keeps a list of rules for each: its IPv4 rules don't apply to
+    /// IPv6, even those from anywhere.
+    fn split_families(&self) -> bool {
+        self.name == "ufw"
+    }
+
+    /// The rules worth showing. ufw lists most rules again for IPv6, and
+    /// the copy says nothing new.
+    pub fn shown(&self) -> impl Iterator<Item = &Rule> {
+        self.rules.iter().filter(|r| {
+            !self.split_families()
+                || !r.info.ipv6
+                || r.info.source.is_some()
+                || !self.rules.iter().any(|v| {
+                    !v.info.ipv6
+                        && v.info.source.is_none()
+                        && v.info.verdict == r.info.verdict
+                        && v.info.ports == r.info.ports
+                        && v.info.proto == r.info.proto
+                        && v.info.opaque == r.info.opaque
+                })
+        })
+    }
+
+    /// Whether this chain lets the internet reach the port over IPv4 or
+    /// IPv6, and why.
     ///
     /// Rules are checked in order and the first that matches decides. A rule
     /// ServerOS can't read only matters when it comes first and may let the
     /// port in: then a port that would be closed is unknown instead.
-    pub fn decide(&self, port: u16, proto: &str) -> (Exposure, String) {
+    pub fn decide(&self, port: u16, proto: &str, v6: bool) -> (Exposure, String) {
         let mut allowed_from = None;
         let mut maybe = None;
+        let family = |r: &&Rule| {
+            let v6_source = r.info.source.as_deref().is_some_and(|s| s.contains(':'));
+            if v6 {
+                r.info.ipv6 || v6_source || (!self.split_families() && r.info.source.is_none())
+            } else {
+                !r.info.ipv6 && !v6_source
+            }
+        };
         let decided = 'rules: {
-            for rule in self.rules.iter().filter(|r| !r.info.ipv6) {
+            for rule in self.rules.iter().filter(family) {
                 if !rule.covers(port, proto) {
                     continue;
                 }
@@ -123,6 +162,9 @@ pub struct Ruleset {
     /// False when its rules couldn't be read at all: every port is then
     /// unknown, and nothing is changed.
     pub readable: bool,
+    /// The machine has a public IPv6 address, so the internet can come in
+    /// over IPv6 too, and those rules count as well.
+    pub ipv6: bool,
     pub notes: Vec<String>,
 }
 
@@ -135,6 +177,7 @@ impl Ruleset {
             chains: Vec::new(),
             unreadable: 0,
             readable: true,
+            ipv6: false,
             notes: Vec::new(),
         }
     }
@@ -155,25 +198,53 @@ impl Ruleset {
     /// Whether the internet can reach the port, and the rule or policy
     /// that decided it.
     pub fn exposure(&self, port: u16, proto: &str) -> (Exposure, String) {
-        if !self.installed {
-            return (
-                Exposure::Open,
-                format!("{} is not installed", backend_name(self.backend)),
-            );
-        }
-        if !self.active {
-            return (
-                Exposure::Open,
-                format!("{} is not turned on", backend_name(self.backend)),
-            );
-        }
-        if !self.readable {
-            return (
-                Exposure::Unknown,
-                format!("couldn't read {}'s rules", backend_name(self.backend)),
-            );
-        }
+        // Between equals, IPv4 says it more plainly.
+        self.settled().unwrap_or_else(|| {
+            self.families(port, proto)
+                .into_iter()
+                .rev()
+                .max_by_key(|(e, _)| reach(*e))
+                .expect("IPv4 is always there")
+        })
+    }
 
+    /// The least the internet can reach the port by, over IPv4 or IPv6: a
+    /// port is only open once it's open over both.
+    pub fn least_exposure(&self, port: u16, proto: &str) -> (Exposure, String) {
+        self.settled().unwrap_or_else(|| {
+            self.families(port, proto)
+                .into_iter()
+                .min_by_key(|(e, _)| reach(*e))
+                .expect("IPv4 is always there")
+        })
+    }
+
+    /// The answer for every port, when there are no rules to go by.
+    fn settled(&self) -> Option<(Exposure, String)> {
+        let name = backend_name(self.backend);
+        if !self.installed {
+            Some((Exposure::Open, format!("{name} is not installed")))
+        } else if !self.active {
+            Some((Exposure::Open, format!("{name} is not turned on")))
+        } else if !self.readable {
+            Some((Exposure::Unknown, format!("couldn't read {name}'s rules")))
+        } else {
+            None
+        }
+    }
+
+    /// What IPv4, and IPv6 when the machine has it, let in.
+    fn families(&self, port: u16, proto: &str) -> Vec<(Exposure, String)> {
+        let mut families = vec![self.family_exposure(port, proto, false)];
+        // ip6tables isn't read, so iptables can only speak for IPv4.
+        if self.ipv6 && self.backend != FirewallBackend::Iptables {
+            let (exposure, because) = self.family_exposure(port, proto, true);
+            families.push((exposure, format!("over IPv6, {because}")));
+        }
+        families
+    }
+
+    fn family_exposure(&self, port: u16, proto: &str, v6: bool) -> (Exposure, String) {
         // It has to get through every chain: a block anywhere is final.
         let rank = |e: Exposure| match e {
             Exposure::Blocked => 3,
@@ -185,8 +256,8 @@ impl Ruleset {
             Exposure::Open,
             "no rules filter incoming connections".to_string(),
         );
-        for (i, chain) in self.chains.iter().enumerate() {
-            let (exposure, because) = chain.decide(port, proto);
+        for (i, chain) in self.chains.iter().filter(|c| c.sees(v6)).enumerate() {
+            let (exposure, because) = chain.decide(port, proto, v6);
             // Between equals, a rule says more than a chain's default.
             let says_more = rank(exposure) == rank(decided.0)
                 && decided.1.contains(": by default ")
@@ -240,7 +311,7 @@ impl Ruleset {
             rules: self
                 .chains
                 .iter()
-                .flat_map(|c| c.rules.iter().map(|r| r.info.clone()))
+                .flat_map(|c| c.shown().map(|r| r.info.clone()))
                 .collect(),
             ports,
             unreadable: self.unreadable,
@@ -320,6 +391,7 @@ pub async fn read(backend: FirewallBackend, timeout: Duration) -> Ruleset {
         ruleset
     });
     ruleset.backend = backend;
+    ruleset.ipv6 = public_ipv6(Path::new("/proc/net/if_inet6"));
     if backend == FirewallBackend::Iptables && !Path::new("/usr/sbin/netfilter-persistent").exists()
     {
         ruleset.notes.push(
@@ -327,6 +399,30 @@ pub async fn read(backend: FirewallBackend, timeout: Duration) -> Ruleset {
         );
     }
     ruleset
+}
+
+/// How much of the internet gets through: the more, the higher.
+fn reach(exposure: Exposure) -> u8 {
+    match exposure {
+        Exposure::Open | Exposure::Docker => 3,
+        Exposure::Unknown => 2,
+        Exposure::Restricted => 1,
+        Exposure::Blocked => 0,
+    }
+}
+
+/// Whether any interface but loopback has a global IPv6 address that isn't
+/// a private (fc00::/7) one.
+fn public_ipv6(if_inet6: &Path) -> bool {
+    std::fs::read_to_string(if_inet6)
+        .map(|text| {
+            text.lines().any(|line| {
+                let words: Vec<&str> = line.split_whitespace().collect();
+                matches!(words.as_slice(), [address, _, _, "00", _, name]
+                    if *name != "lo" && !address.starts_with("fc") && !address.starts_with("fd"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 // --- ufw -------------------------------------------------------------------
@@ -365,20 +461,6 @@ pub fn parse_ufw(text: &str) -> Ruleset {
             }
         }
     }
-
-    // ufw lists each rule again for IPv6; the copy says nothing new.
-    let v4: Vec<FirewallRuleInfo> = rules
-        .iter()
-        .filter(|r| !r.info.ipv6)
-        .map(|r| r.info.clone())
-        .collect();
-    rules.retain(|r| {
-        !r.info.ipv6
-            || r.info.source.is_some()
-            || !v4.iter().any(|v| {
-                v.verdict == r.info.verdict && v.ports == r.info.ports && v.proto == r.info.proto
-            })
-    });
 
     if ruleset.active {
         ruleset.chains.push(Chain {
@@ -985,7 +1067,7 @@ fn shell_words(line: &str) -> Vec<String> {
 fn count_opaque(chains: &[Chain]) -> u32 {
     chains
         .iter()
-        .flat_map(|c| &c.rules)
+        .flat_map(|c| c.shown())
         .filter(|r| r.info.opaque)
         .count() as u32
 }
@@ -1191,7 +1273,7 @@ Anywhere on eth1           ALLOW IN    Anywhere
 
         assert!(ruleset.active);
         assert_eq!(ruleset.unreadable, 1, "the interface rule");
-        let rules = &ruleset.chains[0].rules;
+        let rules: Vec<&Rule> = ruleset.chains[0].shown().collect();
         assert_eq!(rules.len(), 5, "v6 copies and outgoing rules left out");
         assert!(rules[4].info.opaque);
         assert_eq!(rules[4].info.text, "Anywhere on eth1 ALLOW IN Anywhere");
@@ -1438,5 +1520,82 @@ To                         Action      From
             "a drop appended after an accept for its range never matches"
         );
         assert_eq!(ruleset.exposure(3306, "tcp").0, Exposure::Unknown);
+    }
+
+    #[test]
+    fn ipv6_rules_count_once_the_machine_has_a_public_ipv6_address() {
+        let mut ruleset = parse_ufw(
+            "Status: active
+Default: deny (incoming), allow (outgoing), disabled (routed)
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+8020/tcp                   ALLOW IN    2001:db8::/32
+22/tcp (v6)                ALLOW IN    Anywhere (v6)
+8010/tcp (v6)              ALLOW IN    Anywhere (v6)
+",
+        );
+        assert_eq!(
+            ruleset.exposure(8010, "tcp").0,
+            Exposure::Blocked,
+            "IPv4 only"
+        );
+        assert_eq!(
+            ruleset.exposure(8020, "tcp").0,
+            Exposure::Blocked,
+            "an IPv6 source"
+        );
+
+        ruleset.ipv6 = true;
+        assert_eq!(
+            ruleset.exposure(8010, "tcp"),
+            (
+                Exposure::Open,
+                "over IPv6, 8010/tcp (v6) ALLOW IN Anywhere (v6)".into()
+            )
+        );
+        assert_eq!(ruleset.least_exposure(8010, "tcp").0, Exposure::Blocked);
+        assert_eq!(ruleset.exposure(8020, "tcp").0, Exposure::Restricted);
+        assert_eq!(
+            ruleset.exposure(22, "tcp"),
+            (Exposure::Open, "22/tcp ALLOW IN Anywhere".into()),
+            "IPv4 explains it when both agree"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_table_doesnt_decide_ipv4() {
+        let json: Value = serde_json::from_str(r#"{"nftables":[
+            {"chain":{"family":"ip6","table":"filter","name":"input","type":"filter","hook":"input","prio":0,"policy":"drop"}}
+        ]}"#).unwrap();
+        let mut ruleset = parse_nft(&json);
+
+        assert_eq!(ruleset.exposure(80, "tcp").0, Exposure::Open);
+        ruleset.ipv6 = true;
+        assert_eq!(ruleset.exposure(80, "tcp").0, Exposure::Open);
+        assert_eq!(ruleset.least_exposure(80, "tcp").0, Exposure::Blocked);
+    }
+
+    #[test]
+    fn finds_public_ipv6_addresses() {
+        let dir = std::env::temp_dir().join(format!("serveros-if-inet6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("if_inet6");
+        let local = "00000000000000000000000000000001 01 80 10 80       lo
+fe800000000000000000000000000001 02 40 20 80     eth0
+fd000000000000000000000000000010 02 40 00 80     eth0
+";
+        std::fs::write(&file, local).unwrap();
+        assert!(!public_ipv6(&file));
+
+        std::fs::write(
+            &file,
+            format!("{local}20010db8000000000000000000000010 02 40 00 80     eth0\n"),
+        )
+        .unwrap();
+        assert!(public_ipv6(&file));
+        assert!(!public_ipv6(&dir.join("missing")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
