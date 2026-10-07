@@ -526,7 +526,21 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             // with its data. If that fails, nothing is deployed.
             let mut snapshots = Vec::new();
             if spec.snapshot_before {
-                for target in deploy_targets(&app, &spec) {
+                let mut targets = deploy_targets(&app, &spec);
+                for key in &spec.snapshot_also {
+                    match managed(&app, key).await {
+                        Ok(also) if !targets.iter().any(|t| t.key == also.key) => {
+                            targets.push(also)
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            ctx.progress
+                                .line(format!("{key} isn't managed by ServerOS here, so it wasn't snapshotted"))
+                                .await;
+                        }
+                    }
+                }
+                for target in targets {
                     let strategy = match super::backup_ops::data_strategy(&target).await {
                         Ok(Some(strategy)) => strategy,
                         Ok(None) => continue,

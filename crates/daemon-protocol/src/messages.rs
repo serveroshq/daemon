@@ -559,6 +559,10 @@ pub struct DeploySpec {
     /// breaks it (a bad migration) can be rolled back with its data.
     #[serde(default = "default_true")]
     pub snapshot_before: bool,
+    /// Other services to snapshot with it, by key: the database the app
+    /// keeps its data in, say.
+    #[serde(default)]
+    pub snapshot_also: Vec<String>,
 }
 
 /// One service's snapshot, by the service's key.

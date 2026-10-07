@@ -166,7 +166,8 @@ fn object_base(prefix: &str, service: &str, snapshot: &str) -> String {
 }
 
 /// How to copy a service's data, or why there's nothing to copy. Containers
-/// go by what they mount, read now; everything else by what's known about it.
+/// go by what they run and mount, read now: a database's own dump tool, or
+/// their mounts; everything else by what's known about it.
 pub async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure> {
     let Some(container) = container_of(service) else {
         return Strategy::for_service(service).ok_or_else(|| {
@@ -178,16 +179,13 @@ pub async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure>
         });
     };
 
-    let paths = container_mounts(container).await?;
-    if paths.is_empty() {
-        return Err(Failure::new(
+    container_strategy(container).await?.ok_or_else(|| {
+        Failure::new(
             "backup",
             format!("{} keeps no data outside its container", service.name),
         )
-        .with_next_step("There is nothing to back up; redeploying it gets it back."));
-    }
-
-    Ok(Strategy::Files { paths })
+        .with_next_step("There is nothing to back up; redeploying it gets it back.")
+    })
 }
 
 /// Like `strategy_for`, but None when there's simply nothing to copy, so a
@@ -195,19 +193,16 @@ pub async fn strategy_for(service: &ManagedService) -> Result<Strategy, Failure>
 pub async fn data_strategy(service: &ManagedService) -> Result<Option<Strategy>, Failure> {
     match container_of(service) {
         None => Ok(Strategy::for_service(service)),
-        Some(container) => {
-            let paths = container_mounts(container).await?;
-            Ok((!paths.is_empty()).then_some(Strategy::Files { paths }))
-        }
+        Some(container) => container_strategy(container).await,
     }
 }
 
-async fn container_mounts(container: &str) -> Result<Vec<PathBuf>, Failure> {
+async fn container_strategy(container: &str) -> Result<Option<Strategy>, Failure> {
     let output = Command::new("docker")
         .args([
             "inspect",
             "-f",
-            "{{range .Mounts}}{{.Source}}\n{{end}}",
+            "{{.Config.Image}}\n{{range .Config.Env}}env {{.}}\n{{end}}{{range .Mounts}}mount {{.Source}}\n{{end}}",
             container,
         ])
         .output()
@@ -223,7 +218,24 @@ async fn container_mounts(container: &str) -> Result<Vec<PathBuf>, Failure> {
         ));
     }
 
-    Ok(mount_paths(&String::from_utf8_lossy(&output.stdout)))
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let image = lines.next().unwrap_or("").trim().to_string();
+    let (mut env, mut mounts) = (Vec::new(), Vec::new());
+    for line in lines {
+        if let Some(e) = line.strip_prefix("env ") {
+            env.push(e.to_string());
+        } else if let Some(m) = line.strip_prefix("mount ") {
+            mounts.push(m.to_string());
+        }
+    }
+
+    Ok(Strategy::for_container(
+        container,
+        &image,
+        &env,
+        mount_paths(&mounts.join("\n")),
+    ))
 }
 
 fn mount_paths(inspect: &str) -> Vec<PathBuf> {

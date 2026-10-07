@@ -164,6 +164,42 @@ impl Snapshotter {
                 }
                 vec![out]
             }
+            Strategy::PostgresContainer { container, user } => {
+                let out = dir.join("postgres.sql");
+                let user = format!("'{}'", user.replace('\'', ""));
+                shell_to_file(
+                    "docker",
+                    &[
+                        "exec",
+                        container,
+                        "pg_dumpall",
+                        "-U",
+                        &user,
+                        "--clean",
+                        "--if-exists",
+                    ],
+                    &out,
+                    None,
+                    cancel,
+                    progress,
+                )
+                .await?;
+                vec![out]
+            }
+            Strategy::MysqlContainer { container } => {
+                let out = dir.join("mysql.sql");
+                let script = format!("'{MYSQL_DUMP}'");
+                shell_to_file(
+                    "docker",
+                    &["exec", container, "sh", "-c", &script],
+                    &out,
+                    None,
+                    cancel,
+                    progress,
+                )
+                .await?;
+                vec![out]
+            }
         };
 
         progress.phase("checksum", Some(80)).await;
@@ -329,6 +365,19 @@ impl Snapshotter {
                 })?;
             }
             Strategy::Files { .. } => {
+                // A container's files go back while it's stopped, so it
+                // doesn't write over them or read them half restored.
+                let container =
+                    matches!(service.run_by, RunBy::Docker { .. } | RunBy::Compose { .. });
+                let target = target_for(service);
+                if container {
+                    lifecycle
+                        .act(&target, ServiceAction::Stop)
+                        .await
+                        .map_err(|e| {
+                            Failure::new("restore", format!("could not stop {target}: {e}"))
+                        })?;
+                }
                 let file = dir.join("files.tar.gz");
                 let outcome = run_child(
                     "tar",
@@ -341,8 +390,62 @@ impl Snapshotter {
                     None,
                 )
                 .await;
+                if container {
+                    lifecycle
+                        .act(&target, ServiceAction::Start)
+                        .await
+                        .map_err(|e| {
+                            Failure::new(
+                                "restore",
+                                format!("{target} did not start after the restore: {e}"),
+                            )
+                        })?;
+                }
                 if !outcome.success() {
                     return Err(failure("restore", outcome, "tar"));
+                }
+            }
+            Strategy::PostgresContainer { container, user } => {
+                let file = dir.join("postgres.sql");
+                let command = format!(
+                    "docker exec -i {container} psql -U '{}' -v ON_ERROR_STOP=0 -f - postgres < '{}'",
+                    user.replace('\'', ""),
+                    file.to_string_lossy().replace('\'', "")
+                );
+                let outcome = run_child(
+                    "sh",
+                    &["-c", &command],
+                    None,
+                    &[],
+                    Duration::from_secs(3600),
+                    cancel,
+                    progress,
+                    None,
+                )
+                .await;
+                if !outcome.success() {
+                    return Err(failure("restore", outcome, "psql"));
+                }
+            }
+            Strategy::MysqlContainer { container } => {
+                let file = dir.join("mysql.sql");
+                let command = format!(
+                    "docker exec -i {container} sh -c '{MYSQL_CLIENT}' < '{}'",
+                    file.to_string_lossy().replace('\'', "")
+                );
+                let outcome = run_child(
+                    "sh",
+                    &["-c", &command],
+                    None,
+                    &[],
+                    Duration::from_secs(3600),
+                    cancel,
+                    progress,
+                    None,
+                )
+                .await;
+                if !outcome.success() {
+                    return Err(failure("restore", outcome, "mysql"));
                 }
             }
         }
@@ -379,6 +482,14 @@ impl Snapshotter {
         Ok(())
     }
 }
+
+/// Dumps every database in a MySQL or MariaDB container as root, with the
+/// password its image was started with (none if it allows that). Run with
+/// `sh -c` inside the container; it has no single quotes.
+const MYSQL_DUMP: &str = r#"D=mysqldump; command -v mariadb-dump >/dev/null 2>&1 && D=mariadb-dump; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $D --all-databases --single-transaction --routines --triggers --events -uroot "$@""#;
+
+/// Loads a dump into a MySQL or MariaDB container, the same way.
+const MYSQL_CLIENT: &str = r#"C=mysql; command -v mariadb >/dev/null 2>&1 && C=mariadb; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $C -uroot "$@""#;
 
 fn target_for(service: &ManagedService) -> String {
     match &service.run_by {

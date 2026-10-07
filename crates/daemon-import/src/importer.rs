@@ -71,7 +71,8 @@ impl Importer {
                             .collect()
                     })
                     .unwrap_or_default();
-                let method = daemon_backup::Strategy::method_for(managed, &mounts);
+                let image = service.details.get("image").map(String::as_str);
+                let method = daemon_backup::Strategy::method_for(managed, &mounts, image);
                 service
                     .details
                     .insert("backup".into(), method.unwrap_or("none").into());

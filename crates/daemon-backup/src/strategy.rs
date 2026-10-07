@@ -5,10 +5,27 @@ use daemon_services::{ManagedService, RunBy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strategy {
-    Postgres { user: String },
+    Postgres {
+        user: String,
+    },
     Mysql,
-    Redis { data_dir: PathBuf },
-    Files { paths: Vec<PathBuf> },
+    Redis {
+        data_dir: PathBuf,
+    },
+    Files {
+        paths: Vec<PathBuf>,
+    },
+    /// A Postgres in a container, dumped and restored with its own tools
+    /// through `docker exec`, so the copy is consistent while it runs.
+    PostgresContainer {
+        container: String,
+        user: String,
+    },
+    /// MySQL or MariaDB in a container, the same way, as root with the
+    /// password the image was started with.
+    MysqlContainer {
+        container: String,
+    },
 }
 
 impl Strategy {
@@ -40,6 +57,8 @@ impl Strategy {
             Strategy::Mysql => "mysqldump",
             Strategy::Redis { .. } => "redis rdb",
             Strategy::Files { .. } => "tar",
+            Strategy::PostgresContainer { .. } => "pg_dumpall",
+            Strategy::MysqlContainer { .. } => "mysqldump",
         }
     }
 
@@ -47,12 +66,47 @@ impl Strategy {
     /// strategy's label, or None when there is nothing to copy. Containers go
     /// by their mounts (`backup_paths` of what the scan saw), since the backup
     /// itself inspects them the same way.
-    pub fn method_for(service: &ManagedService, container_mounts: &[&str]) -> Option<&'static str> {
+    pub fn method_for(
+        service: &ManagedService,
+        container_mounts: &[&str],
+        image: Option<&str>,
+    ) -> Option<&'static str> {
         match &service.run_by {
             RunBy::Docker { .. } | RunBy::Compose { .. } => {
-                (!backup_paths(container_mounts.iter().copied()).is_empty()).then_some("tar")
+                match database_image(image.unwrap_or("")) {
+                    Some(DatabaseImage::Postgres) => Some("pg_dumpall"),
+                    Some(DatabaseImage::Mysql) => Some("mysqldump"),
+                    None => (!backup_paths(container_mounts.iter().copied()).is_empty())
+                        .then_some("tar"),
+                }
             }
             _ => Self::for_service(service).map(|s| s.label()),
+        }
+    }
+
+    /// How to copy a container's data: a database's own dump tool when its
+    /// image is one, otherwise its mounts. `env` is the container's
+    /// environment, for the database user.
+    pub fn for_container(
+        container: &str,
+        image: &str,
+        env: &[String],
+        mounts: Vec<PathBuf>,
+    ) -> Option<Self> {
+        match database_image(image) {
+            Some(DatabaseImage::Postgres) => Some(Strategy::PostgresContainer {
+                container: container.into(),
+                user: env
+                    .iter()
+                    .find_map(|e| e.strip_prefix("POSTGRES_USER="))
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or("postgres")
+                    .into(),
+            }),
+            Some(DatabaseImage::Mysql) => Some(Strategy::MysqlContainer {
+                container: container.into(),
+            }),
+            None => (!mounts.is_empty()).then_some(Strategy::Files { paths: mounts }),
         }
     }
 
@@ -62,6 +116,7 @@ impl Strategy {
             Strategy::Mysql => "mysqldump",
             Strategy::Redis { .. } => "redis-cli",
             Strategy::Files { .. } => "tar",
+            Strategy::PostgresContainer { .. } | Strategy::MysqlContainer { .. } => "docker",
         }
     }
 
@@ -76,6 +131,38 @@ impl Strategy {
             "storage/logs",
             ".git/objects/pack/*.pack",
         ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabaseImage {
+    Postgres,
+    Mysql,
+}
+
+/// Which database an image runs, by its name: postgres, postgis/postgis,
+/// timescale/timescaledb, mysql, mariadb, percona…
+fn database_image(image: &str) -> Option<DatabaseImage> {
+    let name = image
+        .rsplit('/')
+        .next()
+        .unwrap_or(image)
+        .split([':', '@'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.starts_with("postgres")
+        || name.starts_with("postgis")
+        || name.starts_with("timescaledb")
+    {
+        Some(DatabaseImage::Postgres)
+    } else if name.starts_with("mysql")
+        || name.starts_with("mariadb")
+        || name.starts_with("percona")
+    {
+        Some(DatabaseImage::Mysql)
+    } else {
+        None
     }
 }
 
@@ -129,15 +216,15 @@ mod tests {
     #[test]
     fn reports_how_a_service_would_be_backed_up() {
         assert_eq!(
-            Strategy::method_for(&managed("postgresql", None, &[]), &[]),
+            Strategy::method_for(&managed("postgresql", None, &[]), &[], None),
             Some("pg_dumpall")
         );
         assert_eq!(
-            Strategy::method_for(&managed("docker", None, &[]), &[]),
+            Strategy::method_for(&managed("docker", None, &[]), &[], None),
             None
         );
         assert_eq!(
-            Strategy::method_for(&managed("caddy", None, &[]), &[]),
+            Strategy::method_for(&managed("caddy", None, &[]), &[], None),
             None
         );
 
@@ -146,14 +233,58 @@ mod tests {
             container: "shop-1".into(),
         };
         assert_eq!(
-            Strategy::method_for(&container, &["/srv/shop/data"]),
+            Strategy::method_for(&container, &["/srv/shop/data"], Some("nginx:1.25")),
             Some("tar")
         );
         assert_eq!(
-            Strategy::method_for(&container, &["/var/run/docker.sock", "/etc"]),
+            Strategy::method_for(&container, &["/var/run/docker.sock", "/etc"], None),
             None
         );
-        assert_eq!(Strategy::method_for(&container, &[]), None);
+        assert_eq!(Strategy::method_for(&container, &[], None), None);
+        assert_eq!(
+            Strategy::method_for(&container, &["/v"], Some("postgres:16-alpine")),
+            Some("pg_dumpall")
+        );
+        assert_eq!(
+            Strategy::method_for(&container, &[], Some("docker.io/library/mariadb:11")),
+            Some("mysqldump")
+        );
+    }
+
+    #[test]
+    fn dumps_database_containers_with_their_own_tools() {
+        assert_eq!(
+            Strategy::for_container(
+                "db-1",
+                "postgres:16",
+                &["POSTGRES_USER=shop".into()],
+                vec![]
+            ),
+            Some(Strategy::PostgresContainer {
+                container: "db-1".into(),
+                user: "shop".into()
+            })
+        );
+        assert_eq!(
+            Strategy::for_container("db-1", "timescale/timescaledb:latest-pg16", &[], vec![]),
+            Some(Strategy::PostgresContainer {
+                container: "db-1".into(),
+                user: "postgres".into()
+            })
+        );
+        assert_eq!(
+            Strategy::for_container("db-1", "mysql:8", &[], vec![]),
+            Some(Strategy::MysqlContainer {
+                container: "db-1".into()
+            })
+        );
+        assert_eq!(
+            Strategy::for_container("web-1", "nginx", &[], vec![PathBuf::from("/srv/www")]),
+            Some(Strategy::Files {
+                paths: vec![PathBuf::from("/srv/www")]
+            })
+        );
+        assert_eq!(Strategy::for_container("web-1", "nginx", &[], vec![]), None);
     }
 
     #[test]
