@@ -311,6 +311,47 @@ impl Proxy {
             ),
         };
 
+        // A stopped proxy can't reload (Caddy's reload talks to the running
+        // one on localhost:2019). Starting it loads the same config.
+        if !unit_active(unit).await {
+            progress
+                .line(format!("{unit} is not running: starting it"))
+                .await;
+            let started = run_child(
+                "systemctl",
+                &["enable", "--now", unit],
+                None,
+                &[],
+                Duration::from_secs(60),
+                cancel,
+                progress,
+                None,
+            )
+            .await;
+            if started.success() && unit_active(unit).await {
+                return Ok(());
+            }
+
+            let journal = run_child(
+                "journalctl",
+                &["-u", unit, "-n", "20", "--no-pager"],
+                None,
+                &[],
+                Duration::from_secs(15),
+                cancel,
+                progress,
+                None,
+            )
+            .await;
+            return Err(
+                Failure::new("proxy", format!("{unit} is not running and would not start"))
+                    .with_output(journal.tail().to_vec())
+                    .with_next_step(format!(
+                        "Something else may be using port 80 or 443 (`ss -ltnp` shows what), or the config has an error. `journalctl -u {unit}` says which."
+                    )),
+            );
+        }
+
         let outcome = run_child(
             program,
             &args,
@@ -331,6 +372,16 @@ impl Proxy {
                 .with_next_step(format!("Check `systemctl status {unit}` on the machine.")))
         }
     }
+}
+
+/// Whether systemd says the unit is running (still starting counts as no).
+async fn unit_active(unit: &str) -> bool {
+    tokio::process::Command::new("systemctl")
+        .args(["is-active", "--quiet", unit])
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn on_path(program: &str) -> bool {
