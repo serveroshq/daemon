@@ -49,10 +49,7 @@ pub fn is_forbidden_read(path: &Path) -> bool {
 }
 
 pub fn allowed_on_adopted(op: &ServiceOp) -> bool {
-    !matches!(
-        op,
-        ServiceOp::Create { .. } | ServiceOp::Update { .. } | ServiceOp::Remove { .. }
-    )
+    !matches!(op, ServiceOp::Create { .. } | ServiceOp::Update { .. })
 }
 
 pub fn manages_user(user: &str, managed_users: &[String]) -> bool {
@@ -80,6 +77,10 @@ pub fn explain_refusal(op: &Operation, reason: &Refusal) -> String {
         }
         Refusal::ReadOnly => "machine is in read-only mode".into(),
         Refusal::NotCreatedByUs => format!("{} was not created by ServerOS", op.target()),
+        Refusal::NotAdopted => format!(
+            "{} was neither created nor adopted by ServerOS; adopt it first",
+            op.target()
+        ),
         Refusal::UnmanagedUser => format!("{} is not a ServerOS-managed user", op.target()),
     }
 }
@@ -91,6 +92,7 @@ pub enum Refusal {
     NeedsConfirmation,
     ReadOnly,
     NotCreatedByUs,
+    NotAdopted,
     UnmanagedUser,
 }
 
@@ -112,6 +114,7 @@ pub fn checks_for(op: &Operation) -> Vec<Check> {
 
     match op {
         Operation::Service(s) if !allowed_on_adopted(s) => checks.push(Check::CreatedByUs),
+        Operation::Service(ServiceOp::Remove { .. }) => checks.push(Check::CreatedOrAdopted),
         Operation::Machine(MachineOp::ManageSshKeys { .. }) => checks.push(Check::ManagedUser),
         Operation::Data(DataOp::OpenTerminal { .. }) => checks.push(Check::ReadOnlyMode),
         _ => {}
@@ -127,6 +130,7 @@ pub enum Check {
     ForbiddenPath,
     PermittedRoots,
     CreatedByUs,
+    CreatedOrAdopted,
     ManagedUser,
 }
 
@@ -164,11 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn adopted_services_cannot_be_removed_or_rewritten() {
-        assert!(!allowed_on_adopted(&ServiceOp::Remove {
+    fn adopted_services_cannot_be_created_or_rewritten() {
+        assert!(!allowed_on_adopted(&ServiceOp::Create {
             service: "nginx".into()
         }));
         assert!(!allowed_on_adopted(&ServiceOp::Update {
+            service: "nginx".into()
+        }));
+        assert!(allowed_on_adopted(&ServiceOp::Remove {
             service: "nginx".into()
         }));
         assert!(allowed_on_adopted(&ServiceOp::Restart {
@@ -205,6 +212,19 @@ mod tests {
         assert!(checks_for(&restore).contains(&Check::Confirmation));
         assert!(checks_for(&reboot).contains(&Check::Confirmation));
         assert!(!checks_for(&restart).contains(&Check::Confirmation));
+    }
+
+    #[test]
+    fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
+        let remove = Operation::Service(ServiceOp::Remove {
+            service: "docker:abc123def456".into(),
+        });
+        let checks = checks_for(&remove);
+
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+        assert!(checks.contains(&Check::CreatedOrAdopted));
+        assert!(!checks.contains(&Check::CreatedByUs));
     }
 
     #[test]

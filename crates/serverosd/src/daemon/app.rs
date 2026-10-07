@@ -198,6 +198,17 @@ impl App {
             .take()
     }
 
+    pub fn sync_adopted(&self) {
+        let adopted = daemon_services::Registry::new(&self.state)
+            .all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.origin == daemon_protocol::ServiceOrigin::Discovered)
+            .map(|m| m.key)
+            .collect();
+        self.broker.set_adopted_services(adopted);
+    }
+
     pub fn add_roots(&self, roots: &[PathBuf]) {
         for root in roots {
             self.broker.add_root(root.clone());

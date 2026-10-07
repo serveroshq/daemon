@@ -156,6 +156,7 @@ async fn discovery(app: Arc<App>) {
 
         match app.importer.scan().await {
             Ok((report, events)) => {
+                app.sync_adopted();
                 for event in events {
                     app.raise(event).await;
                 }

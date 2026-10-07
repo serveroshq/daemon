@@ -144,6 +144,131 @@ pub async fn remove(
     }
 }
 
+const DAEMON_DEPENDENCIES: &[&str] = &["serverosd", "serveros-gateway"];
+
+fn is_daemon_dependency(name: &str, image: &str) -> bool {
+    let name = name.trim_start_matches('/').to_ascii_lowercase();
+    let image = image.to_ascii_lowercase();
+    let repo = image.rsplit('/').next().unwrap_or(&image);
+    let repo = repo.split([':', '@']).next().unwrap_or(repo);
+
+    DAEMON_DEPENDENCIES
+        .iter()
+        .any(|d| name == *d || name.starts_with(&format!("{d}-")) || repo == *d)
+}
+
+fn parse_mounts(out: &str) -> (Vec<String>, Vec<String>) {
+    let mut volumes = Vec::new();
+    let mut binds = Vec::new();
+
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match line.split_once(' ') {
+            Some(("volume", name)) if !name.is_empty() => volumes.push(name.to_string()),
+            Some(("bind", path)) if !path.is_empty() => binds.push(path.to_string()),
+            _ => {}
+        }
+    }
+
+    (volumes, binds)
+}
+
+pub async fn remove_adopted(
+    app: &App,
+    ctx: &JobContext,
+    service: &ManagedService,
+    delete_volumes: bool,
+) -> Result<Value, Failure> {
+    let progress = &ctx.progress;
+    let Some(container) = container_of(service) else {
+        return Err(Failure::new(
+            "remove",
+            format!(
+                "{} isn't a container, so ServerOS won't remove it",
+                service.name
+            ),
+        )
+        .with_next_step("Stop it instead, or remove it on the machine yourself."));
+    };
+
+    let identity = docker(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{.Name}}|{{.Config.Image}}",
+        container,
+    ])
+    .await?;
+    let (name, image) = identity
+        .trim()
+        .split_once('|')
+        .unwrap_or((identity.trim(), ""));
+    if is_daemon_dependency(name, image) {
+        return Err(Failure::new(
+            "remove",
+            format!(
+                "{} is part of ServerOS itself, so it can't be removed from here",
+                service.name
+            ),
+        )
+        .with_next_step("Uninstall ServerOS from the machine instead."));
+    }
+
+    let mounts = docker(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{range .Mounts}}{{.Type}} {{if eq .Type \"volume\"}}{{.Name}}{{else}}{{.Source}}{{end}}\n{{end}}",
+        container,
+    ])
+    .await?;
+    let (volumes, binds) = parse_mounts(&mounts);
+
+    docker(&["rm", "-f", container]).await?;
+    let _ = Registry::new(&app.state).remove(&service.key);
+    progress.line(format!("removed {container}")).await;
+
+    let mut deleted = Vec::new();
+    let mut kept = Vec::new();
+    if delete_volumes {
+        for volume in &volumes {
+            match docker(&["volume", "rm", volume]).await {
+                Ok(_) => deleted.push(volume.clone()),
+                Err(e) => {
+                    progress
+                        .line(format!("kept volume {volume}: {}", e.message))
+                        .await;
+                    kept.push(volume.clone());
+                }
+            }
+        }
+        progress
+            .line(format!("deleted {} volume(s)", deleted.len()))
+            .await;
+    } else {
+        kept = volumes;
+        if !kept.is_empty() {
+            progress
+                .line(format!("kept {} volume(s)", kept.len()))
+                .await;
+        }
+    }
+    if !binds.is_empty() {
+        progress
+            .line(format!(
+                "left {} folder(s) on the machine untouched",
+                binds.len()
+            ))
+            .await;
+    }
+
+    Ok(json!({
+        "removed": 1,
+        "volumes_deleted": deleted.len(),
+        "volumes_kept": kept,
+        "folders_kept": binds,
+    }))
+}
+
 pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> Vec<String> {
     let registry = Registry::new(&app.state);
     let project = format!("serveros-{}", sanitise(&spec.service));
@@ -354,6 +479,31 @@ async fn docker_lines(args: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_daemon_and_gateway_are_never_removable() {
+        assert!(is_daemon_dependency(
+            "/serveros-gateway",
+            "ghcr.io/serveroshq/serveros-gateway:1.4"
+        ));
+        assert!(is_daemon_dependency("/gw", "serveros-gateway@sha256:abc"));
+        assert!(is_daemon_dependency("/serverosd", "debian:12"));
+        assert!(!is_daemon_dependency(
+            "/8f2c1d-wings",
+            "ghcr.io/pterodactyl/yolks:java_17"
+        ));
+        assert!(!is_daemon_dependency("/my-serverosd-notes", "nginx:1.27"));
+    }
+
+    #[test]
+    fn mounts_split_into_volumes_and_host_folders() {
+        let (volumes, binds) = parse_mounts(
+            "volume pgdata\nbind /var/lib/pterodactyl/volumes/8f2c\nvolume 3a9e0c\ntmpfs \n",
+        );
+
+        assert_eq!(volumes, vec!["pgdata", "3a9e0c"]);
+        assert_eq!(binds, vec!["/var/lib/pterodactyl/volumes/8f2c"]);
+    }
 
     #[test]
     fn sanitise_matches_the_deployer() {

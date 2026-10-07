@@ -482,6 +482,8 @@ pub enum Job {
         service: String,
         #[serde(default)]
         delete_data: bool,
+        #[serde(default)]
+        delete_adopted_volumes: bool,
     },
     Unadopt {
         service: String,

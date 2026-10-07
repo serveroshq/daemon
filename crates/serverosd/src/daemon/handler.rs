@@ -208,6 +208,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
         Job::ServiceRemove {
             service,
             delete_data,
+            delete_adopted_volumes,
         } => {
             let managed = match managed(&app, &service).await {
                 Ok(managed) => managed,
@@ -219,14 +220,33 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 }
                 Err(failure) => return Err(failure),
             };
+            let adopted = managed.origin == daemon_protocol::ServiceOrigin::Discovered;
+            if adopted && delete_data && !delete_adopted_volumes {
+                return Err(Failure::new(
+                    "remove",
+                    format!(
+                        "{} was adopted, so deleting its data needs delete_adopted_volumes as well",
+                        managed.name
+                    ),
+                )
+                .with_next_step("Remove it and keep the data, or ask again with both flags."));
+            }
             let grant = authorize(Operation::Service(ServiceOp::Remove {
                 service: managed.key.clone(),
             }))?;
-            let result = super::service_ops::remove(&app, &ctx, &managed, delete_data).await;
-            grant.finish(
-                &result.as_ref().map(|_| ()),
-                delete_data.then_some("data deleted"),
-            );
+            let result = if adopted {
+                super::service_ops::remove_adopted(&app, &ctx, &managed, delete_data).await
+            } else {
+                super::service_ops::remove(&app, &ctx, &managed, delete_data).await
+            };
+            app.sync_adopted();
+            let note = match (adopted, delete_data) {
+                (true, true) => Some("adopted; docker volumes deleted"),
+                (true, false) => Some("adopted; data kept"),
+                (false, true) => Some("data deleted"),
+                (false, false) => None,
+            };
+            grant.finish(&result.as_ref().map(|_| ()), note);
             result
         }
 
@@ -660,6 +680,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 Some("no restart, no config changes"),
             );
             let outcome = result?;
+            app.sync_adopted();
             app.add_roots(&outcome.new_roots);
             Ok(serde_json::to_value(outcome).unwrap_or(Value::Null))
         }
@@ -672,6 +693,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 .importer
                 .unadopt(&service)
                 .map_err(|e| Failure::new("unadopt", e.to_string()));
+            app.sync_adopted();
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result

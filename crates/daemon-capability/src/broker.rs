@@ -64,6 +64,7 @@ pub struct Denied {
 pub struct BrokerState {
     pub roots: PermittedRoots,
     pub created: Created,
+    pub adopted: Vec<String>,
     pub read_only: bool,
 }
 
@@ -102,6 +103,13 @@ impl Broker {
             .created
             .services
             .push(service);
+    }
+
+    pub fn set_adopted_services(&self, services: Vec<String>) {
+        self.state
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .adopted = services;
     }
 
     pub fn record_created_path(&self, path: std::path::PathBuf) {
@@ -174,10 +182,15 @@ impl Broker {
                 Check::PermittedRoots => op.path().is_some_and(|p| !state.roots.permits(p)),
                 Check::CreatedByUs => match op {
                     Operation::Service(
-                        ServiceOp::Create { service }
-                        | ServiceOp::Update { service }
-                        | ServiceOp::Remove { service },
+                        ServiceOp::Create { service } | ServiceOp::Update { service },
                     ) => !state.created.services.contains(service),
+                    _ => false,
+                },
+                Check::CreatedOrAdopted => match op {
+                    Operation::Service(ServiceOp::Remove { service }) => {
+                        !state.created.services.contains(service)
+                            && !state.adopted.contains(service)
+                    }
                     _ => false,
                 },
                 Check::ManagedUser => match op {
@@ -195,6 +208,7 @@ impl Broker {
                     Check::ForbiddenPath => Refusal::ForbiddenPath,
                     Check::PermittedRoots => Refusal::OutsideRoots,
                     Check::CreatedByUs => Refusal::NotCreatedByUs,
+                    Check::CreatedOrAdopted => Refusal::NotAdopted,
                     Check::ManagedUser => Refusal::UnmanagedUser,
                 });
             }
@@ -370,31 +384,108 @@ mod tests {
             .is_ok());
     }
 
+    fn remove(service: &str) -> Operation {
+        Operation::Service(ServiceOp::Remove {
+            service: service.into(),
+        })
+    }
+
     #[test]
-    fn only_serveros_created_services_can_be_removed() {
+    fn created_services_can_be_removed() {
         let dir = tempfile::tempdir().unwrap();
         let broker = broker(dir.path());
 
+        assert!(broker
+            .authorize(request(remove("serveros-app"), true))
+            .is_ok());
+    }
+
+    #[test]
+    fn adopted_services_can_be_removed_once_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(dir.path());
+        broker.set_adopted_services(vec!["docker:pterowings01".into()]);
+
         assert_eq!(
             broker
-                .authorize(request(
-                    Operation::Service(ServiceOp::Remove {
-                        service: "nginx".into()
-                    }),
-                    true
-                ))
+                .authorize(request(remove("docker:pterowings01"), false))
                 .unwrap_err()
                 .reason,
-            Refusal::NotCreatedByUs
+            Refusal::NeedsConfirmation
         );
         assert!(broker
-            .authorize(request(
-                Operation::Service(ServiceOp::Remove {
-                    service: "serveros-app".into()
-                }),
-                true
-            ))
+            .authorize(request(remove("docker:pterowings01"), true))
             .is_ok());
+    }
+
+    #[test]
+    fn discovered_services_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(dir.path());
+        broker.set_adopted_services(vec!["docker:pterowings01".into()]);
+
+        let denied = broker
+            .authorize(request(remove("docker:somethingelse"), true))
+            .unwrap_err();
+
+        assert_eq!(denied.reason, Refusal::NotAdopted);
+        assert!(denied.explanation.contains("adopt it first"));
+    }
+
+    #[test]
+    fn adopted_services_still_cannot_be_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(dir.path());
+        broker.set_adopted_services(vec!["docker:pterowings01".into()]);
+
+        for op in [
+            ServiceOp::Create {
+                service: "docker:pterowings01".into(),
+            },
+            ServiceOp::Update {
+                service: "docker:pterowings01".into(),
+            },
+        ] {
+            assert_eq!(
+                broker
+                    .authorize(request(Operation::Service(op), true))
+                    .unwrap_err()
+                    .reason,
+                Refusal::NotCreatedByUs
+            );
+        }
+    }
+
+    #[test]
+    fn unadopting_takes_removal_away_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(dir.path());
+        broker.set_adopted_services(vec!["docker:pterowings01".into()]);
+        broker.set_adopted_services(Vec::new());
+
+        assert_eq!(
+            broker
+                .authorize(request(remove("docker:pterowings01"), true))
+                .unwrap_err()
+                .reason,
+            Refusal::NotAdopted
+        );
+    }
+
+    #[test]
+    fn read_only_mode_refuses_removing_adopted_services() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(dir.path());
+        broker.set_adopted_services(vec!["docker:pterowings01".into()]);
+        broker.set_read_only(true);
+
+        assert_eq!(
+            broker
+                .authorize(request(remove("docker:pterowings01"), true))
+                .unwrap_err()
+                .reason,
+            Refusal::ReadOnly
+        );
     }
 
     #[test]

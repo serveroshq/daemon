@@ -87,8 +87,9 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
 
         let mut broker_state = daemon_capability::broker::BrokerState { roots, ..Default::default() };
         for managed in daemon_services::Registry::new(&state).all().unwrap_or_default() {
-            if managed.origin == daemon_protocol::ServiceOrigin::Created {
-                broker_state.created.services.push(managed.key.clone());
+            match managed.origin {
+                daemon_protocol::ServiceOrigin::Created => broker_state.created.services.push(managed.key.clone()),
+                daemon_protocol::ServiceOrigin::Discovered => broker_state.adopted.push(managed.key.clone()),
             }
         }
         broker_state.created.users.push("serveros".into());
