@@ -27,6 +27,20 @@ pub fn valid_unit_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':' | '\\'))
 }
 
+/// The systemctl arguments for an action. systemctl waits for the job by
+/// default, which is what we want; `--no-block` is a bare switch, and
+/// `--no-block=false` made systemctl refuse every start, stop and restart.
+pub fn action_args(action: ServiceAction, unit: &str) -> [&str; 2] {
+    let verb = match action {
+        ServiceAction::Start => "start",
+        ServiceAction::Stop => "stop",
+        ServiceAction::Restart => "restart",
+        ServiceAction::Reload => "reload-or-restart",
+    };
+
+    [verb, unit]
+}
+
 impl SystemdAdapter {
     async fn run(&self, program: &str, args: &[&str]) -> Result<String> {
         let output = tokio::time::timeout(
@@ -71,14 +85,7 @@ impl Lifecycle for SystemdAdapter {
             )));
         }
 
-        let verb = match action {
-            ServiceAction::Start => "start",
-            ServiceAction::Stop => "stop",
-            ServiceAction::Restart => "restart",
-            ServiceAction::Reload => "reload-or-restart",
-        };
-
-        self.run("systemctl", &[verb, "--no-block=false", unit])
+        self.run("systemctl", &action_args(action, unit))
             .await
             .map(|_| ())
     }
@@ -152,6 +159,36 @@ pub fn status_from_show(text: &str) -> ServiceStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actions_are_plain_systemctl_verbs_that_wait() {
+        assert_eq!(
+            action_args(ServiceAction::Start, "app.service"),
+            ["start", "app.service"]
+        );
+        assert_eq!(
+            action_args(ServiceAction::Stop, "app.service"),
+            ["stop", "app.service"]
+        );
+        assert_eq!(
+            action_args(ServiceAction::Restart, "app.service"),
+            ["restart", "app.service"]
+        );
+        assert_eq!(
+            action_args(ServiceAction::Reload, "app.service"),
+            ["reload-or-restart", "app.service"]
+        );
+        for action in [
+            ServiceAction::Start,
+            ServiceAction::Stop,
+            ServiceAction::Restart,
+            ServiceAction::Reload,
+        ] {
+            assert!(action_args(action, "x.service")
+                .iter()
+                .all(|a| !a.starts_with("--no-block")));
+        }
+    }
 
     #[test]
     fn unit_names_are_validated_before_reaching_a_shell() {
