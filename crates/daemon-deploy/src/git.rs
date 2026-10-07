@@ -78,6 +78,36 @@ pub async fn ensure_deploy_key(
         })
 }
 
+/// How to authenticate a fetch: the machine's deploy key for an SSH
+/// repository, or a token for a private HTTPS one.
+#[derive(Clone, Copy, Default)]
+pub struct Auth<'a> {
+    pub deploy_key: Option<&'a Path>,
+    pub token: Option<&'a str>,
+}
+
+/// The environment that gives git an `Authorization` header for the
+/// repository's host, as actions/checkout does.
+pub fn token_env(repo: &str, token: &str) -> Vec<(&'static str, String)> {
+    use base64::Engine;
+
+    let origin = repo
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .map(|host| format!("https://{host}/"))
+        .unwrap_or_else(|| "https://github.com/".to_string());
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+
+    vec![
+        ("GIT_CONFIG_COUNT", "1".to_string()),
+        ("GIT_CONFIG_KEY_0", format!("http.{origin}.extraheader")),
+        (
+            "GIT_CONFIG_VALUE_0",
+            format!("AUTHORIZATION: basic {basic}"),
+        ),
+    ]
+}
+
 pub fn valid_commit(sha: &str) -> bool {
     (7..=64).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -95,7 +125,7 @@ pub async fn fetch(
     repo: &str,
     commit: &str,
     workspace: &Path,
-    deploy_key: Option<&Path>,
+    auth: Auth<'_>,
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -117,17 +147,24 @@ pub async fn fetch(
     std::fs::create_dir_all(workspace)
         .map_err(|e| Failure::new("fetch", format!("could not create workspace: {e}")))?;
 
-    let ssh_command = match deploy_key {
+    let ssh_command = match auth.deploy_key {
         Some(key) => format!(
             "ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes",
             key.to_string_lossy()
         ),
         None => "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new".into(),
     };
-    let env = [
-        ("GIT_SSH_COMMAND", ssh_command.as_str()),
-        ("GIT_TERMINAL_PROMPT", "0"),
+    let mut env = vec![
+        ("GIT_SSH_COMMAND", ssh_command.clone()),
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
     ];
+    // A token for a private HTTPS repository goes in as an auth header
+    // through git's environment (git 2.31+), so it's never in the remote
+    // URL, .git/config or the job's output.
+    if let Some(token) = auth.token.filter(|t| !t.is_empty()) {
+        env.extend(token_env(repo, token));
+    }
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
     let steps: [(&str, Vec<&str>); 4] = [
         ("init", vec!["init", "-q"]),
@@ -197,6 +234,26 @@ pub async fn fetch(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_token_becomes_an_auth_header_for_the_repository_host_only() {
+        let env = token_env("https://github.com/acme/private-app.git", "ghs_abc");
+        assert_eq!(env[0], ("GIT_CONFIG_COUNT", "1".to_string()));
+        assert_eq!(env[1].1, "http.https://github.com/.extraheader");
+        // base64 of "x-access-token:ghs_abc"
+        assert_eq!(
+            env[2].1,
+            "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46Z2hzX2FiYw=="
+        );
+        assert!(env.iter().all(|(_, v)| !v.contains("ghs_abc")));
+    }
+
+    #[test]
+    fn a_repo_token_never_shows_in_debug_output() {
+        let token = daemon_protocol::RepoToken("ghs_secret".into());
+        assert_eq!(format!("{token:?}"), "RepoToken([redacted])");
+    }
+
     use super::*;
 
     #[test]

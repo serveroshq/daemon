@@ -353,6 +353,7 @@ dependencies = [
 name = "daemon-deploy"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "daemon-core",
  "daemon-files",
  "daemon-jobs",

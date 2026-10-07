@@ -161,7 +161,10 @@ impl Deployer {
                 &spec.repo,
                 commit,
                 workspace,
-                private_key.exists().then_some(private_key.as_path()),
+                git::Auth {
+                    deploy_key: private_key.exists().then_some(private_key.as_path()),
+                    token: spec.repo_token.as_ref().map(|t| t.0.as_str()),
+                },
                 step_timeout,
                 cancel,
                 progress,

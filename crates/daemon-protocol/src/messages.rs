@@ -437,7 +437,7 @@ pub enum Job {
         group: Option<String>,
         service: Option<String>,
     },
-    Deploy(DeploySpec),
+    Deploy(Box<DeploySpec>),
     Rollback {
         service: String,
         release: Option<String>,
@@ -571,6 +571,22 @@ pub struct DeploySpec {
     /// keeps its data in, say.
     #[serde(default)]
     pub snapshot_also: Vec<String>,
+    /// A short-lived token for a private HTTPS repository (a GitHub App
+    /// installation token), sent fresh with each deploy and never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_token: Option<RepoToken>,
+}
+
+/// A repository token. Its Debug says nothing, so a logged spec doesn't
+/// leak it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RepoToken(pub String);
+
+impl std::fmt::Debug for RepoToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RepoToken([redacted])")
+    }
 }
 
 /// One service's snapshot, by the service's key.
