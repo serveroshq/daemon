@@ -85,15 +85,17 @@ impl Strategy {
     }
 
     /// How to copy a container's data: a database's own dump tool when its
-    /// image is one, otherwise its mounts. `env` is the container's
-    /// environment, for the database user.
+    /// image is one and it's running, otherwise its mounts (a stopped
+    /// database's files are consistent, and its tools can't run). `env` is
+    /// the container's environment, for the database user.
     pub fn for_container(
         container: &str,
         image: &str,
         env: &[String],
         mounts: Vec<PathBuf>,
+        running: bool,
     ) -> Option<Self> {
-        match database_image(image) {
+        match database_image(image).filter(|_| running) {
             Some(DatabaseImage::Postgres) => Some(Strategy::PostgresContainer {
                 container: container.into(),
                 user: env
@@ -258,7 +260,8 @@ mod tests {
                 "db-1",
                 "postgres:16",
                 &["POSTGRES_USER=shop".into()],
-                vec![]
+                vec![],
+                true
             ),
             Some(Strategy::PostgresContainer {
                 container: "db-1".into(),
@@ -266,25 +269,47 @@ mod tests {
             })
         );
         assert_eq!(
-            Strategy::for_container("db-1", "timescale/timescaledb:latest-pg16", &[], vec![]),
+            Strategy::for_container(
+                "db-1",
+                "timescale/timescaledb:latest-pg16",
+                &[],
+                vec![],
+                true
+            ),
             Some(Strategy::PostgresContainer {
                 container: "db-1".into(),
                 user: "postgres".into()
             })
         );
         assert_eq!(
-            Strategy::for_container("db-1", "mysql:8", &[], vec![]),
+            Strategy::for_container("db-1", "mysql:8", &[], vec![], true),
             Some(Strategy::MysqlContainer {
                 container: "db-1".into()
             })
         );
         assert_eq!(
-            Strategy::for_container("web-1", "nginx", &[], vec![PathBuf::from("/srv/www")]),
+            Strategy::for_container("web-1", "nginx", &[], vec![PathBuf::from("/srv/www")], true),
             Some(Strategy::Files {
                 paths: vec![PathBuf::from("/srv/www")]
             })
         );
-        assert_eq!(Strategy::for_container("web-1", "nginx", &[], vec![]), None);
+        assert_eq!(
+            Strategy::for_container("web-1", "nginx", &[], vec![], true),
+            None
+        );
+        // A stopped database can't dump, but its files are consistent.
+        assert_eq!(
+            Strategy::for_container(
+                "db-1",
+                "postgres:16",
+                &[],
+                vec![PathBuf::from("/var/lib/docker/volumes/db/_data")],
+                false
+            ),
+            Some(Strategy::Files {
+                paths: vec![PathBuf::from("/var/lib/docker/volumes/db/_data")]
+            })
+        );
     }
 
     #[test]

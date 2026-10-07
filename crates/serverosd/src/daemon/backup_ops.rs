@@ -202,7 +202,7 @@ async fn container_strategy(container: &str) -> Result<Option<Strategy>, Failure
         .args([
             "inspect",
             "-f",
-            "{{.Config.Image}}\n{{range .Config.Env}}env {{.}}\n{{end}}{{range .Mounts}}mount {{.Source}}\n{{end}}",
+            "{{.State.Running}}\n{{.Config.Image}}\n{{range .Config.Env}}env {{.}}\n{{end}}{{range .Mounts}}mount {{.Source}}\n{{end}}",
             container,
         ])
         .output()
@@ -220,6 +220,7 @@ async fn container_strategy(container: &str) -> Result<Option<Strategy>, Failure
 
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
+    let running = lines.next().unwrap_or("").trim() == "true";
     let image = lines.next().unwrap_or("").trim().to_string();
     let (mut env, mut mounts) = (Vec::new(), Vec::new());
     for line in lines {
@@ -235,6 +236,7 @@ async fn container_strategy(container: &str) -> Result<Option<Strategy>, Failure
         &image,
         &env,
         mount_paths(&mounts.join("\n")),
+        running,
     ))
 }
 
