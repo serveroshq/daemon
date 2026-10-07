@@ -131,12 +131,19 @@ impl Proxy {
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<bool, Failure> {
-        if self.backend != ProxyBackend::Caddy || on_path("caddy") {
+        // A caddy binary without its systemd unit (copied in by hand, or
+        // left by another tool) can't be started or reloaded: install the
+        // package, which brings the unit.
+        if self.backend != ProxyBackend::Caddy || (on_path("caddy") && unit_exists("caddy").await) {
             return Ok(false);
         }
 
         progress
-            .line("Caddy is not installed: installing it for automatic HTTPS".to_string())
+            .line(if on_path("caddy") {
+                "Caddy is here but has no systemd service: installing its package for automatic HTTPS".to_string()
+            } else {
+                "Caddy is not installed: installing it for automatic HTTPS".to_string()
+            })
             .await;
 
         let outcome = run_child(
@@ -372,6 +379,18 @@ impl Proxy {
                 .with_next_step(format!("Check `systemctl status {unit}` on the machine.")))
         }
     }
+}
+
+/// Whether systemd knows the unit at all.
+async fn unit_exists(unit: &str) -> bool {
+    tokio::process::Command::new("systemctl")
+        .args(["cat", "--", &format!("{unit}.service")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Whether systemd says the unit is running (still starting counts as no).
