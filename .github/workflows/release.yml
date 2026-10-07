@@ -1,5 +1,8 @@
 # Tag `vX.Y.Z` → static binaries for amd64 and arm64, signed with the
-# release key, checksummed, and published with a manifest per arch.
+# release key, checksummed, and published with a manifest per arch, then
+# uploaded to the panel and registered there, so machines update on their own.
+# Tags go to the stable channel, prereleases (-pre.N) included; only tags
+# with "canary" in them (v0.2.0-canary.1) go to canary.
 #
 # Secrets: SERVEROS_RELEASE_KEY (hex private key from `serveros-release keygen`),
 #          SERVEROS_DEPLOY_TOKEN (the panel's SERVEROS_DEPLOY_TOKEN, to register releases).
@@ -46,7 +49,7 @@ jobs:
         env:
           SERVEROS_VERSION: ${{ github.ref_name }}
           SERVEROS_COMMIT: ${{ github.sha }}
-          SERVEROS_CHANNEL: ${{ contains(github.ref_name, '-') && 'canary' || 'stable' }}
+          SERVEROS_CHANNEL: ${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}
           SERVEROS_TARGET: linux-${{ matrix.arch }}
           SERVEROS_RELEASE_PUBKEY: ${{ vars.SERVEROS_RELEASE_PUBKEY }}
       - name: Stage
@@ -83,7 +86,7 @@ jobs:
             f="serverosd-${{ github.ref_name }}-linux-$arch"
             ../target/release/serveros-release manifest \
               --version "${{ github.ref_name }}" \
-              --channel "${{ contains(github.ref_name, '-') && 'canary' || 'stable' }}" \
+              --channel "${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}" \
               --url "https://releases.serveros.com/${{ github.ref_name }}/$f" \
               --file "$f" --key ../release.key \
               --notes-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" \
@@ -96,13 +99,22 @@ jobs:
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true
-      - name: Register with the panel
+      # The panel serves the binaries daemons download, and refuses to
+      # register a release until its binary is there.
+      - name: Upload to the panel and register
         if: vars.SERVEROS_PANEL_URL != ''
         env:
           PANEL_URL: ${{ vars.SERVEROS_PANEL_URL }}
           DEPLOY_TOKEN: ${{ secrets.SERVEROS_DEPLOY_TOKEN }}
         run: |
           set -euo pipefail
+          for f in dist/serverosd-* dist/SHA256SUMS; do
+            curl -fsS -X PUT "$PANEL_URL/api/daemon/releases/${{ github.ref_name }}/$(basename "$f")" \
+              -H "Authorization: Bearer $DEPLOY_TOKEN" \
+              -H "Content-Type: application/octet-stream" -H "Accept: application/json" \
+              --data-binary @"$f"
+            echo
+          done
           for arch in amd64 arm64; do
             jq --arg arch "$arch" '. + {arch: $arch}' "dist/manifest-$arch.json" \
               | curl -fsS -X POST "$PANEL_URL/api/daemon/releases" \
