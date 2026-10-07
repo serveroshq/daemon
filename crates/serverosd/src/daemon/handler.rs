@@ -185,7 +185,14 @@ fn deploy_targets(app: &App, spec: &daemon_protocol::DeploySpec) -> Vec<ManagedS
             RunBy::Docker { container } => container == &current.container,
             _ => false,
         })
-        .collect()
+        // A recreated container can still be on record under its old id
+        // too; it's one container, so it's snapshotted once.
+        .fold(Vec::<ManagedService>::new(), |mut kept, m| {
+            if !kept.iter().any(|k| k.name == m.name) {
+                kept.push(m);
+            }
+            kept
+        })
 }
 
 async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
