@@ -92,8 +92,15 @@ gh api -X PUT "repos/$REPO/actions/permissions/fork-pr-contributor-approval" \
 
 echo "Moving secrets into the release environment"
 for secret in SERVEROS_RELEASE_KEY SERVEROS_DEPLOY_TOKEN; do
-  echo "Paste $secret:"
-  gh secret set "$secret" --env release -R "$REPO"
+  # From the macOS Keychain (account serveroshq/daemon) when it's there,
+  # otherwise pasted in.
+  if value=$(security find-generic-password -a serveroshq/daemon -s "$secret" -w 2>/dev/null); then
+    printf '%s' "$value" | gh secret set "$secret" --env release -R "$REPO"
+    echo "$secret set from the Keychain"
+  else
+    echo "Paste $secret:"
+    gh secret set "$secret" --env release -R "$REPO"
+  fi
 done
 for secret in SERVEROS_RELEASE_KEY SERVEROS_DEPLOY_TOKEN; do
   gh secret delete "$secret" -R "$REPO"
