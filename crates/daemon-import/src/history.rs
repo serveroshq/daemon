@@ -84,6 +84,7 @@ mod tests {
             scheduled: vec![],
             unknown: vec![],
             warnings: vec![],
+            firewall: None,
         }
     }
 

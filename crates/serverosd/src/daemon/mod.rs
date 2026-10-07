@@ -5,6 +5,7 @@ mod handler;
 mod local;
 mod log_shipper;
 mod machine;
+mod ports;
 mod service_ops;
 mod service_stats;
 mod workers;
@@ -127,6 +128,9 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         workers::forward_streams(Arc::clone(&app));
         workers::spawn_all(Arc::clone(&app));
         local::serve(Arc::clone(&app));
+
+        let firewall = app.config.read().unwrap().integrations.firewall;
+        ports::restore(firewall, &paths.state_dir).await;
 
         let control = tokio::spawn(control::run(Arc::clone(&app), outbound_rx));
 

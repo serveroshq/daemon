@@ -91,6 +91,7 @@ impl App {
                 budget: config
                     .discovery_interval()
                     .min(std::time::Duration::from_secs(config.discovery.budget_secs)),
+                firewall: config.integrations.firewall,
                 ..Default::default()
             },
         );
