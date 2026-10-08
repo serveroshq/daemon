@@ -704,6 +704,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 })
             };
             let result = daemon_deploy::native::release(&ctx, &spec, &user, &reload).await;
+            // An atomic release's files live beside the app's folder, which is
+            // now a link to them: ServerOS may open them as it could the folder.
+            if result.is_ok() && spec.mode == daemon_protocol::ReleaseMode::Atomic {
+                let releases =
+                    PathBuf::from(format!("{}-releases", spec.path.trim_end_matches('/')));
+                if !owner.roots.contains(&releases) {
+                    let mut owner = owner.clone();
+                    owner.roots.push(releases.clone());
+                    let _ = Registry::new(&app.state).upsert(owner);
+                }
+                app.add_roots(&[releases]);
+            }
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result

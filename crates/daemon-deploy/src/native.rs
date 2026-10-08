@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use daemon_jobs::{run_child, ChildOutcome, Failure, JobContext, Progress};
-use daemon_protocol::{ReleaseReload, ReleaseSpec, ReleaseStep};
+use daemon_protocol::{ReleaseMode, ReleaseReload, ReleaseSpec, ReleaseStep};
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -79,6 +79,12 @@ pub struct ReleaseResult {
     pub commit: String,
     pub previous: Option<String>,
     pub steps: Vec<StepRun>,
+    /// Atomic: the release's own folder, and whether a kept one was
+    /// switched back to instead of building.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
 }
 
 pub type ReloadFuture = Pin<Box<dyn Future<Output = Result<(), Failure>> + Send>>;
@@ -138,6 +144,10 @@ async fn release_with(
         )
         .with_next_step("Wait for that release to finish, then try again.")
     })?;
+
+    if spec.mode == ReleaseMode::Atomic {
+        return crate::atomic::release(progress, cancel, spec, user, reload).await;
+    }
 
     let checkout = Checkout {
         path: &path,
@@ -202,6 +212,8 @@ async fn release_with(
             commit: spec.commit.clone(),
             previous,
             steps,
+            release: None,
+            reused: false,
         }),
         Err(failure) => {
             let Some(previous) = previous.filter(|p| p != &spec.commit) else {
@@ -279,6 +291,17 @@ async fn finish(
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
 ) -> Result<Vec<StepRun>, Failure> {
+    let ran = run_steps(spec, checkout, cancel, progress).await?;
+    go_live(spec, reload, progress).await?;
+    Ok(ran)
+}
+
+pub(crate) async fn run_steps(
+    spec: &ReleaseSpec,
+    checkout: &Checkout<'_>,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> Result<Vec<StepRun>, Failure> {
     let mut ran = Vec::new();
     let count = spec.steps.len().max(1);
     for (i, step) in spec.steps.iter().enumerate() {
@@ -293,6 +316,16 @@ async fn finish(
         });
     }
 
+    Ok(ran)
+}
+
+/// The reloads, then the health check: what makes a release live and
+/// proves it.
+pub(crate) async fn go_live(
+    spec: &ReleaseSpec,
+    reload: Reloader<'_>,
+    progress: &Progress,
+) -> Result<(), Failure> {
     if !spec.reload.is_empty() {
         progress.phase("reload", Some(82)).await;
         for wanted in &spec.reload {
@@ -308,7 +341,7 @@ async fn finish(
         check_health(url, progress).await?;
     }
 
-    Ok(ran)
+    Ok(())
 }
 
 async fn put_back(
@@ -359,11 +392,11 @@ pub async fn check_health(url: &str, progress: &Progress) -> Result<(), Failure>
     )
 }
 
-struct Checkout<'a> {
-    path: &'a Path,
-    user: &'a AppUser,
-    repo: &'a str,
-    token: Option<&'a str>,
+pub(crate) struct Checkout<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) user: &'a AppUser,
+    pub(crate) repo: &'a str,
+    pub(crate) token: Option<&'a str>,
 }
 
 impl Checkout<'_> {
@@ -390,13 +423,13 @@ impl Checkout<'_> {
         env
     }
 
-    async fn git(
+    pub(crate) async fn git(
         &self,
         args: &[&str],
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<Vec<String>, Failure> {
-        let safe = format!("safe.directory={}", self.path.display());
+        let safe = "safe.directory=*".to_string();
         let mut full = vec!["-c", safe.as_str()];
         full.extend_from_slice(args);
         let env = self.git_env();
@@ -416,7 +449,7 @@ impl Checkout<'_> {
         settle(outcome, "checkout", &format!("git {name}"))
     }
 
-    async fn fetch(
+    pub(crate) async fn fetch(
         &self,
         commit: &str,
         cancel: &mut watch::Receiver<bool>,
@@ -430,7 +463,7 @@ impl Checkout<'_> {
             ))
     }
 
-    async fn reset(
+    pub(crate) async fn reset(
         &self,
         commit: &str,
         cancel: &mut watch::Receiver<bool>,
@@ -441,7 +474,7 @@ impl Checkout<'_> {
             .map(|_| ())
     }
 
-    async fn step(
+    pub(crate) async fn step(
         &self,
         step: &ReleaseStep,
         cancel: &mut watch::Receiver<bool>,
@@ -483,7 +516,7 @@ fn settle(outcome: ChildOutcome, phase: &str, what: &str) -> Result<Vec<String>,
     }
 }
 
-fn short(commit: &str) -> &str {
+pub(crate) fn short(commit: &str) -> &str {
     &commit[..7.min(commit.len())]
 }
 
@@ -556,6 +589,10 @@ mod tests {
             health_url: None,
             discard_changes: false,
             repo_token: None,
+            mode: daemon_protocol::ReleaseMode::InPlace,
+            shared: vec![".env".into(), "storage".into()],
+            keep: 3,
+            trim: Vec::new(),
         }
     }
 

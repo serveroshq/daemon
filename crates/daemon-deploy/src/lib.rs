@@ -1,3 +1,4 @@
+pub(crate) mod atomic;
 pub mod container;
 pub mod deployer;
 pub mod git;

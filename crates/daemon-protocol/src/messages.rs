@@ -607,6 +607,44 @@ pub struct ReleaseSpec {
     pub discard_changes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_token: Option<RepoToken>,
+    /// In place updates the checkout where it is. Atomic builds each
+    /// release in a folder of its own beside it and switches the app's
+    /// folder (then a link) to it in one step, so the app never runs half
+    /// set up, and going back to a kept release is a switch, not a build.
+    #[serde(default)]
+    pub mode: ReleaseMode,
+    /// Atomic only: what every release shares rather than ships, relative
+    /// to the app's folder: its .env, its storage.
+    #[serde(default = "default_shared")]
+    pub shared: Vec<String>,
+    /// Atomic only: how many releases to keep for going back to.
+    #[serde(default = "default_keep")]
+    pub keep: u32,
+    /// Atomic only: folders removed from releases once they're no longer
+    /// live, to save disk: a Laravel app's node_modules, once its assets
+    /// are built. Nothing by default, since a Node app runs from them.
+    #[serde(default = "default_trim")]
+    pub trim: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseMode {
+    #[default]
+    InPlace,
+    Atomic,
+}
+
+fn default_shared() -> Vec<String> {
+    vec![".env".into(), "storage".into()]
+}
+
+fn default_keep() -> u32 {
+    3
+}
+
+fn default_trim() -> Vec<String> {
+    Vec::new()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
