@@ -155,6 +155,120 @@ pub struct InventoryReport {
     pub unknown: Vec<UnknownListener>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// What the firewall lets in, from the backend ServerOS changes rules
+    /// with. Absent from daemons that don't read it.
+    #[serde(default)]
+    pub firewall: Option<FirewallReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FirewallReport {
+    /// ufw, nftables, iptables or none: the `[integrations] firewall` setting.
+    pub backend: String,
+    pub installed: bool,
+    /// Whether it filters incoming traffic at all (ufw can be installed but off).
+    pub active: bool,
+    #[serde(default)]
+    pub default_incoming: Option<FirewallVerdict>,
+    /// Rules about incoming traffic, in the order they're checked.
+    #[serde(default)]
+    pub rules: Vec<FirewallRuleInfo>,
+    /// Each port listening beyond loopback, and whether the firewall lets the
+    /// internet reach it.
+    #[serde(default)]
+    pub ports: Vec<PortExposure>,
+    /// Rules ServerOS couldn't read (interfaces, jumps to other chains): a
+    /// port they might open or close is reported as unknown, never blocked.
+    #[serde(default)]
+    pub unreadable: u32,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FirewallVerdict {
+    Allow,
+    /// ufw's rate-limited allow.
+    Limit,
+    Deny,
+    Reject,
+}
+
+impl FirewallVerdict {
+    pub fn lets_in(self) -> bool {
+        matches!(self, FirewallVerdict::Allow | FirewallVerdict::Limit)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallRuleInfo {
+    pub verdict: FirewallVerdict,
+    /// Empty: every port.
+    #[serde(default)]
+    pub ports: Vec<PortRange>,
+    /// tcp or udp; none for both.
+    #[serde(default)]
+    pub proto: Option<String>,
+    /// An address or CIDR; none for anywhere.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Applies to IPv6 only.
+    #[serde(default)]
+    pub ipv6: bool,
+    /// Added by ServerOS.
+    #[serde(default)]
+    pub managed: bool,
+    /// Matches ServerOS can't read (an interface, a jump to another chain):
+    /// its verdict and ports are as far as could be told, and a port it may
+    /// let in is reported as unknown.
+    #[serde(default)]
+    pub opaque: bool,
+    /// The rule as the firewall shows it.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    pub fn single(port: u16) -> Self {
+        Self {
+            start: port,
+            end: port,
+        }
+    }
+
+    pub fn contains(&self, port: u16) -> bool {
+        (self.start..=self.end).contains(&port)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortExposure {
+    pub port: u16,
+    pub proto: String,
+    pub exposure: Exposure,
+    /// The rule or policy that decided it.
+    #[serde(default)]
+    pub because: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Exposure {
+    /// Anyone on the internet can connect.
+    Open,
+    /// Only some addresses are allowed.
+    Restricted,
+    Blocked,
+    /// Published by Docker, whose rules come before the host firewall's.
+    Docker,
+    /// Rules ServerOS can't read may decide it.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -539,6 +653,11 @@ pub enum FirewallAction {
     Allow,
     Deny,
     Delete,
+    /// Let the internet reach `PORT/PROTO`, removing what blocks it.
+    Open,
+    /// Stop the internet reaching `PORT/PROTO`, removing what lets it in.
+    /// Refused for SSH and for ports Docker publishes.
+    Close,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

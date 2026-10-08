@@ -6,7 +6,7 @@ use daemon_audit::Actor;
 use daemon_capability::{DataOp, DeployOp, MachineOp, Operation, Request, ServiceOp};
 use daemon_jobs::{Failure, Handler, HandlerFuture, JobContext};
 use daemon_protocol::driver::Outbound;
-use daemon_protocol::{ActorKind, Job, ServiceAction};
+use daemon_protocol::{ActorKind, FirewallAction, Job, ServiceAction};
 use daemon_services::docker::DockerAdapter;
 use daemon_services::systemd::SystemdAdapter;
 use daemon_services::{Lifecycle, ManagedService, Registry, RunBy};
@@ -15,7 +15,7 @@ use daemon_streams::LogTail;
 use serde_json::{json, Value};
 
 use super::app::App;
-use super::machine;
+use super::{machine, ports};
 
 pub struct JobHandler {
     pub app: Arc<App>,
@@ -920,7 +920,16 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 rule: format!("{action:?} {rule}").to_lowercase(),
             }))?;
             let backend = app.config.read().unwrap().integrations.firewall;
+            if matches!(action, FirewallAction::Open | FirewallAction::Close) {
+                let result =
+                    ports::change(&ctx, backend, &app.paths.state_dir, action, &rule).await;
+                grant.finish(&result.as_ref().map(|_| ()), None);
+                return result;
+            }
             let result = machine::firewall(&ctx, backend, action, &rule).await;
+            if result.is_ok() {
+                ports::persist(&ctx, backend, &app.paths.state_dir).await;
+            }
             grant.finish(&result.as_ref().map(|_| ()), None);
             Ok(json!({"status": result?}))
         }
