@@ -63,6 +63,28 @@ impl Layout {
         })
     }
 
+    /// A new release's folder: one that doesn't exist yet, so a build can
+    /// never land in (or clean up) a release that's already there.
+    fn fresh(&self, commit: &str) -> PathBuf {
+        let short = &commit[..12.min(commit.len())];
+        let mut when = now();
+        loop {
+            let dir = self.releases.join(format!("{when}-{short}"));
+            if std::fs::symlink_metadata(&dir).is_err() {
+                return dir;
+            }
+            when += 1;
+        }
+    }
+
+    /// Remove a release that didn't go live, unless it's live or kept:
+    /// whatever went wrong, the app's own release is never deleted.
+    fn discard(&self, dir: &Path, live: &Path, kept: &[Kept]) {
+        if dir != live && !kept.iter().any(|k| k.dir == dir) && self.is_release(dir) {
+            let _ = remove(dir);
+        }
+    }
+
     /// A folder this module made: <unix time>-<commit or "initial">.
     fn is_release(&self, dir: &Path) -> bool {
         dir.parent() == Some(self.releases.as_path())
@@ -232,11 +254,7 @@ pub(crate) async fn release(
             (dir, Vec::new(), true)
         }
         None => {
-            let dir = layout.releases.join(format!(
-                "{}-{}",
-                now(),
-                &spec.commit[..12.min(spec.commit.len())]
-            ));
+            let dir = layout.fresh(&spec.commit);
             match build(
                 &layout,
                 spec,
@@ -251,7 +269,7 @@ pub(crate) async fn release(
             {
                 Ok(steps) => (dir, steps, false),
                 Err(failure) => {
-                    let _ = remove(&dir);
+                    layout.discard(&dir, &live, &kept);
                     let still = previous
                         .as_deref()
                         .map(short)
@@ -286,7 +304,7 @@ pub(crate) async fn release(
             Err(e) => Err(e),
         };
         if !reused {
-            let _ = remove(&dir);
+            layout.discard(&dir, &live, &kept);
         }
         let was = previous.as_deref().map(short).unwrap_or("the last release");
         return Err(match back {
@@ -362,14 +380,7 @@ async fn convert(
         ));
     }
     let commit = commit_of(&layout.app, user, spec, cancel, progress).await;
-    let dir = layout.releases.join(format!(
-        "{}-{}",
-        now(),
-        commit
-            .as_deref()
-            .map(|c| &c[..12.min(c.len())])
-            .unwrap_or("initial")
-    ));
+    let dir = layout.fresh(commit.as_deref().unwrap_or("initial"));
     progress
         .line(format!(
             "first atomic release: {} moves to {} and becomes a link to it",
@@ -727,5 +738,70 @@ mod tests {
             left.contains(&"shared".to_string()) && left.contains(&"releases.json".to_string())
         );
         assert!(!left.iter().any(|n| n.ends_with(&one[..12])), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn releasing_the_live_commit_right_after_converting_never_touches_the_live_release() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let upstream = root.join("upstream");
+        let app = root.join("app");
+        std::fs::create_dir_all(&upstream).unwrap();
+        sh(
+            &upstream,
+            "git init -q -b main && echo one > version && git add -A && git commit -qm one",
+        );
+        sh(&root, "git clone -q upstream app");
+        std::fs::write(app.join("served"), "yes\n").unwrap();
+        let one = sh(&upstream, "git rev-parse HEAD");
+
+        let state = Arc::new(daemon_state::State::in_memory().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(4096);
+        let progress = Progress::new(uuid::Uuid::new_v4(), state, tx, vec![]);
+        let user = AppUser {
+            name: "test".into(),
+            ids: None,
+            home: root.clone(),
+        };
+        let reload = |_: daemon_protocol::ReleaseReload| -> crate::native::ReloadFuture {
+            Box::pin(async { Ok(()) })
+        };
+
+        // Same commit, same second as the conversion, and the build fails:
+        // the converted folder is still there and still live.
+        let failure = release(
+            &progress,
+            watch::channel(false).1,
+            &spec(&app, &upstream, &one, "exit 3"),
+            &user,
+            &reload,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.phase, "build");
+        assert_eq!(read(app.join("served")), "yes");
+        assert_eq!(read(app.join("version")), "one");
+
+        // And a good build of it goes beside it, not over it.
+        let done = release(
+            &progress,
+            watch::channel(false).1,
+            &spec(&app, &upstream, &one, "cp version built"),
+            &user,
+            &reload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(app.join("built")), "one");
+        let live = std::fs::read_link(&app).unwrap();
+        assert_eq!(Some(live.display().to_string()), done.release);
+        let kept: Vec<Kept> = load(&root.join("app-releases/releases.json"));
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept[0].dir.join("served").exists(),
+            "the converted release is kept"
+        );
     }
 }
