@@ -438,6 +438,11 @@ pub enum Job {
         service: Option<String>,
     },
     Deploy(Box<DeploySpec>),
+    /// Deploy a commit onto an app that runs straight on the machine (a
+    /// Laravel app behind PHP-FPM, say): check it out where the app lives,
+    /// run its steps as the app's user, reload its services and check it's
+    /// healthy, putting the last commit back if any of that fails.
+    Release(Box<ReleaseSpec>),
     Rollback {
         service: String,
         release: Option<String>,
@@ -575,6 +580,61 @@ pub struct DeploySpec {
     /// installation token), sent fresh with each deploy and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_token: Option<RepoToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseSpec {
+    /// The adopted service the app belongs to, by key; the app's folder
+    /// must be one ServerOS may open because of it.
+    pub service: String,
+    /// The app's folder: a git checkout.
+    pub path: String,
+    /// Who the checkout and the steps run as. Never root.
+    pub user: String,
+    pub repo: String,
+    pub commit: String,
+    #[serde(default)]
+    pub steps: Vec<ReleaseStep>,
+    /// Adopted services to reload or restart once the steps have run.
+    #[serde(default)]
+    pub reload: Vec<ReleaseReload>,
+    /// An https address that answers 200 when the app is up.
+    #[serde(default)]
+    pub health_url: Option<String>,
+    /// Throw away edits made on the machine to files git tracks. Without
+    /// it, a checkout with edits is left alone and the release fails.
+    #[serde(default)]
+    pub discard_changes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_token: Option<RepoToken>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseStep {
+    pub name: String,
+    /// A shell command, run with sh -c in the app's folder.
+    pub run: String,
+    /// Run it again on the old commit when a release is put back:
+    /// installs and builds yes, migrations no.
+    #[serde(default = "default_true")]
+    pub on_rollback: bool,
+    #[serde(default = "default_step_timeout")]
+    pub timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseReload {
+    pub service: String,
+    #[serde(default = "default_reload_action")]
+    pub action: ServiceAction,
+}
+
+fn default_step_timeout() -> u64 {
+    600
+}
+
+fn default_reload_action() -> ServiceAction {
+    ServiceAction::Reload
 }
 
 /// A repository token. Its Debug says nothing, so a logged spec doesn't

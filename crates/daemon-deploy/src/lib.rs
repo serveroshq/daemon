@@ -2,6 +2,7 @@ pub mod container;
 pub mod deployer;
 pub mod git;
 pub mod health;
+pub mod native;
 pub mod proxy;
 pub mod releases;
 

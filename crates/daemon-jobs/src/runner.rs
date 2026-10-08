@@ -339,6 +339,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Chmod { .. } => "chmod",
         Job::Chown { .. } => "chown",
         Job::Deploy(_) => "deploy",
+        Job::Release(_) => "release",
         Job::Rollback { .. } => "rollback",
         Job::Backup { .. } => "backup",
         Job::BackupTo { .. } => "backup_to",

@@ -30,6 +30,7 @@ impl Handler for JobHandler {
     fn known_secrets(&self, job: &Job) -> Vec<String> {
         match job {
             Job::Deploy(spec) => spec.env.values().cloned().collect(),
+            Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             _ => Vec::new(),
         }
@@ -660,6 +661,58 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 fields.insert("pre_deploy_snapshots".into(), Value::Array(snapshots));
             }
             Ok(value)
+        }
+
+        Job::Release(spec) => {
+            let owner = managed(&app, &spec.service).await?;
+            let grant = authorize(Operation::Deploy(DeployOp::Release {
+                service: owner.name.clone(),
+                path: PathBuf::from(&spec.path),
+            }))?;
+            let user = match daemon_deploy::native::AppUser::lookup(&spec.user) {
+                Ok(user) => user,
+                Err(failure) => {
+                    grant.finish(&Err(failure.clone()), None);
+                    return Err(failure);
+                }
+            };
+            let reload_app = Arc::clone(&app);
+            let reload_actor = actor.clone();
+            let reload = move |wanted: daemon_protocol::ReleaseReload| -> daemon_deploy::native::ReloadFuture {
+                let app = Arc::clone(&reload_app);
+                let actor = reload_actor.clone();
+                Box::pin(async move {
+                    let target = managed(&app, &wanted.service).await?;
+                    let service = target.name.clone();
+                    let op = match wanted.action {
+                        ServiceAction::Start => ServiceOp::Start { service },
+                        ServiceAction::Stop => ServiceOp::Stop { service },
+                        ServiceAction::Restart => ServiceOp::Restart { service },
+                        ServiceAction::Reload => ServiceOp::Reload { service },
+                    };
+                    let grant = app
+                        .broker
+                        .authorize(Request {
+                            actor,
+                            operation: Operation::Service(op),
+                            confirmed,
+                        })
+                        .map_err(denied)?;
+                    let result = lifecycle(&target, Some(wanted.action), None).await.map(|_| ());
+                    grant.finish(&result, None);
+                    result
+                })
+            };
+            let result = daemon_deploy::native::release(&ctx, &spec, &user, &reload).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("commit {}", &r.commit[..7.min(r.commit.len())]))
+                    .as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
         Job::Rollback {

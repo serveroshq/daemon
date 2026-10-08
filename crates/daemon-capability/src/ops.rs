@@ -51,6 +51,7 @@ pub enum DeployOp {
     ObtainCertificate { domains: Vec<String> },
     WriteEnvFile { service: String, path: PathBuf },
     Rollback { service: String },
+    Release { service: String, path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +109,7 @@ impl Operation {
                 DeployOp::ObtainCertificate { .. } => "deploy.tls",
                 DeployOp::WriteEnvFile { .. } => "deploy.env",
                 DeployOp::Rollback { .. } => "deploy.rollback",
+                DeployOp::Release { .. } => "deploy.release",
             },
             Operation::Data(d) => match d {
                 DataOp::Snapshot { .. } => "backup.create",
@@ -161,7 +163,9 @@ impl Operation {
                 | DeployOp::SwapContainers { service }
                 | DeployOp::WriteProxyConfig { service }
                 | DeployOp::Rollback { service } => service.clone(),
-                DeployOp::WriteEnvFile { service, path } => format!("{service} {}", path.display()),
+                DeployOp::WriteEnvFile { service, path } | DeployOp::Release { service, path } => {
+                    format!("{service} {}", path.display())
+                }
                 DeployOp::ObtainCertificate { domains } => domains.join(","),
             },
             Operation::Data(d) => match d {
@@ -220,6 +224,7 @@ impl Operation {
             Operation::Deploy(DeployOp::FetchSource { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::Build { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::WriteEnvFile { path, .. }) => Some(path),
+            Operation::Deploy(DeployOp::Release { path, .. }) => Some(path),
             Operation::Data(DataOp::Browse { path })
             | Operation::Data(DataOp::ReadFile { path })
             | Operation::Data(DataOp::WriteFile { path })
