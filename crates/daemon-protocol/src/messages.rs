@@ -408,6 +408,11 @@ pub enum Job {
         service: String,
         lines: u32,
     },
+    /// A container's `docker inspect`, any container on the machine, adopted
+    /// or not; environment values are never sent.
+    ServiceInspect {
+        service: String,
+    },
     ReadFile {
         path: String,
         service: Option<String>,

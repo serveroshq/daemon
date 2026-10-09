@@ -205,6 +205,52 @@ impl Lifecycle for DockerAdapter {
     }
 }
 
+/// What leaves the machine when someone looks at a container's config:
+/// environment variables keep their names but never their values (they're
+/// where passwords and tokens live), and the command line and labels go
+/// through the usual secret redaction.
+pub fn without_secrets(inspect: &mut serde_json::Value) {
+    use daemon_core::redact::{redact, REDACTED};
+
+    if let Some(env) = inspect
+        .pointer_mut("/Config/Env")
+        .and_then(|v| v.as_array_mut())
+    {
+        for entry in env.iter_mut() {
+            if let Some(text) = entry.as_str() {
+                let name = text.split_once('=').map_or(text, |(name, _)| name);
+                *entry = serde_json::Value::String(format!("{name}={REDACTED}"));
+            }
+        }
+    }
+
+    for pointer in ["/Config/Cmd", "/Config/Entrypoint", "/Args"] {
+        if let Some(parts) = inspect.pointer_mut(pointer).and_then(|v| v.as_array_mut()) {
+            for part in parts.iter_mut() {
+                if let Some(text) = part.as_str() {
+                    *part = serde_json::Value::String(redact(text));
+                }
+            }
+        }
+    }
+    if let Some(path) = inspect.get_mut("Path") {
+        if let Some(text) = path.as_str() {
+            *path = serde_json::Value::String(redact(text));
+        }
+    }
+
+    if let Some(labels) = inspect
+        .pointer_mut("/Config/Labels")
+        .and_then(|v| v.as_object_mut())
+    {
+        for value in labels.values_mut() {
+            if let Some(text) = value.as_str() {
+                *value = serde_json::Value::String(redact(text));
+            }
+        }
+    }
+}
+
 pub const WINGS_RUNTIME: &str = "/run/wings/";
 
 fn is_wings_runtime(source: &str) -> bool {
@@ -304,6 +350,29 @@ pub struct Repaired {
 }
 
 impl DockerAdapter {
+    /// A container's `docker inspect`, with secrets taken out first (see
+    /// [`without_secrets`]): read-only, for people looking at its config.
+    pub async fn inspect(&self, container: &str) -> Result<serde_json::Value> {
+        if !valid_container_ref(container) {
+            return Err(ServiceError::Docker(format!(
+                "{container:?} is not a valid container reference"
+            )));
+        }
+        let reply = self
+            .call(
+                "GET",
+                &format!("/containers/{container}/json"),
+                None,
+                &[200],
+                &format!("inspect {container}"),
+            )
+            .await?;
+        let mut value: serde_json::Value = serde_json::from_slice(&reply.body)?;
+        without_secrets(&mut value);
+
+        Ok(value)
+    }
+
     async fn call(
         &self,
         method: &str,
@@ -596,6 +665,48 @@ mod tests {
         assert!(valid_container_ref("abcdef123456"));
         assert!(!valid_container_ref("../../etc"));
         assert!(!valid_container_ref("x y"));
+    }
+
+    #[test]
+    fn inspect_never_sends_env_values() {
+        let mut inspect = serde_json::json!({
+            "Path": "/app/server",
+            "Args": ["--db", "postgres://app:hunter2secret@db/app"],
+            "Config": {
+                "Env": ["DATABASE_URL=postgres://app:hunter2secret@db/app", "DEBUG", "PORT=8080"],
+                "Cmd": ["node", "server.js"],
+                "Labels": {"com.docker.swarm.service.name": "web", "token": "api_key=abcdef1234567890abcdef"}
+            },
+            "NetworkSettings": {"Networks": {"web_net": {"IPAddress": "10.0.1.5"}}}
+        });
+
+        without_secrets(&mut inspect);
+
+        let text = inspect.to_string();
+        assert!(!text.contains("hunter2secret"), "{text}");
+        assert!(!text.contains("8080"), "{text}");
+        assert!(!text.contains("abcdef1234567890abcdef"), "{text}");
+        assert_eq!(
+            inspect.pointer("/Config/Env").unwrap(),
+            &serde_json::json!([
+                "DATABASE_URL=[redacted]",
+                "DEBUG=[redacted]",
+                "PORT=[redacted]"
+            ])
+        );
+        // The rest is left as it is.
+        assert_eq!(
+            inspect
+                .pointer("/Config/Labels/com.docker.swarm.service.name")
+                .unwrap(),
+            "web"
+        );
+        assert_eq!(
+            inspect
+                .pointer("/NetworkSettings/Networks/web_net/IPAddress")
+                .unwrap(),
+            "10.0.1.5"
+        );
     }
 
     #[test]

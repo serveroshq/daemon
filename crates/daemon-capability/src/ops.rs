@@ -31,6 +31,7 @@ pub enum ServiceOp {
     Restart { service: String },
     Reload { service: String },
     ReadLogs { service: String },
+    Inspect { service: String },
     ReadUsage { service: String },
     ReadConfig { service: String, path: PathBuf },
     Create { service: String },
@@ -91,6 +92,7 @@ impl Operation {
                 ServiceOp::Restart { .. } => "service.restart",
                 ServiceOp::Reload { .. } => "service.reload",
                 ServiceOp::ReadLogs { .. } => "service.logs",
+                ServiceOp::Inspect { .. } => "service.inspect",
                 ServiceOp::ReadUsage { .. } => "service.usage",
                 ServiceOp::ReadConfig { .. } => "service.config",
                 ServiceOp::Create { .. } => "service.create",
@@ -147,6 +149,7 @@ impl Operation {
                 | ServiceOp::Restart { service }
                 | ServiceOp::Reload { service }
                 | ServiceOp::ReadLogs { service }
+                | ServiceOp::Inspect { service }
                 | ServiceOp::ReadUsage { service }
                 | ServiceOp::Create { service }
                 | ServiceOp::Update { service }
@@ -196,6 +199,7 @@ impl Operation {
             Operation::Service(s) => !matches!(
                 s,
                 ServiceOp::ReadLogs { .. }
+                    | ServiceOp::Inspect { .. }
                     | ServiceOp::ReadUsage { .. }
                     | ServiceOp::ReadConfig { .. }
             ),

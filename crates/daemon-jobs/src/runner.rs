@@ -332,6 +332,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Facts => "facts",
         Job::ServiceAction { .. } => "service_action",
         Job::ServiceLogs { .. } => "service_logs",
+        Job::ServiceInspect { .. } => "service_inspect",
         Job::ReadFile { .. } => "read_file",
         Job::WriteFile { .. } => "write_file",
         Job::ListDir { .. } => "list_dir",
@@ -368,6 +369,7 @@ pub fn mutates(job: &Job) -> bool {
         Job::Discover
             | Job::Facts
             | Job::ServiceLogs { .. }
+            | Job::ServiceInspect { .. }
             | Job::ReadFile { .. }
             | Job::ListDir { .. }
             | Job::TailLogs { .. }

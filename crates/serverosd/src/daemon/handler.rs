@@ -322,6 +322,30 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             }))
         }
 
+        Job::ServiceInspect { service } => {
+            // Any container, adopted or not: discovery reads the same thing.
+            let container = service
+                .strip_prefix("docker:")
+                .filter(|c| daemon_services::docker::valid_container_ref(c))
+                .ok_or_else(|| {
+                    Failure::new(
+                        "inspect",
+                        format!("{service:?} isn't a container, so there's no config to show"),
+                    )
+                })?
+                .to_string();
+            let grant = authorize(Operation::Service(ServiceOp::Inspect {
+                service: service.clone(),
+            }))?;
+            let result = DockerAdapter::default()
+                .inspect(&container)
+                .await
+                .map(|inspect| json!({ "inspect": inspect }))
+                .map_err(|e| Failure::new("inspect", e.to_string()));
+            grant.finish(&result.as_ref().map(|_| ()), None);
+            result
+        }
+
         Job::ServiceExec {
             service,
             command,
