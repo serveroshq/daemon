@@ -401,7 +401,9 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Service(ServiceOp::Remove {
                 service: managed.key.clone(),
             }))?;
-            let result = if adopted {
+            let result = if let RunBy::Systemd { unit } = &managed.run_by {
+                super::service_ops::remove_systemd(&app, &ctx, &managed, unit).await
+            } else if adopted {
                 super::service_ops::remove_adopted(&app, &ctx, &managed, delete_data).await
             } else {
                 super::service_ops::remove(&app, &ctx, &managed, delete_data).await

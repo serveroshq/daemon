@@ -172,6 +172,44 @@ fn parse_mounts(out: &str) -> (Vec<String>, Vec<String>) {
     (volumes, binds)
 }
 
+/// A systemd service: stopped, kept from starting at boot, and its unit
+/// file deleted when it was made on the machine (a package's stays). The
+/// files and data it works with are never touched.
+pub async fn remove_systemd(
+    app: &App,
+    ctx: &JobContext,
+    service: &ManagedService,
+    unit: &str,
+) -> Result<Value, Failure> {
+    let progress = &ctx.progress;
+    let removed = daemon_services::systemd::SystemdAdapter::default()
+        .remove(unit)
+        .await
+        .map_err(|e| {
+            Failure::new("remove", e.to_string())
+                .with_next_step("Stop it instead, or remove it on the machine yourself.")
+        })?;
+    let _ = Registry::new(&app.state).remove(&service.key);
+
+    progress
+        .line(format!("stopped {unit} and turned it off at boot"))
+        .await;
+    for path in &removed.deleted {
+        progress.line(format!("deleted {path}")).await;
+    }
+    if removed.package_owned {
+        progress
+            .line(format!("{unit} came with a package, so its files were left; uninstall the package to remove it completely"))
+            .await;
+    }
+
+    Ok(json!({
+        "removed": 1,
+        "unit_files_deleted": removed.deleted,
+        "package_owned": removed.package_owned,
+    }))
+}
+
 pub async fn remove_adopted(
     app: &App,
     ctx: &JobContext,

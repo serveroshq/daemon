@@ -41,7 +41,119 @@ pub fn action_args(action: ServiceAction, unit: &str) -> [&str; 2] {
     [verb, unit]
 }
 
+/// Units ServerOS will never remove: the machine needs them to boot, stay
+/// reachable or run containers, or they are ServerOS itself.
+pub fn protected_unit(unit: &str) -> bool {
+    let base = unit.split('@').next().unwrap_or(unit);
+    let base = base.strip_suffix(".service").unwrap_or(base);
+    const EXACT: &[&str] = &[
+        "ssh",
+        "sshd",
+        "dbus",
+        "dbus-broker",
+        "networking",
+        "NetworkManager",
+        "docker",
+        "containerd",
+        "cron",
+        "crond",
+        "polkit",
+        "udev",
+        "rsyslog",
+        "snapd",
+        "getty",
+        "serial-getty",
+        "user",
+        "multipathd",
+    ];
+    const PREFIXES: &[&str] = &["systemd-", "serveros", "cloud-", "ifup", "wpa_supplicant"];
+
+    EXACT.contains(&base) || PREFIXES.iter().any(|p| base.starts_with(p))
+}
+
+/// What removing a unit did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RemovedUnit {
+    /// Unit files and drop-in folders deleted (ones made on the machine).
+    pub deleted: Vec<String>,
+    /// Installed by a package: stopped and turned off, its files left.
+    pub package_owned: bool,
+}
+
+/// Where a unit file lives decides what removing it may delete: files an
+/// admin made (under /etc/systemd/system) go; a package's (/usr/lib, /lib)
+/// stay, since the package owns them.
+pub fn made_on_machine(path: &str) -> bool {
+    path.starts_with("/etc/systemd/system/") && !path.contains("..")
+}
+
 impl SystemdAdapter {
+    /// Stop a unit, keep it from starting at boot, and delete its unit file
+    /// when it was made on the machine. Data and folders it uses are never
+    /// touched.
+    pub async fn remove(&self, unit: &str) -> Result<RemovedUnit> {
+        if !valid_unit_name(unit) {
+            return Err(ServiceError::Command(format!(
+                "{unit:?} is not a valid unit name"
+            )));
+        }
+        if protected_unit(unit) {
+            return Err(ServiceError::Command(format!(
+                "{unit} keeps the machine running, so ServerOS won't remove it"
+            )));
+        }
+
+        let show = self
+            .run(
+                "systemctl",
+                &[
+                    "show",
+                    "-p",
+                    "FragmentPath",
+                    "-p",
+                    "DropInPaths",
+                    "--value",
+                    unit,
+                ],
+            )
+            .await?;
+        let mut lines = show.lines();
+        let fragment = lines.next().unwrap_or("").trim().to_string();
+        let drop_ins: Vec<String> = lines
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+
+        // Stop it and keep it from coming back at boot.
+        self.run("systemctl", &["disable", "--now", unit]).await?;
+
+        let mut removed = RemovedUnit::default();
+        if made_on_machine(&fragment) {
+            tokio::fs::remove_file(&fragment)
+                .await
+                .map_err(|e| ServiceError::Command(format!("could not delete {fragment}: {e}")))?;
+            removed.deleted.push(fragment.clone());
+        } else if !fragment.is_empty() {
+            removed.package_owned = true;
+        }
+        for drop_in in drop_ins.iter().filter(|p| made_on_machine(p)) {
+            if tokio::fs::remove_file(drop_in).await.is_ok() {
+                removed.deleted.push(drop_in.clone());
+            }
+        }
+        let folder = format!("/etc/systemd/system/{unit}.d");
+        if tokio::fs::remove_dir(&folder).await.is_ok() {
+            removed.deleted.push(folder);
+        }
+
+        let _ = self.run("systemctl", &["daemon-reload"]).await;
+        let _ = self.run("systemctl", &["reset-failed", unit]).await;
+
+        Ok(removed)
+    }
+
     async fn run(&self, program: &str, args: &[&str]) -> Result<String> {
         let output = tokio::time::timeout(
             self.timeout,
@@ -188,6 +300,46 @@ mod tests {
                 .iter()
                 .all(|a| !a.starts_with("--no-block")));
         }
+    }
+
+    #[test]
+    fn the_machine_s_own_units_are_never_removed() {
+        for unit in [
+            "ssh.service",
+            "sshd.service",
+            "systemd-journald.service",
+            "dbus.service",
+            "docker.service",
+            "containerd.service",
+            "serverosd.service",
+            "serveros-gateway.service",
+            "getty@tty1.service",
+            "cloud-init.service",
+        ] {
+            assert!(protected_unit(unit), "{unit}");
+        }
+        for unit in [
+            "laravel-queue.service",
+            "myapp.service",
+            "nginx.service",
+            "php8.4-fpm.service",
+        ] {
+            assert!(!protected_unit(unit), "{unit}");
+        }
+    }
+
+    #[test]
+    fn only_unit_files_made_on_the_machine_are_deleted() {
+        assert!(made_on_machine("/etc/systemd/system/myapp.service"));
+        assert!(made_on_machine(
+            "/etc/systemd/system/myapp.service.d/override.conf"
+        ));
+        assert!(!made_on_machine("/usr/lib/systemd/system/nginx.service"));
+        assert!(!made_on_machine("/lib/systemd/system/nginx.service"));
+        assert!(!made_on_machine(
+            "/etc/systemd/system/../../usr/lib/x.service"
+        ));
+        assert!(!made_on_machine(""));
     }
 
     #[test]
