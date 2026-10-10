@@ -475,6 +475,18 @@ async fn build(
         repo: &spec.repo,
         token,
     };
+    // The clone has no refs, only a detached HEAD at the live commit, and
+    // fetch tells the server what it already has from refs alone: without
+    // one, every release downloaded the whole history again. Name the live
+    // commit so only what's new comes down. A clone without a HEAD (a
+    // first release) just fetches everything, as before.
+    let _ = checkout
+        .git(
+            &["update-ref", "refs/serveros/live", "HEAD"],
+            cancel,
+            progress,
+        )
+        .await;
     checkout.fetch(&spec.commit, cancel, progress).await?;
     progress.phase("checkout", Some(25)).await;
     checkout
@@ -717,6 +729,14 @@ mod tests {
         assert!(!done.reused);
         assert_eq!(read(app.join("built")), "three");
         assert!(!live_two.join("node_modules").exists());
+        // It fetched only what was new: the live commit was named for fetch.
+        assert_eq!(
+            sh(
+                &std::fs::read_link(&app).unwrap(),
+                "git rev-parse refs/serveros/live"
+            ),
+            sh(&live_two, "git rev-parse HEAD")
+        );
 
         // Going back to two is a switch, not a build.
         let before = reloads.load(Ordering::SeqCst);
