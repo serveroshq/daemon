@@ -24,6 +24,9 @@ pub enum AuditError {
 pub struct Actor {
     pub kind: &'static str,
     pub name: String,
+    /// Where the request came from, written at the end of each line as
+    /// key=value pairs: the panel job, and the MCP call that asked for it.
+    pub context: Vec<(&'static str, String)>,
 }
 
 impl Actor {
@@ -31,6 +34,7 @@ impl Actor {
         Self {
             kind: "user",
             name: name.into(),
+            context: Vec::new(),
         }
     }
 
@@ -38,6 +42,7 @@ impl Actor {
         Self {
             kind: "automation",
             name: name.into(),
+            context: Vec::new(),
         }
     }
 
@@ -45,6 +50,7 @@ impl Actor {
         Self {
             kind: "scheduler",
             name: String::new(),
+            context: Vec::new(),
         }
     }
 
@@ -52,6 +58,7 @@ impl Actor {
         Self {
             kind: "local",
             name: name.into(),
+            context: Vec::new(),
         }
     }
 
@@ -59,7 +66,22 @@ impl Actor {
         Self {
             kind: "daemon",
             name: String::new(),
+            context: Vec::new(),
         }
+    }
+
+    /// The same actor, with where the request came from.
+    pub fn with(mut self, key: &'static str, value: impl Into<String>) -> Self {
+        let value: String = value
+            .into()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        if !value.is_empty() {
+            self.context.push((key, value));
+        }
+        self
     }
 
     fn column(&self) -> String {
@@ -211,6 +233,14 @@ fn format_line(entry: &Entry<'_>, at: OffsetDateTime) -> String {
         line.push_str(&redact(note).replace('\n', " "));
     }
 
+    for (key, value) in &entry.actor.context {
+        if value.chars().any(char::is_whitespace) {
+            line.push_str(&format!("  {key}={value:?}"));
+        } else {
+            line.push_str(&format!("  {key}={value}"));
+        }
+    }
+
     line.push('\n');
     line
 }
@@ -218,6 +248,31 @@ fn format_line(entry: &Entry<'_>, at: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_says_which_job_and_which_mcp_call_asked() {
+        let actor = Actor::user("dylan@serveros.com")
+            .with("job", "4093bc88-f7f3-43cf-84f6-de582c53ece2")
+            .with("via", "mcp")
+            .with("client", "Claude Desktop")
+            .with("tool", "restart_service")
+            .with("call", "9b1d2c7e-0000-4000-8000-000000000001")
+            .with("empty", "");
+        let line = format_line(
+            &Entry {
+                actor: &actor,
+                action: "service.restart",
+                target: "nginx.service",
+                outcome: Outcome::Ok,
+                duration: None,
+                note: None,
+            },
+            OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap(),
+        );
+
+        assert!(line.contains("  job=4093bc88-f7f3-43cf-84f6-de582c53ece2  via=mcp  client=\"Claude Desktop\"  tool=restart_service  call=9b1d2c7e-0000-4000-8000-000000000001\n"), "{line}");
+        assert!(!line.contains("empty="));
+    }
 
     #[test]
     fn lines_read_like_prose_not_json() {

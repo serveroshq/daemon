@@ -356,6 +356,18 @@ pub struct Actor {
     pub name: String,
     #[serde(default)]
     pub id: Option<String>,
+    /// How the person asked: "mcp" (an AI agent), "api", "web", "workflow".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// The app they asked through, like "Claude".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// The MCP tool or API operation that asked for this job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The panel's id for that call, to match this job to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

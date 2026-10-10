@@ -23,6 +23,9 @@ pub enum DriverError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Each message is handled and dropped straight away; boxing the command
+// to even out the sizes would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     HelloAck(HelloAck),
     Command { id: Uuid, command: Command },

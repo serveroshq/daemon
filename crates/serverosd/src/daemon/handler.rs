@@ -37,15 +37,30 @@ impl Handler for JobHandler {
     }
 }
 
+/// Who asked for the job, and where from: the panel's job id always, and
+/// for an agent the MCP call (via, client, tool, call id), so each line in
+/// actions.log traces back to the request that caused it.
 fn actor_of(ctx: &JobContext) -> Actor {
     let a = &ctx.command.actor;
-    match a.kind {
+    let actor = match a.kind {
         ActorKind::User => Actor::user(&a.name),
         ActorKind::Automation | ActorKind::Panel => Actor::automation(&a.name),
         ActorKind::Scheduler => Actor::scheduler(),
         ActorKind::Local => Actor::local(&a.name),
         ActorKind::Daemon => Actor::daemon(),
+    };
+    let mut actor = actor.with("job", ctx.id.to_string());
+    for (key, value) in [
+        ("via", &a.via),
+        ("client", &a.client),
+        ("tool", &a.tool),
+        ("call", &a.call),
+    ] {
+        if let Some(value) = value {
+            actor = actor.with(key, value.clone());
+        }
     }
+    actor
 }
 
 fn denied(d: daemon_capability::Denied) -> Failure {
