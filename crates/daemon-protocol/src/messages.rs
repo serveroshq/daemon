@@ -539,6 +539,12 @@ pub enum Job {
     Snapshots {
         service: String,
     },
+    /// What's using the disk under a folder (the root filesystem when left
+    /// out). Read-only.
+    DiskUsage {
+        #[serde(default)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

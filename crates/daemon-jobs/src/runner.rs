@@ -360,6 +360,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",
         Job::Snapshots { .. } => "snapshots",
+        Job::DiskUsage { .. } => "disk_usage",
     }
 }
 
@@ -375,6 +376,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::TailLogs { .. }
             | Job::PackageUpdates { apply: false, .. }
             | Job::Snapshots { .. }
+            | Job::DiskUsage { .. }
     )
 }
 

@@ -826,6 +826,14 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(value)
         }
 
+        Job::DiskUsage { path } => {
+            let path = super::disk_usage::checked_path(path)?;
+            let grant = authorize(Operation::Machine(MachineOp::ReadMetrics))?;
+            let result = super::disk_usage::report(&path).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(&path));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
         Job::Snapshots { service } => {
             let managed = managed(&app, &service).await?;
             Ok(json!({"snapshots": app.snapshotter.list(&managed.name)}))

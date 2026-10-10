@@ -1,6 +1,7 @@
 mod app;
 mod backup_ops;
 mod control;
+mod disk_usage;
 mod handler;
 mod local;
 mod log_shipper;
