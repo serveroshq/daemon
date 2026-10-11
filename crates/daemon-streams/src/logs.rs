@@ -93,6 +93,11 @@ impl LogTail {
         out: mpsc::Sender<StreamFrame>,
     ) -> std::io::Result<Self> {
         let mut child = source.command(backlog.clamp(0, 5000)).spawn()?;
+        // The service skip rules match against; a file has none.
+        let service = match source {
+            Source::Unit(name) | Source::Container(name) => Some(name.clone()),
+            Source::File(_) => None,
+        };
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -104,11 +109,15 @@ impl LogTail {
         .flatten()
         {
             let tx = out.clone();
+            let service = service.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(reader).lines();
                 let mut limiter = RateLimiter::new(LINE_RATE_CAP);
 
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if daemon_core::logskip::skips_line(service.as_deref(), &line) {
+                        continue;
+                    }
                     match limiter.admit() {
                         Admit::Send => {
                             if tx

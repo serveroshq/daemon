@@ -80,6 +80,11 @@ impl App {
         // salt is made on first start and stays on the machine.
         let salt = daemon_core::ipmask::load_salt(&paths.ip_mask_salt()).unwrap_or_default();
         daemon_core::ipmask::configure(config.logs.mask_ips, salt);
+        // And never at all for the services and lines the skip rules name.
+        let rejected = daemon_core::logskip::configure(&config.logs.skip);
+        if !rejected.is_empty() {
+            tracing::warn!(patterns = ?rejected, "some log skip patterns aren't valid and are ignored");
+        }
 
         let (stream_tx, stream_rx) = mpsc::channel(512);
         let limits = &config.limits;

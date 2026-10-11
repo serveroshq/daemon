@@ -17,6 +17,28 @@ pub struct Hello {
     /// "partial" or "hash". Missing from daemons that can't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_ip_masking: Option<String>,
+    /// Services and line patterns never sent. Missing from daemons that
+    /// can't skip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_skip: Option<LogSkipRules>,
+}
+
+/// Log skip rules as the panel and daemon pass them: service names (with
+/// `*`) whose lines are never sent, and line patterns (regular
+/// expressions), each for every service or the ones its rule matches.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSkipRules {
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub patterns: Vec<LogSkipPattern>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogSkipPattern {
+    #[serde(default)]
+    pub service: Option<String>,
+    pub pattern: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -859,6 +881,9 @@ pub enum Control {
         /// "off", "partial" or "hash": masking IPs in outgoing log lines.
         #[serde(default)]
         log_ip_masking: Option<String>,
+        /// Replaces the machine's log skip rules when present.
+        #[serde(default)]
+        log_skip: Option<LogSkipRules>,
     },
     Disconnect {
         reason: String,

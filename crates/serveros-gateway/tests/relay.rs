@@ -239,6 +239,7 @@ fn hello() -> Hello {
         facts: MachineFacts::default(),
         oldest_local_sample_ts: None,
         log_ip_masking: None,
+        log_skip: None,
     }
 }
 

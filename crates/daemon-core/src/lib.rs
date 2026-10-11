@@ -2,6 +2,7 @@ pub mod buildinfo;
 pub mod config;
 pub mod ipmask;
 pub mod links;
+pub mod logskip;
 pub mod paths;
 pub mod redact;
 

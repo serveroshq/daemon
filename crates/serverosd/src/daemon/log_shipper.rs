@@ -63,6 +63,14 @@ pub async fn run(app: Arc<App>) {
             });
 
             for (id, name) in running {
+                // A skipped service isn't even read; one skipped since it
+                // started stops being read.
+                if daemon_core::logskip::skips_service(&name) {
+                    if let Some(task) = containers.remove(&id) {
+                        task.abort();
+                    }
+                    continue;
+                }
                 if containers.contains_key(&id) {
                     continue;
                 }
@@ -263,6 +271,10 @@ impl Shipper {
         line: &str,
         admit: Admit,
     ) -> bool {
+        // Never sent: a skipped service, or a line a skip pattern matches.
+        if daemon_core::logskip::skips_line(Some(name), line) {
+            return !self.tx.is_closed();
+        }
         let ts = ts.unwrap_or_else(now_ms);
 
         let mut entries = Vec::with_capacity(2);
@@ -378,6 +390,7 @@ fn systemd_units(app: &App) -> BTreeSet<String> {
         .filter(|s| s.status == ServiceStatus::Running)
         .filter_map(|s| s.key.strip_prefix("systemd:"))
         .filter(|unit| !unit.starts_with("serverosd"))
+        .filter(|unit| !daemon_core::logskip::skips_service(unit))
         .map(str::to_string)
         .collect()
 }

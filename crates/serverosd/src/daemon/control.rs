@@ -83,6 +83,34 @@ fn masking_name(masking: daemon_core::ipmask::IpMasking) -> &'static str {
     }
 }
 
+fn skip_to_wire(skip: &daemon_core::logskip::LogSkip) -> daemon_protocol::LogSkipRules {
+    daemon_protocol::LogSkipRules {
+        services: skip.services.clone(),
+        patterns: skip
+            .patterns
+            .iter()
+            .map(|p| daemon_protocol::LogSkipPattern {
+                service: p.service.clone(),
+                pattern: p.pattern.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn skip_from_wire(rules: daemon_protocol::LogSkipRules) -> daemon_core::logskip::LogSkip {
+    daemon_core::logskip::LogSkip {
+        services: rules.services,
+        patterns: rules
+            .patterns
+            .into_iter()
+            .map(|p| daemon_core::logskip::SkipPattern {
+                service: p.service,
+                pattern: p.pattern,
+            })
+            .collect(),
+    }
+}
+
 fn hello(app: &App) -> Hello {
     let facts = app.facts.read().unwrap().clone();
     let config = app.config.read().unwrap();
@@ -96,6 +124,7 @@ fn hello(app: &App) -> Hello {
         facts,
         oldest_local_sample_ts: app.state.oldest_sample_ts().ok().flatten(),
         log_ip_masking: Some(masking_name(config.logs.mask_ips).to_string()),
+        log_skip: Some(skip_to_wire(&config.logs.skip)),
     }
 }
 
@@ -293,6 +322,7 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                 pinned_version,
                 mode,
                 log_ip_masking,
+                log_skip,
             } => {
                 let mut changed = Vec::new();
                 {
@@ -301,6 +331,19 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                         config.logs.mask_ips = masking;
                         daemon_core::ipmask::set_mode(masking);
                         changed.push(format!("log_ip_masking={}", masking_name(masking)));
+                    }
+                    if let Some(rules) = log_skip {
+                        let skip = skip_from_wire(rules);
+                        let rejected = daemon_core::logskip::configure(&skip);
+                        changed.push(format!(
+                            "log_skip={} services, {} patterns",
+                            skip.services.len(),
+                            skip.patterns.len()
+                        ));
+                        if !rejected.is_empty() {
+                            changed.push(format!("unusable patterns: {}", rejected.join(" | ")));
+                        }
+                        config.logs.skip = skip;
                     }
                     if let Some(channel) = updates_channel {
                         config.updates.channel = channel.clone();

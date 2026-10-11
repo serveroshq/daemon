@@ -164,6 +164,10 @@ pub struct LogsConfig {
     /// on an older daemon.
     #[serde(skip_serializing_if = "crate::ipmask::IpMasking::is_off")]
     pub mask_ips: crate::ipmask::IpMasking,
+    /// Services and line patterns that are never sent. Only written when
+    /// there are some, for the same reason.
+    #[serde(skip_serializing_if = "crate::logskip::LogSkip::is_empty")]
+    pub skip: crate::logskip::LogSkip,
 }
 
 impl Default for LogsConfig {
@@ -172,6 +176,7 @@ impl Default for LogsConfig {
             enabled: true,
             lines_per_second: 100,
             mask_ips: crate::ipmask::IpMasking::Off,
+            skip: crate::logskip::LogSkip::default(),
         }
     }
 }
@@ -349,6 +354,24 @@ mod tests {
         let path = dir.path().join("daemon.toml");
         let config = Config::new("api.serveros.com", "mch_123");
 
+        config.save(&path).unwrap();
+
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn keeps_log_skip_rules_and_leaves_them_out_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+        let mut config = Config::new("api.serveros.com", "mch_123");
+        config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("skip"));
+
+        config.logs.skip.services.push("wings".into());
+        config.logs.skip.patterns.push(crate::logskip::SkipPattern {
+            service: Some("nginx*".into()),
+            pattern: r"\d+".into(),
+        });
         config.save(&path).unwrap();
 
         assert_eq!(Config::load(&path).unwrap(), config);

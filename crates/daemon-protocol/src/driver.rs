@@ -34,6 +34,9 @@ pub enum Inbound {
     Gap { from: u64, to: u64 },
 }
 
+// Hello goes once a connection; boxing it to even out the sizes would
+// buy nothing either.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
     Hello(Hello),
