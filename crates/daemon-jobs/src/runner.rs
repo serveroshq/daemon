@@ -361,6 +361,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::DeployKey { .. } => "deploy_key",
         Job::Snapshots { .. } => "snapshots",
         Job::DiskUsage { .. } => "disk_usage",
+        Job::ServiceClone { .. } => "service_clone",
     }
 }
 

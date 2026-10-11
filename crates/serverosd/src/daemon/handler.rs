@@ -826,6 +826,38 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(value)
         }
 
+        Job::ServiceClone {
+            service,
+            name,
+            port,
+            container_port,
+            domain,
+            copy_data,
+        } => {
+            let managed = managed(&app, &service).await?;
+            let grant = authorize(Operation::Service(ServiceOp::Create {
+                service: name.clone(),
+            }))?;
+            ctx.progress
+                .line(format!("cloning {} as {name}", managed.name))
+                .await;
+            let result = super::clone::clone(
+                &app,
+                &ctx,
+                &managed,
+                super::clone::CloneRequest {
+                    name: name.clone(),
+                    port,
+                    container_port,
+                    domain,
+                    copy_data,
+                },
+            )
+            .await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(&name));
+            result
+        }
+
         Job::DiskUsage { path } => {
             let path = super::disk_usage::checked_path(path)?;
             let grant = authorize(Operation::Machine(MachineOp::ReadMetrics))?;

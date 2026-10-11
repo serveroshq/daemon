@@ -374,6 +374,93 @@ impl DockerAdapter {
         Ok(value)
     }
 
+    /// A container's full `docker inspect`, secrets included. Only for work
+    /// done on the machine (a clone needs its original's real environment);
+    /// never send it to the panel, which gets [`DockerAdapter::inspect`].
+    pub async fn inspect_with_secrets(&self, container: &str) -> Result<serde_json::Value> {
+        if !valid_container_ref(container) {
+            return Err(ServiceError::Docker(format!(
+                "{container:?} is not a valid container reference"
+            )));
+        }
+        let reply = self
+            .call(
+                "GET",
+                &format!("/containers/{container}/json"),
+                None,
+                &[200],
+                &format!("inspect {container}"),
+            )
+            .await?;
+
+        Ok(serde_json::from_slice(&reply.body)?)
+    }
+
+    /// Creates a container from a create request, joins any more networks,
+    /// and starts it. Anything that fails after the create removes it again.
+    pub async fn create_and_start(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+        more_networks: &[String],
+    ) -> Result<String> {
+        if !valid_container_ref(name) {
+            return Err(ServiceError::Docker(format!(
+                "{name:?} is not a valid container name"
+            )));
+        }
+        let created = self
+            .call(
+                "POST",
+                &format!("/containers/create?name={name}"),
+                Some(body),
+                &[201],
+                &format!("create {name}"),
+            )
+            .await?;
+        let id = serde_json::from_slice::<serde_json::Value>(&created.body)?
+            .get("Id")
+            .and_then(|i| i.as_str())
+            .unwrap_or(name)
+            .to_string();
+
+        let started = async {
+            for network in more_networks {
+                self.call(
+                    "POST",
+                    &format!("/networks/{network}/connect"),
+                    Some(&serde_json::json!({ "Container": id })),
+                    &[200],
+                    &format!("connect {name} to {network}"),
+                )
+                .await?;
+            }
+            self.call(
+                "POST",
+                &format!("/containers/{id}/start"),
+                None,
+                &[204, 304],
+                &format!("start {name}"),
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = started {
+            let _ = self
+                .call(
+                    "DELETE",
+                    &format!("/containers/{id}?force=1"),
+                    None,
+                    &[204, 404],
+                    "remove the half-made container",
+                )
+                .await;
+            return Err(e);
+        }
+
+        Ok(id)
+    }
+
     async fn call(
         &self,
         method: &str,

@@ -565,6 +565,20 @@ pub enum Job {
     Snapshots {
         service: String,
     },
+    /// A copy of a running container under a new name, to try things on:
+    /// on a host port and/or a domain, with its data copied or empty.
+    ServiceClone {
+        service: String,
+        name: String,
+        #[serde(default)]
+        port: Option<u16>,
+        #[serde(default)]
+        container_port: Option<u16>,
+        #[serde(default)]
+        domain: Option<String>,
+        #[serde(default)]
+        copy_data: bool,
+    },
     /// What's using the disk under a folder (the root filesystem when left
     /// out). Read-only.
     DiskUsage {

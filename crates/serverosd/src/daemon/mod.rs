@@ -1,5 +1,6 @@
 mod app;
 mod backup_ops;
+mod clone;
 mod control;
 mod disk_usage;
 mod handler;
