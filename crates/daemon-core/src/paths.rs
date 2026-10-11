@@ -43,6 +43,11 @@ impl Paths {
         self.config_dir.join("daemon.key")
     }
 
+    /// The salt for hashed IP addresses in logs (daemon_core::ipmask).
+    pub fn ip_mask_salt(&self) -> PathBuf {
+        self.config_dir.join("ip-mask.salt")
+    }
+
     pub fn client_cert(&self) -> PathBuf {
         self.config_dir.join("daemon.crt")
     }

@@ -159,6 +159,11 @@ pub struct DiscoveryConfig {
 pub struct LogsConfig {
     pub enabled: bool,
     pub lines_per_second: u32,
+    /// Replace IP addresses in log lines before they leave the machine.
+    /// Only written when on, so a config that never used it still loads
+    /// on an older daemon.
+    #[serde(skip_serializing_if = "crate::ipmask::IpMasking::is_off")]
+    pub mask_ips: crate::ipmask::IpMasking,
 }
 
 impl Default for LogsConfig {
@@ -166,6 +171,7 @@ impl Default for LogsConfig {
         Self {
             enabled: true,
             lines_per_second: 100,
+            mask_ips: crate::ipmask::IpMasking::Off,
         }
     }
 }

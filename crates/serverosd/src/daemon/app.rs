@@ -76,6 +76,11 @@ impl App {
         guard: RollbackGuard,
         on_trial: Option<(String, String)>,
     ) -> Self {
+        // Log lines leave with IPs masked when the machine says so. The
+        // salt is made on first start and stays on the machine.
+        let salt = daemon_core::ipmask::load_salt(&paths.ip_mask_salt()).unwrap_or_default();
+        daemon_core::ipmask::configure(config.logs.mask_ips, salt);
+
         let (stream_tx, stream_rx) = mpsc::channel(512);
         let limits = &config.limits;
         let facts = daemon_telemetry::gather_facts();

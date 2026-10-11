@@ -1,7 +1,6 @@
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use daemon_core::redact::redact;
 use daemon_protocol::{StreamFrame, StreamKind};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -116,7 +115,7 @@ impl LogTail {
                                 .send(frame(
                                     session,
                                     StreamKind::LogLine,
-                                    redact(&line).as_bytes(),
+                                    daemon_core::ipmask::outgoing(&line).as_bytes(),
                                     false,
                                 ))
                                 .await
@@ -144,7 +143,7 @@ impl LogTail {
                                 .send(frame(
                                     session,
                                     StreamKind::LogLine,
-                                    redact(&line).as_bytes(),
+                                    daemon_core::ipmask::outgoing(&line).as_bytes(),
                                     false,
                                 ))
                                 .await

@@ -341,8 +341,10 @@ name = "daemon-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hex",
  "regex",
  "serde",
+ "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "time",

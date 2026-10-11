@@ -243,7 +243,7 @@ impl Lifecycle for SystemdAdapter {
             )
             .await?;
 
-        Ok(out.lines().map(daemon_core::redact::redact).collect())
+        Ok(out.lines().map(daemon_core::ipmask::outgoing).collect())
     }
 }
 

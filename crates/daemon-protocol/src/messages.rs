@@ -13,6 +13,10 @@ pub struct Hello {
     pub facts: MachineFacts,
     #[serde(default)]
     pub oldest_local_sample_ts: Option<i64>,
+    /// How IP addresses in log lines are masked before they leave: "off",
+    /// "partial" or "hash". Missing from daemons that can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_ip_masking: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -852,6 +856,9 @@ pub enum Control {
         updates_channel: Option<String>,
         pinned_version: Option<Option<String>>,
         mode: Option<PanelMode>,
+        /// "off", "partial" or "hash": masking IPs in outgoing log lines.
+        #[serde(default)]
+        log_ip_masking: Option<String>,
     },
     Disconnect {
         reason: String,

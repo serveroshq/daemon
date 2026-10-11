@@ -200,7 +200,7 @@ impl Lifecycle for DockerAdapter {
 
         Ok(demux_log_stream(&reply.body)
             .lines()
-            .map(daemon_core::redact::redact)
+            .map(daemon_core::ipmask::outgoing)
             .collect())
     }
 }

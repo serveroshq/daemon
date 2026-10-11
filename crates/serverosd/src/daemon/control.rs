@@ -64,6 +64,25 @@ pub async fn run(app: Arc<App>, mut outbound: mpsc::Receiver<Outbound>) {
     }
 }
 
+fn parse_masking(value: &str) -> Option<daemon_core::ipmask::IpMasking> {
+    use daemon_core::ipmask::IpMasking;
+    match value {
+        "off" => Some(IpMasking::Off),
+        "partial" => Some(IpMasking::Partial),
+        "hash" => Some(IpMasking::Hash),
+        _ => None,
+    }
+}
+
+fn masking_name(masking: daemon_core::ipmask::IpMasking) -> &'static str {
+    use daemon_core::ipmask::IpMasking;
+    match masking {
+        IpMasking::Off => "off",
+        IpMasking::Partial => "partial",
+        IpMasking::Hash => "hash",
+    }
+}
+
 fn hello(app: &App) -> Hello {
     let facts = app.facts.read().unwrap().clone();
     let config = app.config.read().unwrap();
@@ -76,6 +95,7 @@ fn hello(app: &App) -> Hello {
         supported_majors: daemon_protocol::SUPPORTED_MAJORS.to_vec(),
         facts,
         oldest_local_sample_ts: app.state.oldest_sample_ts().ok().flatten(),
+        log_ip_masking: Some(masking_name(config.logs.mask_ips).to_string()),
     }
 }
 
@@ -272,10 +292,16 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                 updates_channel,
                 pinned_version,
                 mode,
+                log_ip_masking,
             } => {
                 let mut changed = Vec::new();
                 {
                     let mut config = app.config.write().unwrap();
+                    if let Some(masking) = log_ip_masking.as_deref().and_then(parse_masking) {
+                        config.logs.mask_ips = masking;
+                        daemon_core::ipmask::set_mode(masking);
+                        changed.push(format!("log_ip_masking={}", masking_name(masking)));
+                    }
                     if let Some(channel) = updates_channel {
                         config.updates.channel = channel.clone();
                         changed.push(format!("channel={channel}"));

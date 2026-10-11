@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use daemon_core::redact::redact;
 use daemon_import::history::History;
 use daemon_protocol::driver::Outbound;
 use daemon_protocol::{LogBatch, LogEntry, LogStream, ServiceStatus};
@@ -291,7 +290,7 @@ impl Shipper {
             ts,
             stream,
             priority,
-            line: clip(&redact(line)),
+            line: clip(&daemon_core::ipmask::outgoing(line)),
         });
 
         {
