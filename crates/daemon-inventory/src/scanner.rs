@@ -2,16 +2,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use daemon_core::config::FirewallBackend;
 use daemon_protocol::{DiscoveredService, Event, EventKind, InventoryReport, Severity};
 use tracing::debug;
 
 use crate::classify::{self, Findings};
-use crate::{cron, docker, listeners, systemd, tls, webservers};
+use crate::{cron, docker, firewall, listeners, systemd, tls, webservers};
 
 pub struct Scanner {
     pub budget: Duration,
     pub proc_root: std::path::PathBuf,
     pub docker_socket: std::path::PathBuf,
+    /// The firewall ServerOS changes rules with, read the same way.
+    pub firewall: FirewallBackend,
 }
 
 impl Default for Scanner {
@@ -20,6 +23,7 @@ impl Default for Scanner {
             budget: Duration::from_secs(60),
             proc_root: "/proc".into(),
             docker_socket: docker::SOCKET.into(),
+            firewall: FirewallBackend::default(),
         }
     }
 }
@@ -83,6 +87,25 @@ impl Scanner {
             .filter(|t| !cron::is_ours(t))
             .collect();
 
+        let docker_ports: Vec<u16> = containers
+            .iter()
+            .filter(|c| c.state == "running")
+            .flat_map(|c| c.ports.iter().copied())
+            .collect();
+        let firewall = match tokio::time::timeout(
+            per_source,
+            firewall::read(self.firewall, Duration::from_secs(10)),
+        )
+        .await
+        {
+            Ok(ruleset) => Some(ruleset.report(&found_listeners, &docker_ports)),
+            Err(_) => {
+                complete = false;
+                warnings.push("firewall read overran its budget".into());
+                None
+            }
+        };
+
         let findings = Findings {
             listeners: found_listeners.clone(),
             processes,
@@ -111,6 +134,7 @@ impl Scanner {
             scheduled,
             unknown: classified.unknown,
             warnings,
+            firewall,
         };
 
         if let Some(v) = docker_version {
@@ -296,6 +320,7 @@ mod tests {
             scheduled: vec![],
             unknown: vec![],
             warnings: vec![],
+            firewall: None,
         }
     }
 

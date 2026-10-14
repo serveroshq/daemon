@@ -266,6 +266,7 @@ mod tests {
             scheduled: vec![],
             unknown: vec![],
             warnings: vec![],
+            firewall: None,
         };
 
         History::new(state).remember_report(&report).unwrap();
