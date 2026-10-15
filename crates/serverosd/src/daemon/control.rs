@@ -82,6 +82,7 @@ fn hello(app: &App) -> Hello {
         discovery: Some(config.discovery.enabled),
         logs: Some(config.logs.enabled),
         updates_automatic: Some(config.updates.automatic),
+        pinned_version: Some(config.updates.pinned_version.clone()),
     }
 }
 

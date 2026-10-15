@@ -244,6 +244,7 @@ fn hello() -> Hello {
         discovery: None,
         logs: None,
         updates_automatic: None,
+        pinned_version: None,
     }
 }
 

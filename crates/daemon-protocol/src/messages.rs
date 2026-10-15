@@ -37,6 +37,11 @@ pub struct Hello {
     /// Missing from daemons that can't be told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_automatic: Option<bool>,
+    /// The version it stays on; null when it doesn't. Always sent (even as
+    /// null), so a panel can tell "no pin" from a daemon that can't say:
+    /// those leave it out.
+    #[serde(default, deserialize_with = "present")]
+    pub pinned_version: Option<Option<String>>,
 }
 
 /// What the panel decides for a machine: each one present is applied and
@@ -1074,6 +1079,22 @@ mod tests {
             (set.discovery, set.logs, set.updates_automatic),
             (Some(false), Some(false), Some(false))
         );
+    }
+
+    #[test]
+    fn hello_always_says_whether_it_is_pinned() {
+        let raw = r#"{"machine_id":"m","daemon_version":"v","daemon_commit":"c","channel":"stable","supported_majors":[1],"facts":{"hostname":"h","os":"linux","os_version":"","kernel":"","arch":"x86_64","libc":"","cpu_model":"","cpu_cores":1,"memory_bytes":0,"disks":[],"interfaces":[],"timezone":"UTC","boot_ts":0}}"#;
+        let mut hello: Hello = serde_json::from_str(raw).unwrap();
+        // An older daemon leaves it out.
+        assert_eq!(hello.pinned_version, None);
+
+        hello.pinned_version = Some(None);
+        let json = serde_json::to_value(&hello).unwrap();
+        assert!(json.get("pinned_version").unwrap().is_null());
+
+        hello.pinned_version = Some(Some("v0.1.1-pre.24".into()));
+        let back: Hello = serde_json::from_value(serde_json::to_value(&hello).unwrap()).unwrap();
+        assert_eq!(back.pinned_version, Some(Some("v0.1.1-pre.24".into())));
     }
 
     #[test]
