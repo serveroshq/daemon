@@ -246,8 +246,13 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::Facts => {
             let grant = authorize(Operation::Machine(MachineOp::ReadFacts))?;
-            let facts = daemon_telemetry::gather_facts();
-            *app.facts.write().unwrap_or_else(|p| p.into_inner()) = facts.clone();
+            let facts = {
+                let mut current = app.facts.write().unwrap_or_else(|p| p.into_inner());
+                let mut facts = daemon_telemetry::gather_facts();
+                facts.security = current.security.clone();
+                *current = facts.clone();
+                facts
+            };
             app.send(Outbound::Facts(facts.clone())).await;
             grant.finish::<String>(&Ok(()), None);
             Ok(serde_json::to_value(facts).unwrap_or(Value::Null))

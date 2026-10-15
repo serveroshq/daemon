@@ -27,6 +27,7 @@ pub fn spawn_all(app: Arc<App>) {
             }
         }
     });
+    tokio::spawn(security_watch(Arc::clone(&app)));
     tokio::spawn(self_health(Arc::clone(&app)));
     tokio::spawn(updates(Arc::clone(&app)));
     tokio::spawn(update_checks(Arc::clone(&app)));
@@ -138,10 +139,6 @@ async fn telemetry(app: Arc<App>) {
 }
 
 async fn discovery(app: Arc<App>) {
-    if !app.config.read().unwrap().discovery.enabled {
-        return;
-    }
-
     let interval = app.config.read().unwrap().discovery_interval();
 
     for _ in 0..60 {
@@ -153,6 +150,16 @@ async fn discovery(app: Arc<App>) {
 
     loop {
         app.supervisor.tick("discovery");
+
+        // Turned off, by daemon.toml or the panel: look for nothing until
+        // it's turned back on. A scan someone asks for still runs.
+        if !app.config.read().unwrap().discovery.enabled {
+            tokio::select! {
+                _ = app.discovery_wake.notified() => {}
+                _ = tokio::time::sleep(DISCOVERY_OFF_CHECK) => {}
+            }
+            continue;
+        }
 
         match app.importer.scan().await {
             Ok((report, events)) => {
@@ -166,15 +173,58 @@ async fn discovery(app: Arc<App>) {
             Err(e) => warn!(error = %e, "discovery scan failed"),
         }
 
-        let fresh = daemon_telemetry::gather_facts();
+        let mut fresh = daemon_telemetry::gather_facts();
+        // The security watch keeps its own part up to date.
+        fresh.security = app.facts.read().unwrap().security.clone();
         let changed = *app.facts.read().unwrap() != fresh;
         if changed {
             *app.facts.write().unwrap() = fresh.clone();
             app.send(Outbound::Facts(fresh)).await;
         }
 
-        app.supervisor.idle("discovery", interval).await;
+        tokio::select! {
+            _ = app.supervisor.idle("discovery", interval) => {}
+            _ = app.discovery_wake.notified() => {}
+        }
     }
+}
+
+/// How often discovery, while off, checks whether it's been turned on
+/// (the panel also wakes it straight away).
+const DISCOVERY_OFF_CHECK: Duration = Duration::from_secs(30);
+
+/// How often the security watch reads SSH settings and failed sign-ins.
+const SECURITY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+async fn security_watch(app: Arc<App>) {
+    loop {
+        app.supervisor.tick("security");
+        refresh_security(&app).await;
+        app.supervisor.idle("security", SECURITY_INTERVAL).await;
+    }
+}
+
+/// Read what the security watch reads, or clear it while the watch is off,
+/// and send the facts when that changed them.
+pub(super) async fn refresh_security(app: &Arc<App>) {
+    let watch = app.config.read().unwrap().security.watch;
+    let security = if watch {
+        tokio::task::spawn_blocking(daemon_telemetry::facts::security::gather)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    let fresh = {
+        let mut facts = app.facts.write().unwrap();
+        if facts.security == security {
+            return;
+        }
+        facts.security = security;
+        facts.clone()
+    };
+    app.send(Outbound::Facts(fresh)).await;
 }
 
 async fn self_health(app: Arc<App>) {

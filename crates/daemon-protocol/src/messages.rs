@@ -21,6 +21,63 @@ pub struct Hello {
     /// can't skip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_skip: Option<LogSkipRules>,
+    /// Whether the daemon reads SSH settings and failed sign-ins for the
+    /// panel's security watch. Missing from daemons that can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_watch: Option<bool>,
+    /// Whether the daemon looks for what's running on its own. Missing
+    /// from daemons that can't be told not to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<bool>,
+    /// Whether log lines are sent at all. Missing from daemons that can't
+    /// be told not to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<bool>,
+    /// Whether new releases install on their own or wait for the panel.
+    /// Missing from daemons that can't be told.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_automatic: Option<bool>,
+}
+
+/// What the panel decides for a machine: each one present is applied and
+/// kept, each one missing is left as it is. Sent in `reconfigure` and, for
+/// a new machine, with its enrolment, so it holds from the first start.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<bool>,
+    /// "off", "partial" or "hash": masking IPs in outgoing log lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_ip_masking: Option<String>,
+    /// Replaces the machine's log skip rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_skip: Option<LogSkipRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_watch: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_automatic: Option<bool>,
+    /// "stable" or "canary".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_channel: Option<String>,
+    /// A version to stay on, or null to stop staying on one.
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pinned_version: Option<Option<String>>,
+}
+
+/// Tells a field that's there but null (`Some(None)`, "clear it") apart
+/// from one that's missing (`None`, "leave it").
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 /// Log skip rules as the panel and daemon pass them: service names (with
@@ -81,6 +138,49 @@ pub struct MachineFacts {
     pub docker_version: Option<String>,
     #[serde(default)]
     pub hosting: HostingFacts,
+    /// What the security watch reads: SSH settings, failed sign-ins and
+    /// automatic updates. None while the watch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityFacts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SecurityFacts {
+    /// The SSH server's effective settings; None when there isn't one.
+    pub ssh: Option<SshFacts>,
+    /// Failed SSH sign-ins in the last `window_secs`; None when the
+    /// machine's logs couldn't be read.
+    pub logins: Option<LoginFacts>,
+    /// Whether security updates install themselves (unattended-upgrades,
+    /// dnf-automatic); None when the package manager isn't one we know.
+    pub auto_updates: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SshFacts {
+    pub ports: Vec<u16>,
+    /// As sshd says it: yes, no, prohibit-password or forced-commands-only.
+    pub permit_root_login: String,
+    pub password_authentication: bool,
+    pub kbd_interactive_authentication: bool,
+    pub use_pam: bool,
+    /// "sshd -T" when it ran, "config" when read from sshd_config.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoginFacts {
+    pub window_secs: u64,
+    /// Connections that failed to sign in (each source address and port
+    /// once, however many tries it made).
+    pub failed: u32,
+    /// Distinct addresses they came from. The addresses themselves never
+    /// leave the machine.
+    pub sources: u32,
+    /// Failed connections that tried root.
+    pub root: u32,
+    /// Connections that signed in with a password.
+    pub accepted_password: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -889,15 +989,10 @@ pub enum Control {
         approved: bool,
     },
     Reconfigure {
-        updates_channel: Option<String>,
-        pinned_version: Option<Option<String>>,
+        #[serde(default)]
         mode: Option<PanelMode>,
-        /// "off", "partial" or "hash": masking IPs in outgoing log lines.
-        #[serde(default)]
-        log_ip_masking: Option<String>,
-        /// Replaces the machine's log skip rules when present.
-        #[serde(default)]
-        log_skip: Option<LogSkipRules>,
+        #[serde(flatten)]
+        settings: MachineSettings,
     },
     Disconnect {
         reason: String,
@@ -943,6 +1038,57 @@ mod tests {
 
         let facts: MachineFacts = serde_json::from_str(r#"{"hostname":"box","os":"linux","os_version":"","kernel":"","arch":"x86_64","libc":"","cpu_model":"","cpu_cores":1,"memory_bytes":0,"disks":[],"interfaces":[],"timezone":"UTC","boot_ts":0}"#).unwrap();
         assert_eq!(facts.hosting, HostingFacts::default());
+    }
+
+    #[test]
+    fn reconfigure_reads_what_older_panels_send() {
+        let raw = r#"{"type":"reconfigure","updates_channel":null,"pinned_version":null,"mode":"managed","log_ip_masking":"hash"}"#;
+        let Control::Reconfigure { mode, settings } = serde_json::from_str(raw).unwrap() else {
+            panic!("not a reconfigure");
+        };
+
+        assert_eq!(mode, Some(PanelMode::Managed));
+        assert_eq!(settings.updates_channel, None);
+        assert_eq!(settings.log_ip_masking.as_deref(), Some("hash"));
+        assert_eq!(settings.discovery, None);
+    }
+
+    #[test]
+    fn reconfigure_tells_a_cleared_pin_from_a_missing_one() {
+        let cleared: Control =
+            serde_json::from_str(r#"{"type":"reconfigure","pinned_version":null}"#).unwrap();
+        let missing: Control = serde_json::from_str(r#"{"type":"reconfigure"}"#).unwrap();
+        let set: Control =
+            serde_json::from_str(r#"{"type":"reconfigure","pinned_version":"0.1.2","discovery":false,"logs":false,"updates_automatic":false}"#)
+                .unwrap();
+
+        let pin = |c: Control| match c {
+            Control::Reconfigure { settings, .. } => settings,
+            _ => panic!("not a reconfigure"),
+        };
+        assert_eq!(pin(cleared).pinned_version, Some(None));
+        assert_eq!(pin(missing).pinned_version, None);
+        let set = pin(set);
+        assert_eq!(set.pinned_version, Some(Some("0.1.2".into())));
+        assert_eq!(
+            (set.discovery, set.logs, set.updates_automatic),
+            (Some(false), Some(false), Some(false))
+        );
+    }
+
+    #[test]
+    fn reconfigure_round_trips() {
+        let control = Control::Reconfigure {
+            mode: None,
+            settings: MachineSettings {
+                logs: Some(false),
+                pinned_version: Some(None),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&control).unwrap();
+
+        assert_eq!(serde_json::from_str::<Control>(&json).unwrap(), control);
     }
 
     #[test]

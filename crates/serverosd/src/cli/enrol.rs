@@ -97,6 +97,14 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     });
     let mut config = Config::new(host, answer.machine_id.clone());
     config.machine.label = answer.label.clone();
+    // What the workspace decided for its machines holds from the first
+    // start: no scan or log line goes out that it said no to.
+    if let Some(settings) = answer.settings.clone() {
+        let applied = crate::settings::apply(&mut config, settings);
+        if !applied.is_empty() {
+            println!("  settings from the panel: {}", applied.join(", "));
+        }
+    }
     config.save(&paths.config_file())?;
     println!("  enrolled as machine {}", answer.machine_id);
 
@@ -115,7 +123,11 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
 
     println!();
     println!("Done. The machine will show as connected in the panel within a few seconds,");
-    println!("and its first service scan will follow.");
+    if config.discovery.enabled {
+        println!("and its first service scan will follow.");
+    } else {
+        println!("Discovery is off for this machine, so nothing is scanned until it's turned on.");
+    }
     println!();
     println!("  status:    serverosd status");
     println!("  audit log: {}", paths.actions_log().display());

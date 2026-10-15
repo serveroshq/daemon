@@ -64,53 +64,6 @@ pub async fn run(app: Arc<App>, mut outbound: mpsc::Receiver<Outbound>) {
     }
 }
 
-fn parse_masking(value: &str) -> Option<daemon_core::ipmask::IpMasking> {
-    use daemon_core::ipmask::IpMasking;
-    match value {
-        "off" => Some(IpMasking::Off),
-        "partial" => Some(IpMasking::Partial),
-        "hash" => Some(IpMasking::Hash),
-        _ => None,
-    }
-}
-
-fn masking_name(masking: daemon_core::ipmask::IpMasking) -> &'static str {
-    use daemon_core::ipmask::IpMasking;
-    match masking {
-        IpMasking::Off => "off",
-        IpMasking::Partial => "partial",
-        IpMasking::Hash => "hash",
-    }
-}
-
-fn skip_to_wire(skip: &daemon_core::logskip::LogSkip) -> daemon_protocol::LogSkipRules {
-    daemon_protocol::LogSkipRules {
-        services: skip.services.clone(),
-        patterns: skip
-            .patterns
-            .iter()
-            .map(|p| daemon_protocol::LogSkipPattern {
-                service: p.service.clone(),
-                pattern: p.pattern.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn skip_from_wire(rules: daemon_protocol::LogSkipRules) -> daemon_core::logskip::LogSkip {
-    daemon_core::logskip::LogSkip {
-        services: rules.services,
-        patterns: rules
-            .patterns
-            .into_iter()
-            .map(|p| daemon_core::logskip::SkipPattern {
-                service: p.service,
-                pattern: p.pattern,
-            })
-            .collect(),
-    }
-}
-
 fn hello(app: &App) -> Hello {
     let facts = app.facts.read().unwrap().clone();
     let config = app.config.read().unwrap();
@@ -123,8 +76,12 @@ fn hello(app: &App) -> Hello {
         supported_majors: daemon_protocol::SUPPORTED_MAJORS.to_vec(),
         facts,
         oldest_local_sample_ts: app.state.oldest_sample_ts().ok().flatten(),
-        log_ip_masking: Some(masking_name(config.logs.mask_ips).to_string()),
-        log_skip: Some(skip_to_wire(&config.logs.skip)),
+        log_ip_masking: Some(crate::settings::masking_name(config.logs.mask_ips).to_string()),
+        log_skip: Some(crate::settings::skip_to_wire(&config.logs.skip)),
+        security_watch: Some(config.security.watch),
+        discovery: Some(config.discovery.enabled),
+        logs: Some(config.logs.enabled),
+        updates_automatic: Some(config.updates.automatic),
     }
 }
 
@@ -317,46 +274,27 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                     .await;
                 }
             }
-            Control::Reconfigure {
-                updates_channel,
-                pinned_version,
-                mode,
-                log_ip_masking,
-                log_skip,
-            } => {
-                let mut changed = Vec::new();
-                {
+            Control::Reconfigure { mode, settings } => {
+                let security_watch = settings.security_watch;
+                let discovery_on = settings.discovery == Some(true);
+                let mut changed = {
                     let mut config = app.config.write().unwrap();
-                    if let Some(masking) = log_ip_masking.as_deref().and_then(parse_masking) {
-                        config.logs.mask_ips = masking;
-                        daemon_core::ipmask::set_mode(masking);
-                        changed.push(format!("log_ip_masking={}", masking_name(masking)));
-                    }
-                    if let Some(rules) = log_skip {
-                        let skip = skip_from_wire(rules);
-                        let rejected = daemon_core::logskip::configure(&skip);
-                        changed.push(format!(
-                            "log_skip={} services, {} patterns",
-                            skip.services.len(),
-                            skip.patterns.len()
-                        ));
-                        if !rejected.is_empty() {
-                            changed.push(format!("unusable patterns: {}", rejected.join(" | ")));
+                    let changed = crate::settings::apply(&mut config, settings);
+                    if !changed.is_empty() {
+                        if let Err(e) = config.save(&app.paths.config_file()) {
+                            warn!(error = %e, "couldn't save the panel's settings; they hold until the daemon restarts");
                         }
-                        config.logs.skip = skip;
                     }
-                    if let Some(channel) = updates_channel {
-                        config.updates.channel = channel.clone();
-                        changed.push(format!("channel={channel}"));
-                    }
-                    if let Some(pin) = pinned_version {
-                        changed.push(format!(
-                            "pin={}",
-                            pin.clone().unwrap_or_else(|| "none".into())
-                        ));
-                        config.updates.pinned_version = pin;
-                    }
-                    let _ = config.save(&app.paths.config_file());
+                    changed
+                };
+                if security_watch.is_some() {
+                    // Read (or clear) it now rather than at the next tick.
+                    let app = Arc::clone(app);
+                    tokio::spawn(async move { super::workers::refresh_security(&app).await });
+                }
+                if discovery_on {
+                    // Look now rather than at the next interval.
+                    app.discovery_wake.notify_one();
                 }
                 if let Some(mode) = mode {
                     app.runner().set_mode(mode);

@@ -49,6 +49,30 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// Only written when the watch is off, so a config that never turned
+    /// it off still loads on an older daemon.
+    #[serde(default, skip_serializing_if = "SecurityConfig::is_default")]
+    pub security: SecurityConfig,
+}
+
+/// The security watch: SSH settings, failed sign-ins and automatic
+/// updates, read every few minutes and sent with the machine's facts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SecurityConfig {
+    pub watch: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { watch: true }
+    }
+}
+
+impl SecurityConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +278,7 @@ impl Config {
             files: FilesConfig::default(),
             limits: LimitsConfig::default(),
             integrations: IntegrationsConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 
