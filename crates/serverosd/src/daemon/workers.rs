@@ -139,10 +139,6 @@ async fn telemetry(app: Arc<App>) {
 }
 
 async fn discovery(app: Arc<App>) {
-    if !app.config.read().unwrap().discovery.enabled {
-        return;
-    }
-
     let interval = app.config.read().unwrap().discovery_interval();
 
     for _ in 0..60 {
@@ -154,6 +150,16 @@ async fn discovery(app: Arc<App>) {
 
     loop {
         app.supervisor.tick("discovery");
+
+        // Turned off, by daemon.toml or the panel: look for nothing until
+        // it's turned back on. A scan someone asks for still runs.
+        if !app.config.read().unwrap().discovery.enabled {
+            tokio::select! {
+                _ = app.discovery_wake.notified() => {}
+                _ = tokio::time::sleep(DISCOVERY_OFF_CHECK) => {}
+            }
+            continue;
+        }
 
         match app.importer.scan().await {
             Ok((report, events)) => {
@@ -176,9 +182,16 @@ async fn discovery(app: Arc<App>) {
             app.send(Outbound::Facts(fresh)).await;
         }
 
-        app.supervisor.idle("discovery", interval).await;
+        tokio::select! {
+            _ = app.supervisor.idle("discovery", interval) => {}
+            _ = app.discovery_wake.notified() => {}
+        }
     }
 }
+
+/// How often discovery, while off, checks whether it's been turned on
+/// (the panel also wakes it straight away).
+const DISCOVERY_OFF_CHECK: Duration = Duration::from_secs(30);
 
 /// How often the security watch reads SSH settings and failed sign-ins.
 const SECURITY_INTERVAL: Duration = Duration::from_secs(5 * 60);

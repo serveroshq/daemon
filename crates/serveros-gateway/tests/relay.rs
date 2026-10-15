@@ -241,6 +241,9 @@ fn hello() -> Hello {
         log_ip_masking: None,
         log_skip: None,
         security_watch: None,
+        discovery: None,
+        logs: None,
+        updates_automatic: None,
     }
 }
 

@@ -25,13 +25,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const NEW_CONTAINER_LOOKBACK_MS: i64 = 30_000;
 
 pub async fn run(app: Arc<App>) {
-    let (enabled, cap) = {
-        let c = app.config.read().unwrap();
-        (c.logs.enabled, c.logs.lines_per_second.max(1) as usize)
-    };
-    if !enabled {
-        return;
-    }
+    let cap = app.config.read().unwrap().logs.lines_per_second.max(1) as usize;
 
     let (tx, rx) = mpsc::channel::<LogEntry>(4096);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -52,6 +46,21 @@ pub async fn run(app: Arc<App>) {
     loop {
         tick.tick().await;
         app.supervisor.tick("log_shipper");
+
+        // Turned off, by daemon.toml or the panel: stop reading anything.
+        // Turned back on, it starts from then, not from where it stopped.
+        if !app.config.read().unwrap().logs.enabled {
+            for (_, task) in containers.drain() {
+                task.abort();
+            }
+            if let Some((_, task)) = journal.take() {
+                task.abort();
+            }
+            shipper.cursors.lock().unwrap().clear();
+            *journal_cursor.lock().unwrap() = None;
+            first = true;
+            continue;
+        }
 
         if let Some(running) = running_containers().await {
             containers.retain(|id, task| {

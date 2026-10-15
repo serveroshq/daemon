@@ -55,6 +55,8 @@ pub struct App {
     pub facts: RwLock<MachineFacts>,
     pub status: RwLock<ConnectionStatus>,
     pub pending_update: Mutex<Option<(Candidate, bool)>>,
+    /// Wakes discovery early: when the panel turns it on.
+    pub discovery_wake: tokio::sync::Notify,
     stopping: std::sync::atomic::AtomicBool,
     outbound: mpsc::Sender<Outbound>,
     stream_tx: mpsc::Sender<StreamFrame>,
@@ -151,6 +153,7 @@ impl App {
             facts: RwLock::new(facts),
             status: RwLock::new(ConnectionStatus::default()),
             pending_update: Mutex::new(None),
+            discovery_wake: tokio::sync::Notify::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             outbound,
             stream_tx,
