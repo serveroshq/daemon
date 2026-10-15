@@ -21,6 +21,10 @@ pub struct Hello {
     /// can't skip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_skip: Option<LogSkipRules>,
+    /// Whether the daemon reads SSH settings and failed sign-ins for the
+    /// panel's security watch. Missing from daemons that can't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_watch: Option<bool>,
 }
 
 /// Log skip rules as the panel and daemon pass them: service names (with
@@ -81,6 +85,49 @@ pub struct MachineFacts {
     pub docker_version: Option<String>,
     #[serde(default)]
     pub hosting: HostingFacts,
+    /// What the security watch reads: SSH settings, failed sign-ins and
+    /// automatic updates. None while the watch is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityFacts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SecurityFacts {
+    /// The SSH server's effective settings; None when there isn't one.
+    pub ssh: Option<SshFacts>,
+    /// Failed SSH sign-ins in the last `window_secs`; None when the
+    /// machine's logs couldn't be read.
+    pub logins: Option<LoginFacts>,
+    /// Whether security updates install themselves (unattended-upgrades,
+    /// dnf-automatic); None when the package manager isn't one we know.
+    pub auto_updates: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct SshFacts {
+    pub ports: Vec<u16>,
+    /// As sshd says it: yes, no, prohibit-password or forced-commands-only.
+    pub permit_root_login: String,
+    pub password_authentication: bool,
+    pub kbd_interactive_authentication: bool,
+    pub use_pam: bool,
+    /// "sshd -T" when it ran, "config" when read from sshd_config.
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct LoginFacts {
+    pub window_secs: u64,
+    /// Connections that failed to sign in (each source address and port
+    /// once, however many tries it made).
+    pub failed: u32,
+    /// Distinct addresses they came from. The addresses themselves never
+    /// leave the machine.
+    pub sources: u32,
+    /// Failed connections that tried root.
+    pub root: u32,
+    /// Connections that signed in with a password.
+    pub accepted_password: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -898,6 +945,9 @@ pub enum Control {
         /// Replaces the machine's log skip rules when present.
         #[serde(default)]
         log_skip: Option<LogSkipRules>,
+        /// Turns the security watch on or off when present.
+        #[serde(default)]
+        security_watch: Option<bool>,
     },
     Disconnect {
         reason: String,

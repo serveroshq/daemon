@@ -125,6 +125,7 @@ fn hello(app: &App) -> Hello {
         oldest_local_sample_ts: app.state.oldest_sample_ts().ok().flatten(),
         log_ip_masking: Some(masking_name(config.logs.mask_ips).to_string()),
         log_skip: Some(skip_to_wire(&config.logs.skip)),
+        security_watch: Some(config.security.watch),
     }
 }
 
@@ -323,6 +324,7 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                 mode,
                 log_ip_masking,
                 log_skip,
+                security_watch,
             } => {
                 let mut changed = Vec::new();
                 {
@@ -345,6 +347,10 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                         }
                         config.logs.skip = skip;
                     }
+                    if let Some(watch) = security_watch {
+                        config.security.watch = watch;
+                        changed.push(format!("security_watch={watch}"));
+                    }
                     if let Some(channel) = updates_channel {
                         config.updates.channel = channel.clone();
                         changed.push(format!("channel={channel}"));
@@ -357,6 +363,11 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                         config.updates.pinned_version = pin;
                     }
                     let _ = config.save(&app.paths.config_file());
+                }
+                if security_watch.is_some() {
+                    // Read (or clear) it now rather than at the next tick.
+                    let app = Arc::clone(app);
+                    tokio::spawn(async move { super::workers::refresh_security(&app).await });
                 }
                 if let Some(mode) = mode {
                     app.runner().set_mode(mode);

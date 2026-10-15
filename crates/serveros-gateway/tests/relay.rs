@@ -240,6 +240,7 @@ fn hello() -> Hello {
         oldest_local_sample_ts: None,
         log_ip_masking: None,
         log_skip: None,
+        security_watch: None,
     }
 }
 
