@@ -1,0 +1,21 @@
+[package]
+name = "daemon-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The security audit: installed packages for vulnerability matching, websites, runtimes, and what shouldn't be on the machine. Read-only"
+
+[dependencies]
+daemon-core.workspace = true
+daemon-inventory.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+sha2.workspace = true
+base64.workspace = true
+libc.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

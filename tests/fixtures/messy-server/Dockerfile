@@ -25,4 +25,10 @@ RUN chmod +x /entrypoint.sh \
         -keyout /etc/letsencrypt/live/shop.example.com/privkey.pem \
         -out /etc/letsencrypt/live/shop.example.com/fullchain.pem 2>/dev/null
 
+# What the security audit must find: a server someone has already got into,
+# and the usual mistakes on one nobody has.
+COPY compromise.sh /compromise.sh
+COPY check_audit.py /check_audit.py
+RUN sh /compromise.sh
+
 ENTRYPOINT ["/entrypoint.sh"]

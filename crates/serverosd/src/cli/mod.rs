@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod doctor;
 pub mod enrol;
 pub mod inventory;

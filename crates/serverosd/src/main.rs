@@ -36,6 +36,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// What the security audit finds on this machine, without sending it.
+    Audit {
+        #[arg(long)]
+        json: bool,
+    },
     Doctor,
     Update {
         #[arg(long)]
@@ -69,6 +74,7 @@ fn main() {
         } => cli::enrol::run(paths, &token, &panel, dry_run),
         Command::Status { json } => cli::status::run(paths, json),
         Command::Inventory { json } => cli::inventory::run(json),
+        Command::Audit { json } => cli::audit::run(&paths, json),
         Command::Doctor => cli::doctor::run(paths),
         Command::Update { to, check } => cli::update::run(paths, to, check),
         Command::Disconnect { yes } => cli::uninstall::disconnect(paths, yes),

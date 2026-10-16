@@ -871,6 +871,39 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
+        Job::SecurityAudit => {
+            if !app
+                .config
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .security
+                .watch
+            {
+                return Err(Failure::new(
+                    "security_audit",
+                    "the security watch is off on this machine",
+                ));
+            }
+            let grant = authorize(Operation::Machine(MachineOp::SecurityAudit))?;
+            ctx.progress.phase("auditing", None).await;
+            let report = daemon_security::audit(daemon_security::Options {
+                apps_dir: Some(app.paths.state_dir.join("apps")),
+                ..daemon_security::Options::default()
+            })
+            .await;
+            grant.finish::<String>(
+                &Ok(()),
+                Some(format!(
+                    "{} packages, {} sites, {} suspicious",
+                    report.packages.len(),
+                    report.sites.len(),
+                    report.host.suspicious.len()
+                ))
+                .as_deref(),
+            );
+            Ok(serde_json::to_value(report).unwrap_or(Value::Null))
+        }
+
         Job::Snapshots { service } => {
             let managed = managed(&app, &service).await?;
             Ok(json!({"snapshots": app.snapshotter.list(&managed.name)}))

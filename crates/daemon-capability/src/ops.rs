@@ -22,6 +22,7 @@ pub enum MachineOp {
     ManageSshKeys { user: String },
     ReadJournal { unit: Option<String> },
     ReadNamedLog { path: PathBuf },
+    SecurityAudit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,7 @@ impl Operation {
                 MachineOp::ManageSshKeys { .. } => "ssh.keys",
                 MachineOp::ReadJournal { .. } => "journal.read",
                 MachineOp::ReadNamedLog { .. } => "log.read",
+                MachineOp::SecurityAudit => "security.audit",
             },
             Operation::Service(s) => match s {
                 ServiceOp::Start { .. } => "service.start",

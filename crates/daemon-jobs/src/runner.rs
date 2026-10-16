@@ -361,6 +361,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::DeployKey { .. } => "deploy_key",
         Job::Snapshots { .. } => "snapshots",
         Job::DiskUsage { .. } => "disk_usage",
+        Job::SecurityAudit => "security_audit",
         Job::ServiceClone { .. } => "service_clone",
     }
 }
@@ -378,6 +379,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::PackageUpdates { apply: false, .. }
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
+            | Job::SecurityAudit
     )
 }
 

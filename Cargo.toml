@@ -12,6 +12,7 @@ members = [
     "crates/daemon-transport",
     "crates/daemon-telemetry",
     "crates/daemon-inventory",
+    "crates/daemon-security",
     "crates/daemon-jobs",
     "crates/daemon-import",
     "crates/daemon-services",
@@ -45,6 +46,7 @@ daemon-identity = { path = "crates/daemon-identity" }
 daemon-transport = { path = "crates/daemon-transport" }
 daemon-telemetry = { path = "crates/daemon-telemetry" }
 daemon-inventory = { path = "crates/daemon-inventory" }
+daemon-security = { path = "crates/daemon-security" }
 daemon-jobs = { path = "crates/daemon-jobs" }
 daemon-import = { path = "crates/daemon-import" }
 daemon-services = { path = "crates/daemon-services" }

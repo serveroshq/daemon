@@ -488,6 +488,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemon-security"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "daemon-core",
+ "daemon-inventory",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "daemon-selfupdate"
 version = "0.1.0"
 dependencies = [
@@ -1587,6 +1604,7 @@ dependencies = [
  "daemon-inventory",
  "daemon-jobs",
  "daemon-protocol",
+ "daemon-security",
  "daemon-selfupdate",
  "daemon-services",
  "daemon-state",

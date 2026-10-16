@@ -632,6 +632,10 @@ pub enum Job {
         #[serde(default)]
         path: Option<String>,
     },
+    /// The security audit: installed packages, websites, runtimes, risky
+    /// settings and what shouldn't be on the machine. Read-only; refused
+    /// while the security watch is off.
+    SecurityAudit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]

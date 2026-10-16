@@ -20,6 +20,7 @@ daemon-identity.workspace = true
 daemon-transport.workspace = true
 daemon-telemetry.workspace = true
 daemon-inventory.workspace = true
+daemon-security.workspace = true
 daemon-import.workspace = true
 daemon-jobs.workspace = true
 daemon-services.workspace = true
