@@ -7,6 +7,7 @@ mod handler;
 mod local;
 mod log_shipper;
 mod machine;
+mod packages;
 mod service_ops;
 mod service_stats;
 mod workers;

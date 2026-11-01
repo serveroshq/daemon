@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 
 use super::app::App;
 use super::machine;
+use super::packages;
 
 pub struct JobHandler {
     pub app: Arc<App>,
@@ -976,7 +977,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             } else {
                 MachineOp::QueryPackageUpdates
             }))?;
-            let result = machine::package_updates(&ctx, apply, security_only).await;
+            let result = packages::package_updates(&ctx, apply, security_only).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result
@@ -998,7 +999,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Machine(MachineOp::ApplyPackageUpdates {
                 security_only: false,
             }))?;
-            let result = machine::install_packages(&ctx, &packages).await;
+            let result = packages::install_packages(&ctx, &packages).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 Some(format!("{} packages", packages.len())).as_deref(),
