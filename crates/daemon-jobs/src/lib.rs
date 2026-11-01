@@ -2,7 +2,7 @@ pub mod child;
 pub mod progress;
 pub mod runner;
 
-pub use child::{run_child, ChildOutcome};
+pub use child::{capture_child, run_child, Captured, ChildOutcome};
 pub use progress::Progress;
 pub use runner::{Handler, HandlerFuture, JobContext, Runner};
 
