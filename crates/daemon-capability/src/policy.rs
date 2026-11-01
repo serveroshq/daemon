@@ -217,6 +217,20 @@ mod tests {
     }
 
     #[test]
+    fn holding_packages_is_a_confirmed_change() {
+        let hold = Operation::Machine(MachineOp::HoldPackages {
+            hold: true,
+            packages: vec!["openssl".into(), "nginx".into()],
+        });
+        let checks = checks_for(&hold);
+
+        assert_eq!(hold.verb(), "packages.hold");
+        assert_eq!(hold.target(), "hold openssl,nginx");
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
         let remove = Operation::Service(ServiceOp::Remove {
             service: "docker:abc123def456".into(),

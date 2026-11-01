@@ -16,6 +16,7 @@ pub enum MachineOp {
     ListContainers,
     QueryPackageUpdates,
     ApplyPackageUpdates { security_only: bool },
+    HoldPackages { hold: bool, packages: Vec<String> },
     Reboot,
     ReadFirewall,
     WriteFirewall { rule: String },
@@ -79,6 +80,7 @@ impl Operation {
                 MachineOp::ListContainers => "machine.containers",
                 MachineOp::QueryPackageUpdates => "packages.query",
                 MachineOp::ApplyPackageUpdates { .. } => "packages.apply",
+                MachineOp::HoldPackages { .. } => "packages.hold",
                 MachineOp::Reboot => "machine.reboot",
                 MachineOp::ReadFirewall => "firewall.read",
                 MachineOp::WriteFirewall { .. } => "firewall.write",
@@ -137,6 +139,11 @@ impl Operation {
                 MachineOp::ApplyPackageUpdates {
                     security_only: false,
                 } => "all updates".into(),
+                MachineOp::HoldPackages { hold, packages } => format!(
+                    "{} {}",
+                    if *hold { "hold" } else { "unhold" },
+                    packages.join(",")
+                ),
                 MachineOp::WriteFirewall { rule } => rule.clone(),
                 MachineOp::ManageSshKeys { user } => user.clone(),
                 MachineOp::ReadJournal { unit } => unit.clone().unwrap_or_else(|| "system".into()),
@@ -192,6 +199,7 @@ impl Operation {
             Operation::Machine(m) => matches!(
                 m,
                 MachineOp::ApplyPackageUpdates { .. }
+                    | MachineOp::HoldPackages { .. }
                     | MachineOp::Reboot
                     | MachineOp::WriteFirewall { .. }
                     | MachineOp::ManageSshKeys { .. }
@@ -212,6 +220,7 @@ impl Operation {
         matches!(
             self,
             Operation::Machine(MachineOp::ApplyPackageUpdates { .. })
+                | Operation::Machine(MachineOp::HoldPackages { .. })
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })

@@ -1,8 +1,10 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
 use daemon_jobs::{capture_child, run_child, Captured, ChildOutcome, Failure, JobContext};
+use daemon_protocol::PackageVersion;
 use serde::Serialize;
 use tokio::sync::watch;
 
@@ -25,6 +27,16 @@ pub struct PackageReport {
     /// Packages held at their version (apt-mark hold, dnf/yum versionlock).
     pub held: Vec<String>,
     pub os: Option<OsRelease>,
+    /// After an install, the version of each named package now installed,
+    /// so the panel can check the target was reached. Empty for checks.
+    pub installed: Vec<PackageVersion>,
+}
+
+/// What `package_hold` leaves: every package held afterwards.
+#[derive(Debug, Serialize)]
+pub struct HoldReport {
+    pub manager: String,
+    pub held: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -290,10 +302,27 @@ pub async fn package_updates(
         packages,
         held: held(manager, &mut cancel).await,
         os: os_release(),
+        installed: Vec::new(),
     })
 }
 
 const MAX_INSTALL_PACKAGES: usize = 500;
+
+fn check_names(packages: &[String]) -> Result<(), Failure> {
+    if packages.is_empty() || packages.len() > MAX_INSTALL_PACKAGES {
+        return Err(Failure::new(
+            "packages",
+            format!("name between 1 and {MAX_INSTALL_PACKAGES} packages"),
+        ));
+    }
+    if let Some(bad) = packages.iter().find(|p| !valid_package_name(p)) {
+        return Err(Failure::new(
+            "packages",
+            format!("{bad:?} isn't a package name"),
+        ));
+    }
+    Ok(())
+}
 
 fn valid_package_name(name: &str) -> bool {
     !name.is_empty()
@@ -317,18 +346,7 @@ pub async fn install_packages(
             "no supported package manager (apt, dnf, yum) on this machine",
         )
     })?;
-    if packages.is_empty() || packages.len() > MAX_INSTALL_PACKAGES {
-        return Err(Failure::new(
-            "packages",
-            format!("name between 1 and {MAX_INSTALL_PACKAGES} packages"),
-        ));
-    }
-    if let Some(bad) = packages.iter().find(|p| !valid_package_name(p)) {
-        return Err(Failure::new(
-            "packages",
-            format!("{bad:?} isn't a package name"),
-        ));
-    }
+    check_names(packages)?;
 
     let mut cancel = ctx.cancel.clone();
     let progress = &ctx.progress;
@@ -397,7 +415,566 @@ pub async fn install_packages(
         packages: Vec::new(),
         held: held(manager, &mut cancel).await,
         os: os_release(),
+        installed: installed_versions(manager, packages, &mut cancel).await,
     })
+}
+
+const MAX_VERSION_LEN: usize = 128;
+
+/// A version as apt or dnf writes one: starts with a letter or digit (so it
+/// can't pass for an option), then only what versions are made of.
+fn valid_version(version: &str) -> bool {
+    !version.is_empty()
+        && version.len() <= MAX_VERSION_LEN
+        && version.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && version
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || ".+~:_-".contains(c))
+}
+
+fn check_versions(packages: &[PackageVersion]) -> Result<(), Failure> {
+    if packages.is_empty() || packages.len() > MAX_INSTALL_PACKAGES {
+        return Err(Failure::new(
+            "packages",
+            format!("name between 1 and {MAX_INSTALL_PACKAGES} packages"),
+        ));
+    }
+    for p in packages {
+        if !valid_package_name(&p.name) {
+            return Err(Failure::new(
+                "packages",
+                format!("{:?} isn't a package name", p.name),
+            ));
+        }
+        if !valid_version(&p.version) {
+            return Err(Failure::new(
+                "packages",
+                format!("{:?} isn't a version of {}", p.version, p.name),
+            ));
+        }
+    }
+    let mut seen = HashSet::new();
+    if let Some(twice) = packages.iter().find(|p| !seen.insert(p.name.as_str())) {
+        return Err(Failure::new(
+            "packages",
+            format!("{} is named more than once", twice.name),
+        ));
+    }
+    Ok(())
+}
+
+fn apt_install_versions_args(packages: &[PackageVersion], allow_downgrade: bool) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "install",
+        "-y",
+        "-q",
+        "-o",
+        "Dpkg::Options::=--force-confold",
+    ]
+    .map(String::from)
+    .to_vec();
+    if allow_downgrade {
+        args.push("--allow-downgrades".into());
+    }
+    args.extend(packages.iter().map(|p| format!("{}={}", p.name, p.version)));
+    args
+}
+
+/// `name-[epoch:]version-release`, the form dnf and yum take for one version.
+fn rpm_spec(package: &PackageVersion) -> String {
+    format!("{}-{}", package.name, package.version)
+}
+
+fn rpm_args(action: &str, packages: &[&PackageVersion]) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-y".into(), "-q".into(), action.into()];
+    args.extend(packages.iter().map(|p| rpm_spec(p)));
+    args
+}
+
+fn apt_mark_args(hold: bool, names: &[String]) -> Vec<String> {
+    let mut args = vec![if hold { "hold" } else { "unhold" }.to_string()];
+    args.extend(names.iter().cloned());
+    args
+}
+
+fn versionlock_args(hold: bool, names: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-q".into(),
+        "versionlock".into(),
+        if hold { "add" } else { "delete" }.into(),
+    ];
+    args.extend(names.iter().cloned());
+    args
+}
+
+async fn run_args(
+    ctx: &JobContext,
+    cancel: &mut watch::Receiver<bool>,
+    program: &str,
+    args: &[String],
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> ChildOutcome {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_child(
+        program,
+        &args,
+        None,
+        env,
+        timeout,
+        cancel,
+        &ctx.progress,
+        None,
+    )
+    .await
+}
+
+fn install_failed(manager: &str, outcome: ChildOutcome) -> Failure {
+    match outcome {
+        ChildOutcome::Cancelled { tail } => {
+            Failure::new("cancelled", "package install cancelled").with_output(tail)
+        }
+        other => Failure::new("apply", format!("{manager} install did not complete"))
+            .with_output(other.tail().to_vec())
+            .with_next_step(
+                "Check the output; a version the repositories no longer offer, or a held or broken package, usually needs a person.",
+            ),
+    }
+}
+
+/// Requested packages that are held now, as the hold list names them.
+fn held_among(held: &[String], names: &[&str]) -> Vec<String> {
+    held.iter()
+        .filter(|h| {
+            names.iter().any(|n| {
+                *n == h.as_str() || n.split(':').next() == Some(h.split(':').next().unwrap_or(h))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Installs exactly the versions asked for. Packages held now are let go for
+/// the install and held again afterwards, whether it worked or not.
+pub async fn install_versions(
+    ctx: &JobContext,
+    packages: &[PackageVersion],
+    allow_downgrade: bool,
+) -> Result<PackageReport, Failure> {
+    let manager = manager().ok_or_else(|| {
+        Failure::new(
+            "unsupported",
+            "no supported package manager (apt, dnf, yum) on this machine",
+        )
+    })?;
+    check_versions(packages)?;
+
+    let mut cancel = ctx.cancel.clone();
+    let names: Vec<String> = packages.iter().map(|p| p.name.clone()).collect();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let hold_secs = Duration::from_secs(120);
+
+    // dnf and yum install an older version when asked to by name, so what
+    // allow_downgrade forbids has to be worked out first.
+    let (upgrades, downgrades): (Vec<&PackageVersion>, Vec<&PackageVersion>) = if manager == "apt" {
+        (packages.iter().collect(), Vec::new())
+    } else {
+        let installed = rpm_installed_by_name(&names, &mut cancel).await?;
+        packages.iter().partition(|p| {
+            installed.get(&p.name).is_none_or(|versions| {
+                versions
+                    .iter()
+                    .any(|v| compare_evr(&p.version, v) != Ordering::Less)
+            })
+        })
+    };
+    if !downgrades.is_empty() && !allow_downgrade {
+        let listed: Vec<String> = downgrades.iter().map(|p| rpm_spec(p)).collect();
+        return Err(Failure::new(
+            "packages",
+            format!(
+                "{} would be a downgrade; allow downgrades to install it",
+                listed.join(", ")
+            ),
+        ));
+    }
+
+    let relock = match holds(manager, &mut cancel).await {
+        Some(held) => held_among(&held, &name_refs),
+        None => Vec::new(),
+    };
+
+    ctx.progress.phase("apply", Some(30)).await;
+
+    if !relock.is_empty() {
+        let (program, args) = if manager == "apt" {
+            ("apt-mark", apt_mark_args(false, &relock))
+        } else {
+            (manager, versionlock_args(false, &relock))
+        };
+        let outcome = run_args(ctx, &mut cancel, program, &args, APT_ENV, hold_secs).await;
+        if !outcome.success() {
+            return Err(Failure::new(
+                "hold",
+                format!("couldn't let go of {} for the install", relock.join(", ")),
+            )
+            .with_output(outcome.tail().to_vec()));
+        }
+    }
+
+    let mut result = Ok(());
+    if manager == "apt" {
+        let args = apt_install_versions_args(packages, allow_downgrade);
+        let outcome = run_args(ctx, &mut cancel, "apt-get", &args, APT_ENV, ctx.timeout).await;
+        if !outcome.success() {
+            result = Err(install_failed(manager, outcome));
+        }
+    } else {
+        for (action, list) in [("install", &upgrades), ("downgrade", &downgrades)] {
+            if list.is_empty() || result.is_err() {
+                continue;
+            }
+            let args = rpm_args(action, list);
+            let outcome = run_args(ctx, &mut cancel, manager, &args, &[], ctx.timeout).await;
+            if !outcome.success() {
+                result = Err(install_failed(manager, outcome));
+            }
+        }
+    }
+
+    if !relock.is_empty() {
+        let (program, args) = if manager == "apt" {
+            ("apt-mark", apt_mark_args(true, &relock))
+        } else {
+            (manager, versionlock_args(true, &relock))
+        };
+        // Held again even when the job was cancelled: a hold mustn't be lost.
+        let (_tx, mut uncancellable) = watch::channel(false);
+        let outcome = run_args(ctx, &mut uncancellable, program, &args, APT_ENV, hold_secs).await;
+        if !outcome.success() && result.is_ok() {
+            result = Err(Failure::new(
+                "hold",
+                format!("installed, but couldn't hold {} again", relock.join(", ")),
+            )
+            .with_output(outcome.tail().to_vec())
+            .with_next_step("Hold them again from the panel."));
+        }
+    }
+    result?;
+
+    Ok(PackageReport {
+        manager: manager.into(),
+        upgradable: Vec::new(),
+        security: Vec::new(),
+        reboot_required: reboot_required(manager, &mut cancel).await,
+        applied: true,
+        packages: Vec::new(),
+        held: held(manager, &mut cancel).await,
+        os: os_release(),
+        installed: installed_matching(manager, packages, &mut cancel).await,
+    })
+}
+
+/// Holds packages at the version installed, or lets them go.
+pub async fn hold_packages(
+    ctx: &JobContext,
+    packages: &[String],
+    hold: bool,
+) -> Result<HoldReport, Failure> {
+    let manager = manager().ok_or_else(|| {
+        Failure::new(
+            "unsupported",
+            "no supported package manager (apt, dnf, yum) on this machine",
+        )
+    })?;
+    check_names(packages)?;
+
+    let mut cancel = ctx.cancel.clone();
+    ctx.progress.phase("apply", Some(30)).await;
+
+    let (program, args) = if manager == "apt" {
+        ("apt-mark", apt_mark_args(hold, packages))
+    } else {
+        let Some(current) = holds(manager, &mut cancel).await else {
+            return Err(Failure::new(
+                "unsupported",
+                "Holding packages needs the versionlock plugin: install python3-dnf-plugin-versionlock",
+            )
+            .with_next_step(format!(
+                "{manager} install python3-dnf-plugin-versionlock (yum-plugin-versionlock on yum)"
+            )));
+        };
+        let names: Vec<String> = if hold {
+            packages.to_vec()
+        } else {
+            let refs: Vec<&str> = packages.iter().map(String::as_str).collect();
+            held_among(&current, &refs)
+        };
+        if names.is_empty() {
+            return Ok(HoldReport {
+                manager: manager.into(),
+                held: current,
+            });
+        }
+        (manager, versionlock_args(hold, &names))
+    };
+
+    let outcome = run_args(
+        ctx,
+        &mut cancel,
+        program,
+        &args,
+        APT_ENV,
+        Duration::from_secs(120),
+    )
+    .await;
+    if !outcome.success() {
+        let verb = if hold { "hold" } else { "unhold" };
+        return Err(Failure::new(
+            "hold",
+            format!("{program} couldn't {verb} {}", packages.join(", ")),
+        )
+        .with_output(outcome.tail().to_vec()));
+    }
+
+    Ok(HoldReport {
+        manager: manager.into(),
+        held: held(manager, &mut cancel).await,
+    })
+}
+
+const RPM_NAME_QUERY_FORMAT: &str = "%{NAME} %{EPOCH}:%{VERSION}-%{RELEASE}\\n";
+const DPKG_QUERY_FORMAT: &str =
+    "--showformat=${db:Status-Abbrev}\\t${binary:Package}\\t${Package}\\t${Version}\\n";
+
+/// Every installed version of each name (more than one for kernels).
+async fn rpm_installed_by_name(
+    names: &[String],
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<HashMap<String, Vec<String>>, Failure> {
+    let mut args = vec!["-q", "--qf", RPM_NAME_QUERY_FORMAT];
+    args.extend(names.iter().map(String::as_str));
+    let queried = list(cancel, "rpm", &args, &[], 120).await?;
+    Ok(parse_rpm_by_name(queried.stdout()))
+}
+
+fn parse_rpm_by_name(lines: &[String]) -> HashMap<String, Vec<String>> {
+    let mut installed: HashMap<String, Vec<String>> = HashMap::new();
+    for line in lines {
+        let mut words = line.split_whitespace();
+        let (Some(name), Some(version), None) = (words.next(), words.next(), words.next()) else {
+            continue;
+        };
+        if version.contains(':') {
+            installed
+                .entry(name.to_string())
+                .or_default()
+                .push(normalise_epoch(version));
+        }
+    }
+    installed
+}
+
+/// `dpkg-query` lines of [`DPKG_QUERY_FORMAT`], installed packages only,
+/// by both their `name:arch` and plain names.
+fn parse_dpkg_installed(lines: &[String]) -> HashMap<String, String> {
+    let mut installed = HashMap::new();
+    for line in lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [status, binary, name, version] = fields.as_slice() else {
+            continue;
+        };
+        if status.chars().nth(1) != Some('i') || version.is_empty() {
+            continue;
+        }
+        installed.insert(binary.to_string(), version.to_string());
+        installed.insert(name.to_string(), version.to_string());
+    }
+    installed
+}
+
+/// The version of each name installed now (the newest, when there's more
+/// than one), leaving out names that aren't installed.
+async fn installed_versions(
+    manager: &str,
+    names: &[String],
+    cancel: &mut watch::Receiver<bool>,
+) -> Vec<PackageVersion> {
+    let wanted: Vec<PackageVersion> = names
+        .iter()
+        .map(|n| PackageVersion {
+            name: n.clone(),
+            version: String::new(),
+        })
+        .collect();
+    installed_matching(manager, &wanted, cancel).await
+}
+
+/// The version of each package installed now; where several are (kernels),
+/// the one asked for if it's among them, else the newest.
+async fn installed_matching(
+    manager: &str,
+    wanted: &[PackageVersion],
+    cancel: &mut watch::Receiver<bool>,
+) -> Vec<PackageVersion> {
+    let names: Vec<String> = wanted.iter().map(|p| p.name.clone()).collect();
+
+    if manager == "apt" {
+        let mut args = vec!["-W", DPKG_QUERY_FORMAT];
+        args.extend(names.iter().map(String::as_str));
+        let Ok(queried) = list(cancel, "dpkg-query", &args, &[], 60).await else {
+            return Vec::new();
+        };
+        let installed = parse_dpkg_installed(queried.stdout());
+        return wanted
+            .iter()
+            .filter_map(|p| {
+                let version = installed.get(&p.name)?;
+                Some(PackageVersion {
+                    name: p.name.clone(),
+                    version: version.clone(),
+                })
+            })
+            .collect();
+    }
+
+    let Ok(installed) = rpm_installed_by_name(&names, cancel).await else {
+        return Vec::new();
+    };
+    wanted
+        .iter()
+        .filter_map(|p| {
+            let versions = installed.get(&p.name)?;
+            let target = normalise_epoch(&p.version);
+            let version = versions
+                .iter()
+                .find(|v| **v == target)
+                .or_else(|| versions.iter().max_by(|a, b| compare_evr(a, b)))?;
+            Some(PackageVersion {
+                name: p.name.clone(),
+                version: version.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `[epoch:]version[-release]` compared the way rpm does.
+fn compare_evr(a: &str, b: &str) -> Ordering {
+    fn split(evr: &str) -> (u64, &str, &str) {
+        let (epoch, rest) = match evr.split_once(':') {
+            Some((e, rest)) if e.chars().all(|c| c.is_ascii_digit()) => {
+                (e.parse().unwrap_or(0), rest)
+            }
+            _ => (0, evr),
+        };
+        match rest.rsplit_once('-') {
+            Some((version, release)) => (epoch, version, release),
+            None => (epoch, rest, ""),
+        }
+    }
+    let (ea, va, ra) = split(a);
+    let (eb, vb, rb) = split(b);
+
+    ea.cmp(&eb)
+        .then_with(|| rpmvercmp(va, vb))
+        .then_with(|| rpmvercmp(ra, rb))
+}
+
+/// rpm's `rpmvercmp`: runs of digits compare as numbers, runs of letters as
+/// strings, digits beat letters, `~` sorts before anything (even the end)
+/// and `^` after the end but before anything else.
+fn rpmvercmp(a: &str, b: &str) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    let separator = |c: &u8| !c.is_ascii_alphanumeric() && *c != b'~' && *c != b'^';
+
+    loop {
+        while a.first().is_some_and(separator) {
+            a = &a[1..];
+        }
+        while b.first().is_some_and(separator) {
+            b = &b[1..];
+        }
+
+        if a.first() == Some(&b'~') || b.first() == Some(&b'~') {
+            if a.first() != Some(&b'~') {
+                return Ordering::Greater;
+            }
+            if b.first() != Some(&b'~') {
+                return Ordering::Less;
+            }
+            a = &a[1..];
+            b = &b[1..];
+            continue;
+        }
+
+        if a.first() == Some(&b'^') || b.first() == Some(&b'^') {
+            if a.is_empty() {
+                return Ordering::Less;
+            }
+            if b.is_empty() {
+                return Ordering::Greater;
+            }
+            if a.first() != Some(&b'^') {
+                return Ordering::Greater;
+            }
+            if b.first() != Some(&b'^') {
+                return Ordering::Less;
+            }
+            a = &a[1..];
+            b = &b[1..];
+            continue;
+        }
+
+        if a.is_empty() || b.is_empty() {
+            break;
+        }
+
+        let numeric = a[0].is_ascii_digit();
+        let run = |s: &[u8]| -> usize {
+            s.iter()
+                .take_while(|c| {
+                    if numeric {
+                        c.is_ascii_digit()
+                    } else {
+                        c.is_ascii_alphabetic()
+                    }
+                })
+                .count()
+        };
+        let (la, lb) = (run(a), run(b));
+        let (sa, sb) = (&a[..la], &b[..lb]);
+
+        if sb.is_empty() {
+            // Different kinds of run: a number is newer than letters.
+            return if numeric {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            };
+        }
+
+        let order = if numeric {
+            let trim = |s: &[u8]| -> usize { s.iter().take_while(|c| **c == b'0').count() };
+            let (na, nb) = (&sa[trim(sa)..], &sb[trim(sb)..]);
+            na.len().cmp(&nb.len()).then_with(|| na.cmp(nb))
+        } else {
+            sa.cmp(sb)
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+        a = &a[la..];
+        b = &b[lb..];
+    }
+
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Less,
+        _ => Ordering::Greater,
+    }
 }
 
 /// A reboot is wanted: Debian and Ubuntu leave a file; on RPM systems
@@ -450,6 +1027,12 @@ fn needs_restarting_says_reboot<'a>(
 /// Packages held at their version. Empty when nothing is, or on dnf/yum
 /// without the versionlock plugin.
 async fn held(manager: &str, cancel: &mut watch::Receiver<bool>) -> Vec<String> {
+    holds(manager, cancel).await.unwrap_or_default()
+}
+
+/// The hold list, or None where packages can't be held (dnf/yum without the
+/// versionlock plugin, which is how `versionlock list` failing reads).
+async fn holds(manager: &str, cancel: &mut watch::Receiver<bool>) -> Option<Vec<String>> {
     let captured = if manager == "apt" {
         list(cancel, "apt-mark", &["showhold"], APT_ENV, 60).await
     } else {
@@ -457,14 +1040,12 @@ async fn held(manager: &str, cancel: &mut watch::Receiver<bool>) -> Vec<String> 
     };
 
     match captured {
-        Ok(captured) if captured.code() == Some(0) => {
-            if manager == "apt" {
-                parse_showhold(captured.stdout())
-            } else {
-                parse_versionlock(captured.stdout())
-            }
-        }
-        _ => Vec::new(),
+        Ok(captured) if captured.code() == Some(0) => Some(if manager == "apt" {
+            parse_showhold(captured.stdout())
+        } else {
+            parse_versionlock(captured.stdout())
+        }),
+        _ => None,
     }
 }
 
@@ -716,6 +1297,183 @@ mod tests {
         for bad in ["", "-y", "--reinstall", "a b", "pkg;rm", "$(x)", "../x"] {
             assert!(!valid_package_name(bad), "{bad:?} was accepted");
         }
+    }
+
+    fn pv(name: &str, version: &str) -> PackageVersion {
+        PackageVersion {
+            name: name.into(),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn versions_cant_pass_for_options_or_shell() {
+        for ok in [
+            "3.0.13-0ubuntu3.5",
+            "1:3.0.7-28.el9_4",
+            "2.39-0ubuntu8.3",
+            "1.2~rc1-1",
+            "5.14.0-427.el9",
+            "1:1.12.0-1+deb12u3",
+        ] {
+            assert!(valid_version(ok), "{ok} was refused");
+        }
+        let long = "1".repeat(129);
+        for bad in [
+            "",
+            "--foo",
+            "-1.2",
+            "x;rm",
+            "1.2 3",
+            "1.2\n3",
+            "$(id)",
+            "1.2`id`",
+            "1.2|sh",
+            "1.2>x",
+            "../1",
+            "1/2",
+            long.as_str(),
+        ] {
+            assert!(!valid_version(bad), "{bad:?} was accepted");
+        }
+        assert!(valid_version(&"1".repeat(128)));
+
+        assert!(check_versions(&[pv("openssl", "3.0.13-0ubuntu3.5")]).is_ok());
+        assert!(check_versions(&[]).is_err());
+        assert!(check_versions(&[pv("--reinstall", "1.0")]).is_err());
+        assert!(check_versions(&[pv("openssl", "--allow-unauthenticated")]).is_err());
+        assert!(check_versions(&[pv("openssl", "1.0"), pv("openssl", "1.1")]).is_err());
+        let many: Vec<PackageVersion> = (0..501).map(|i| pv(&format!("p{i}"), "1.0")).collect();
+        assert!(check_versions(&many).is_err());
+        assert!(check_versions(&many[..500]).is_ok());
+    }
+
+    #[test]
+    fn apt_installs_name_equals_version_as_separate_arguments() {
+        let packages = [
+            pv("openssl", "3.0.13-0ubuntu3.4"),
+            pv("libc6:amd64", "2.39-0ubuntu8.3"),
+        ];
+        assert_eq!(
+            apt_install_versions_args(&packages, false),
+            vec![
+                "install",
+                "-y",
+                "-q",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+                "openssl=3.0.13-0ubuntu3.4",
+                "libc6:amd64=2.39-0ubuntu8.3",
+            ]
+        );
+        assert_eq!(
+            apt_install_versions_args(&packages[..1], true),
+            vec![
+                "install",
+                "-y",
+                "-q",
+                "-o",
+                "Dpkg::Options::=--force-confold",
+                "--allow-downgrades",
+                "openssl=3.0.13-0ubuntu3.4",
+            ]
+        );
+    }
+
+    #[test]
+    fn dnf_installs_and_downgrades_name_dash_version_with_epochs() {
+        let openssl = pv("openssl", "1:3.0.7-28.el9");
+        let tzdata = pv("tzdata", "2024a-1.el9");
+
+        assert_eq!(rpm_spec(&openssl), "openssl-1:3.0.7-28.el9");
+        assert_eq!(
+            rpm_args("install", &[&openssl, &tzdata]),
+            vec![
+                "-y",
+                "-q",
+                "install",
+                "openssl-1:3.0.7-28.el9",
+                "tzdata-2024a-1.el9"
+            ]
+        );
+        assert_eq!(
+            rpm_args("downgrade", &[&tzdata]),
+            vec!["-y", "-q", "downgrade", "tzdata-2024a-1.el9"]
+        );
+    }
+
+    #[test]
+    fn holds_are_set_with_apt_mark_or_versionlock() {
+        let names = vec!["nginx".to_string(), "openssl".to_string()];
+        assert_eq!(
+            apt_mark_args(true, &names),
+            vec!["hold", "nginx", "openssl"]
+        );
+        assert_eq!(
+            apt_mark_args(false, &names),
+            vec!["unhold", "nginx", "openssl"]
+        );
+        assert_eq!(
+            versionlock_args(true, &names),
+            vec!["-q", "versionlock", "add", "nginx", "openssl"]
+        );
+        assert_eq!(
+            versionlock_args(false, &names),
+            vec!["-q", "versionlock", "delete", "nginx", "openssl"]
+        );
+
+        let held = vec!["libc6:amd64".to_string(), "nginx".to_string()];
+        assert_eq!(held_among(&held, &["nginx", "curl"]), vec!["nginx"]);
+        assert_eq!(held_among(&held, &["libc6"]), vec!["libc6:amd64"]);
+        assert!(held_among(&held, &["nginx-common"]).is_empty());
+    }
+
+    #[test]
+    fn rpm_versions_compare_like_rpm() {
+        use std::cmp::Ordering::*;
+        for (a, b, want) in [
+            ("1.0", "1.0", Equal),
+            ("1.0", "2.0", Less),
+            ("2.0.1", "2.0", Greater),
+            ("1.10", "1.9", Greater),
+            ("1.010", "1.10", Equal),
+            ("1.0a", "1.0", Greater),
+            ("1.0~rc1", "1.0", Less),
+            ("1.0~rc1", "1.0~rc2", Less),
+            ("1.0^git1", "1.0", Greater),
+            ("1.0^git1", "1.0.1", Less),
+            ("1.a", "1.1", Less),
+            ("el9_4", "el9", Greater),
+        ] {
+            assert_eq!(rpmvercmp(a, b), want, "{a} vs {b}");
+        }
+        assert_eq!(compare_evr("1:3.0.7-27.el9", "3.0.8-1.el9"), Greater);
+        assert_eq!(compare_evr("3.0.7-27.el9", "0:3.0.7-28.el9"), Less);
+        assert_eq!(compare_evr("3.0.7-28.el9_4", "3.0.7-28.el9"), Greater);
+        assert_eq!(compare_evr("0:1.2-3", "1.2-3"), Equal);
+    }
+
+    #[test]
+    fn installed_versions_parse_from_dpkg_and_rpm() {
+        let dpkg = parse_dpkg_installed(&lines(
+            "ii \topenssl\topenssl\t3.0.13-0ubuntu3.4\n\
+             hi \tlibc6:amd64\tlibc6\t2.39-0ubuntu8.3\n\
+             rc \told-thing\told-thing\t1.0-1",
+        ));
+        assert_eq!(dpkg["openssl"], "3.0.13-0ubuntu3.4");
+        assert_eq!(dpkg["libc6"], "2.39-0ubuntu8.3");
+        assert_eq!(dpkg["libc6:amd64"], "2.39-0ubuntu8.3");
+        assert!(
+            !dpkg.contains_key("old-thing"),
+            "config files only isn't installed"
+        );
+
+        let rpm = parse_rpm_by_name(&lines(
+            "openssl 1:3.0.7-28.el9\nkernel (none):5.14.0-362.el9\nkernel (none):5.14.0-427.el9\npackage nope is not installed",
+        ));
+        assert_eq!(rpm["openssl"], vec!["1:3.0.7-28.el9"]);
+        assert_eq!(rpm["kernel"], vec!["5.14.0-362.el9", "5.14.0-427.el9"]);
+        assert!(!rpm.contains_key("package"));
     }
 
     #[test]

@@ -623,6 +623,21 @@ pub enum Job {
     PackageInstall {
         packages: Vec<String>,
     },
+    /// Install exactly these versions, for machines that should match each
+    /// other or a version tested elsewhere. A job of its own rather than a
+    /// field on `PackageInstall`, so a daemon that predates it drops the job
+    /// instead of installing the latest versions. Held packages stay held.
+    PackageInstallVersions {
+        packages: Vec<PackageVersion>,
+        #[serde(default)]
+        allow_downgrade: bool,
+    },
+    /// Hold packages at the version installed (apt-mark, or dnf/yum
+    /// versionlock), or let them go again.
+    PackageHold {
+        packages: Vec<String>,
+        hold: bool,
+    },
     Reboot,
     FirewallRule {
         action: FirewallAction,
@@ -690,6 +705,15 @@ pub enum Job {
         #[serde(default)]
         path: Option<String>,
     },
+}
+
+/// A package at a version, as the package manager writes it: Debian
+/// versions as dpkg has them (`1:2.3-4ubuntu1`), RPM ones as
+/// `[epoch:]version-release` (`1:3.0.7-28.el9`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PackageVersion {
+    pub name: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1025,6 +1049,34 @@ mod tests {
 
         assert_eq!(json["type"], "service_action");
         assert_eq!(json["action"], "reload");
+    }
+
+    #[test]
+    fn package_version_jobs_have_their_own_types() {
+        let raw = serde_json::json!({
+            "type": "package_install_versions",
+            "packages": [{"name": "openssl", "version": "1:3.0.7-28.el9"}],
+            "allow_downgrade": true,
+        });
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::PackageInstallVersions {
+                packages: vec![PackageVersion {
+                    name: "openssl".into(),
+                    version: "1:3.0.7-28.el9".into(),
+                }],
+                allow_downgrade: true,
+            }
+        );
+
+        let raw = serde_json::json!({"type": "package_hold", "packages": ["nginx"], "hold": true});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::PackageHold {
+                packages: vec!["nginx".into()],
+                hold: true,
+            }
+        );
     }
 
     #[test]

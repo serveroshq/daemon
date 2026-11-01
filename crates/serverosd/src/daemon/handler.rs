@@ -1007,6 +1007,43 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
+        Job::PackageInstallVersions {
+            packages: versions,
+            allow_downgrade,
+        } => {
+            let grant = authorize(Operation::Machine(MachineOp::ApplyPackageUpdates {
+                security_only: false,
+            }))?;
+            let result = packages::install_versions(&ctx, &versions, allow_downgrade).await;
+            let note = versions
+                .iter()
+                .map(|p| format!("{}={}", p.name, p.version))
+                .collect::<Vec<_>>()
+                .join(" ");
+            grant.finish(&result.as_ref().map(|_| ()), Some(note.as_str()));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::PackageHold {
+            packages: names,
+            hold,
+        } => {
+            let grant = authorize(Operation::Machine(MachineOp::HoldPackages {
+                hold,
+                packages: names.clone(),
+            }))?;
+            let result = packages::hold_packages(&ctx, &names, hold).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("{} held", r.held.len()))
+                    .as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
         Job::Reboot => {
             let grant = authorize(Operation::Machine(MachineOp::Reboot))?;
             machine::reboot_soon();

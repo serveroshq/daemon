@@ -348,6 +348,8 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Restore { .. } => "restore",
         Job::PackageUpdates { .. } => "package_updates",
         Job::PackageInstall { .. } => "package_install",
+        Job::PackageInstallVersions { .. } => "package_install_versions",
+        Job::PackageHold { .. } => "package_hold",
         Job::Reboot => "reboot",
         Job::FirewallRule { .. } => "firewall_rule",
         Job::SshKey { .. } => "ssh_key",
