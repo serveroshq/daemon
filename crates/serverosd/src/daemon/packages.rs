@@ -542,13 +542,37 @@ fn install_failed(manager: &str, outcome: ChildOutcome) -> Failure {
     }
 }
 
-/// Requested packages that are held now, as the hold list names them.
-fn held_among(held: &[String], names: &[&str]) -> Vec<String> {
+/// A held package: its name, and the entry that holds it, which is what
+/// letting it go takes (yum's `versionlock delete` matches whole entries like
+/// `0:nginx-1.20.1-1.el7.*`, not names). For apt they're the same.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Hold {
+    name: String,
+    entry: String,
+}
+
+fn hold_names(holds: &[Hold]) -> Vec<String> {
+    holds
+        .iter()
+        .map(|h| h.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn hold_entries(holds: &[Hold]) -> Vec<String> {
+    holds.iter().map(|h| h.entry.clone()).collect()
+}
+
+/// The holds on any of these packages (`libc6` and `libc6:amd64` are the
+/// same package).
+fn held_among(held: &[Hold], names: &[&str]) -> Vec<Hold> {
+    let base = |n: &str| n.split(':').next().unwrap_or(n).to_string();
     held.iter()
         .filter(|h| {
-            names.iter().any(|n| {
-                *n == h.as_str() || n.split(':').next() == Some(h.split(':').next().unwrap_or(h))
-            })
+            names
+                .iter()
+                .any(|n| *n == h.name || base(n) == base(&h.name))
         })
         .cloned()
         .collect()
@@ -606,24 +630,32 @@ pub async fn install_versions(
 
     ctx.progress.phase("apply", Some(30)).await;
 
+    let relock_names = hold_names(&relock);
+    let mut result = Ok(());
+
     if !relock.is_empty() {
         let (program, args) = if manager == "apt" {
-            ("apt-mark", apt_mark_args(false, &relock))
+            ("apt-mark", apt_mark_args(false, &hold_entries(&relock)))
         } else {
-            (manager, versionlock_args(false, &relock))
+            (manager, versionlock_args(false, &hold_entries(&relock)))
         };
         let outcome = run_args(ctx, &mut cancel, program, &args, APT_ENV, hold_secs).await;
         if !outcome.success() {
-            return Err(Failure::new(
+            // Some may have been let go; they're held again below.
+            result = Err(Failure::new(
                 "hold",
-                format!("couldn't let go of {} for the install", relock.join(", ")),
+                format!(
+                    "couldn't let go of {} for the install",
+                    relock_names.join(", ")
+                ),
             )
             .with_output(outcome.tail().to_vec()));
         }
     }
 
-    let mut result = Ok(());
-    if manager == "apt" {
+    if result.is_err() {
+        // Not installing what's still held.
+    } else if manager == "apt" {
         let args = apt_install_versions_args(packages, allow_downgrade);
         let outcome = run_args(ctx, &mut cancel, "apt-get", &args, APT_ENV, ctx.timeout).await;
         if !outcome.success() {
@@ -644,9 +676,9 @@ pub async fn install_versions(
 
     if !relock.is_empty() {
         let (program, args) = if manager == "apt" {
-            ("apt-mark", apt_mark_args(true, &relock))
+            ("apt-mark", apt_mark_args(true, &relock_names))
         } else {
-            (manager, versionlock_args(true, &relock))
+            (manager, versionlock_args(true, &relock_names))
         };
         // Held again even when the job was cancelled: a hold mustn't be lost.
         let (_tx, mut uncancellable) = watch::channel(false);
@@ -654,7 +686,10 @@ pub async fn install_versions(
         if !outcome.success() && result.is_ok() {
             result = Err(Failure::new(
                 "hold",
-                format!("installed, but couldn't hold {} again", relock.join(", ")),
+                format!(
+                    "installed, but couldn't hold {} again",
+                    relock_names.join(", ")
+                ),
             )
             .with_output(outcome.tail().to_vec())
             .with_next_step("Hold them again from the panel."));
@@ -704,19 +739,19 @@ pub async fn hold_packages(
                 "{manager} install python3-dnf-plugin-versionlock (yum-plugin-versionlock on yum)"
             )));
         };
-        let names: Vec<String> = if hold {
+        let args: Vec<String> = if hold {
             packages.to_vec()
         } else {
             let refs: Vec<&str> = packages.iter().map(String::as_str).collect();
-            held_among(&current, &refs)
+            hold_entries(&held_among(&current, &refs))
         };
-        if names.is_empty() {
+        if args.is_empty() {
             return Ok(HoldReport {
                 manager: manager.into(),
-                held: current,
+                held: hold_names(&current),
             });
         }
-        (manager, versionlock_args(hold, &names))
+        (manager, versionlock_args(hold, &args))
     };
 
     let outcome = run_args(
@@ -1027,12 +1062,12 @@ fn needs_restarting_says_reboot<'a>(
 /// Packages held at their version. Empty when nothing is, or on dnf/yum
 /// without the versionlock plugin.
 async fn held(manager: &str, cancel: &mut watch::Receiver<bool>) -> Vec<String> {
-    holds(manager, cancel).await.unwrap_or_default()
+    hold_names(&holds(manager, cancel).await.unwrap_or_default())
 }
 
 /// The hold list, or None where packages can't be held (dnf/yum without the
 /// versionlock plugin, which is how `versionlock list` failing reads).
-async fn holds(manager: &str, cancel: &mut watch::Receiver<bool>) -> Option<Vec<String>> {
+async fn holds(manager: &str, cancel: &mut watch::Receiver<bool>) -> Option<Vec<Hold>> {
     let captured = if manager == "apt" {
         list(cancel, "apt-mark", &["showhold"], APT_ENV, 60).await
     } else {
@@ -1042,6 +1077,12 @@ async fn holds(manager: &str, cancel: &mut watch::Receiver<bool>) -> Option<Vec<
     match captured {
         Ok(captured) if captured.code() == Some(0) => Some(if manager == "apt" {
             parse_showhold(captured.stdout())
+                .into_iter()
+                .map(|name| Hold {
+                    entry: name.clone(),
+                    name,
+                })
+                .collect()
         } else {
             parse_versionlock(captured.stdout())
         }),
@@ -1205,8 +1246,8 @@ fn parse_showhold(lines: &[String]) -> Vec<String> {
 /// Package names from `versionlock list`: dnf writes `name-[epoch:]ver-rel.*`,
 /// yum `epoch:name-ver-rel.*`, dnf5 `Package name: name`. Excludes (`!`)
 /// aren't holds.
-fn parse_versionlock(lines: &[String]) -> Vec<String> {
-    let mut names = BTreeSet::new();
+fn parse_versionlock(lines: &[String]) -> Vec<Hold> {
+    let mut holds = BTreeSet::new();
 
     for line in lines {
         let line = line.trim();
@@ -1216,15 +1257,18 @@ fn parse_versionlock(lines: &[String]) -> Vec<String> {
         if let Some(name) = line.strip_prefix("Package name:") {
             let name = name.trim();
             if valid_package_name(name) {
-                names.insert(name.to_string());
+                holds.insert(Hold {
+                    name: name.to_string(),
+                    entry: name.to_string(),
+                });
             }
             continue;
         }
 
-        let Some(entry) = line.split_whitespace().next() else {
+        let Some(whole) = line.split_whitespace().next() else {
             continue;
         };
-        let entry = entry.strip_suffix(".*").unwrap_or(entry);
+        let entry = whole.strip_suffix(".*").unwrap_or(whole);
         let entry = match entry.split_once(':') {
             Some((epoch, rest))
                 if !epoch.is_empty() && epoch.chars().all(|c| c.is_ascii_digit()) =>
@@ -1239,12 +1283,15 @@ fn parse_versionlock(lines: &[String]) -> Vec<String> {
         let Some((name, _version)) = rest.rsplit_once('-') else {
             continue;
         };
-        if valid_package_name(name) {
-            names.insert(name.to_string());
+        if valid_package_name(name) && !whole.starts_with('-') {
+            holds.insert(Hold {
+                name: name.to_string(),
+                entry: whole.to_string(),
+            });
         }
     }
 
-    names.into_iter().collect()
+    holds.into_iter().collect()
 }
 
 fn parse_os_release(text: &str) -> OsRelease {
@@ -1422,9 +1469,21 @@ mod tests {
             vec!["-q", "versionlock", "delete", "nginx", "openssl"]
         );
 
-        let held = vec!["libc6:amd64".to_string(), "nginx".to_string()];
-        assert_eq!(held_among(&held, &["nginx", "curl"]), vec!["nginx"]);
-        assert_eq!(held_among(&held, &["libc6"]), vec!["libc6:amd64"]);
+        let held: Vec<Hold> = ["libc6:amd64", "nginx"]
+            .iter()
+            .map(|n| Hold {
+                name: n.to_string(),
+                entry: n.to_string(),
+            })
+            .collect();
+        assert_eq!(
+            hold_names(&held_among(&held, &["nginx", "curl"])),
+            vec!["nginx"]
+        );
+        assert_eq!(
+            hold_names(&held_among(&held, &["libc6"])),
+            vec!["libc6:amd64"]
+        );
         assert!(held_among(&held, &["nginx-common"]).is_empty());
     }
 
@@ -1606,18 +1665,28 @@ FEDORA-2024-1a2b3c security Moderate python3.12-3.12.1-4.fc40.noarch 2024-05-01 
             vec!["linux-image-generic", "nginx"]
         );
 
-        assert_eq!(
-            parse_versionlock(&lines(
-                "\
+        let locks = parse_versionlock(&lines(
+            "\
 Last metadata expiration check: 0:10:01 ago on Fri 01 Nov 2026.
 openssl-1:3.0.7-28.el9_4.*
 kernel-0:5.14.0-427.el9.*
 0:httpd-2.4.6-99.el7.*
 !tzdata-0:2024a-1.el9.*
 # Added by 'versionlock add' command on 2026-11-01
-Package name: nginx"
-            )),
+Package name: nginx",
+        ));
+        assert_eq!(
+            hold_names(&locks),
             vec!["httpd", "kernel", "nginx", "openssl"]
+        );
+        // Letting go passes the entries, which yum's delete matches whole.
+        assert_eq!(
+            hold_entries(&held_among(&locks, &["httpd", "openssl", "nginx"])),
+            vec![
+                "0:httpd-2.4.6-99.el7.*",
+                "nginx",
+                "openssl-1:3.0.7-28.el9_4.*"
+            ]
         );
     }
 
