@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use daemon_deploy::container::APP_LABEL;
 use daemon_jobs::{run_child, ChildOutcome, Failure, JobContext};
 use daemon_protocol::{AdoptedCapability, DeploySpec, ServiceOrigin};
 use daemon_services::{ManagedService, Registry, RunBy};
@@ -122,6 +123,21 @@ pub async fn remove(
             Ok(json!({ "removed": containers.len(), "volumes_deleted": volumes.len() }))
         }
         RunBy::Docker { container } => {
+            // A release of an app ServerOS deployed keeps its data in the
+            // app's named volumes, which `rm -v` leaves: find them first.
+            let app_volumes = if delete_data {
+                let format = format!("{{{{index .Config.Labels \"{APP_LABEL}\"}}}}");
+                match docker(&["inspect", "--format", &format, container]).await {
+                    Ok(app) if !app.trim().is_empty() => {
+                        let label = format!("label={APP_LABEL}={}", app.trim());
+                        docker_lines(&["volume", "ls", "-q", "--filter", &label]).await
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+
             let mut args = vec!["rm", "-f"];
             if delete_data {
                 args.push("-v");
@@ -131,7 +147,25 @@ pub async fn remove(
             let _ = registry.remove(&service.key);
             progress.line(format!("removed {container}")).await;
 
-            Ok(json!({ "removed": 1, "volumes_deleted": usize::from(delete_data) }))
+            let mut deleted = usize::from(delete_data);
+            for volume in &app_volumes {
+                match docker(&["volume", "rm", volume]).await {
+                    Ok(_) => {
+                        deleted += 1;
+                        progress.line(format!("deleted volume {volume}")).await;
+                    }
+                    Err(failure) => {
+                        progress
+                            .line(format!(
+                                "kept volume {volume}: {} (an older release still uses it)",
+                                failure.message
+                            ))
+                            .await;
+                    }
+                }
+            }
+
+            Ok(json!({ "removed": 1, "volumes_deleted": deleted }))
         }
         _ => Err(Failure::new(
             "remove",

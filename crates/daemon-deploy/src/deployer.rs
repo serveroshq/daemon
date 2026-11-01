@@ -246,13 +246,35 @@ impl Deployer {
         let name = container::container_name(service, commit);
         let host_port = releases::port_for(commit);
         let container_port = spec.port.unwrap_or(80);
+
+        // Folders the Dockerfile declares with VOLUME are the app's data:
+        // each is a volume every release mounts, so a deploy never starts
+        // it over empty. Read the previous release's before it can go.
+        let previous_volumes = match previous {
+            Some(prev) => container::container_volumes(&prev.container).await,
+            None => Default::default(),
+        };
+        let volumes = container::plan_volumes(
+            service,
+            &container::image_volumes(&tag).await?,
+            &previous_volumes,
+        );
+        for (volume, path) in &volumes {
+            container::ensure_volume(volume, service).await?;
+            progress
+                .line(format!("{path} is kept in volume {volume} between deploys"))
+                .await;
+        }
+
         container::remove(&name, progress).await;
         container::run(
             &name,
             &tag,
+            service,
             host_port,
             container_port,
             env_file.as_deref(),
+            &volumes,
             Duration::from_secs(120),
             cancel,
             progress,
