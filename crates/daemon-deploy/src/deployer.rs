@@ -309,7 +309,7 @@ impl Deployer {
             .promote(service, release, RETAINED_RELEASES)
             .map_err(|e| Failure::new("record", e.to_string()))?;
 
-        if let Some(prev) = previous {
+        if let Some(prev) = to_drain(previous, &name) {
             progress.phase("drain", Some(95)).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
             if let Err(e) =
@@ -424,6 +424,13 @@ impl Deployer {
     }
 }
 
+/// The release to stop once the new one is live: the one before it, unless
+/// it was the same commit deployed again, whose container the new one has
+/// already replaced (same name), so stopping it would take the app down.
+fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Release> {
+    previous.filter(|prev| prev.container != container)
+}
+
 const MAX_JOB_FILES: usize = 64;
 const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 
@@ -525,6 +532,27 @@ mod tests {
         let mut big = std::collections::BTreeMap::new();
         big.insert("big".to_string(), "x".repeat(MAX_JOB_FILE_BYTES + 1));
         assert!(write_files(dir.path(), &big).is_err());
+    }
+
+    #[test]
+    fn redeploying_the_live_commit_does_not_stop_it() {
+        let release = |container: &str| Release {
+            commit: "a".repeat(40),
+            image: "serveros/shop:aaaaaaaaaaaa".into(),
+            container: container.into(),
+            port: 20000,
+            deployed_at: 0,
+            status: "live".into(),
+        };
+        let same = release("serveros-shop-aaaaaaaaaaaa");
+        let older = release("serveros-shop-bbbbbbbbbbbb");
+
+        assert!(to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa").is_none());
+        assert_eq!(
+            to_drain(Some(&older), "serveros-shop-aaaaaaaaaaaa").map(|r| r.container.as_str()),
+            Some("serveros-shop-bbbbbbbbbbbb")
+        );
+        assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
     }
 
     #[test]
