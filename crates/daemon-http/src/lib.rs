@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -204,26 +205,13 @@ impl Client {
                     host: host.clone(),
                     source,
                 })?;
-            let mut last_err = None;
-            let mut tcp = None;
-
-            for addr in addrs {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        tcp = Some(stream);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-
-            let tcp = tcp.ok_or_else(|| HttpError::Connect {
-                host: host.clone(),
-                port,
-                source: last_err.unwrap_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses")
-                }),
-            })?;
+            let tcp = connect_any(addrs.collect())
+                .await
+                .map_err(|source| HttpError::Connect {
+                    host: host.clone(),
+                    port,
+                    source,
+                })?;
 
             let server_name =
                 ServerName::try_from(host.clone()).map_err(|_| HttpError::Url(url.into()))?;
@@ -296,6 +284,59 @@ impl Client {
             .await
             .map_err(|_| HttpError::Timeout(host_of(url)))?
     }
+}
+
+/// How long one address gets before the next is tried alongside it.
+const NEXT_ATTEMPT_AFTER: Duration = Duration::from_millis(250);
+
+/// Connects to whichever address answers first, IPv6 and IPv4 taken in
+/// turn and each new attempt started 250ms after the last (Happy
+/// Eyeballs, RFC 8305). serveros.com is behind Cloudflare, which has IPv6
+/// addresses; on a machine whose IPv6 looks set up but goes nowhere, one
+/// attempt at a time hung on the first address until the request timed
+/// out, while curl on the same machine was fine.
+async fn connect_any(addrs: Vec<SocketAddr>) -> std::io::Result<TcpStream> {
+    let mut queue = interleave(addrs).into_iter().peekable();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut last_err = None;
+
+    loop {
+        if let Some(addr) = queue.next() {
+            attempts.spawn(TcpStream::connect(addr));
+        }
+        if attempts.is_empty() {
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses")
+            }));
+        }
+        let more = queue.peek().is_some();
+
+        tokio::select! {
+            Some(done) = attempts.join_next() => match done {
+                // Dropping the set stops the attempts still going.
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(e) => last_err = Some(std::io::Error::other(e)),
+            },
+            _ = tokio::time::sleep(NEXT_ATTEMPT_AFTER), if more => {}
+        }
+    }
+}
+
+/// The addresses with the families alternating, starting with the one
+/// the resolver put first.
+fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut lead, mut other): (Vec<_>, Vec<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(lead.len() + other.len());
+    lead.reverse();
+    other.reverse();
+    while !lead.is_empty() || !other.is_empty() {
+        out.extend(lead.pop());
+        out.extend(other.pop());
+    }
+    out
 }
 
 fn host_of(url: &str) -> String {
@@ -390,6 +431,42 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternates_address_families() {
+        let a: Vec<SocketAddr> = [
+            "[2606::1]:443",
+            "[2606::2]:443",
+            "1.1.1.1:443",
+            "2.2.2.2:443",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let got: Vec<String> = interleave(a).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            got,
+            [
+                "[2606::1]:443",
+                "1.1.1.1:443",
+                "[2606::2]:443",
+                "2.2.2.2:443"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_never_answers_does_not_hold_up_the_next() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = listener.local_addr().unwrap();
+        // TEST-NET-1 and a documentation IPv6 address: nothing answers.
+        let dead: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let blackhole: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let started = std::time::Instant::now();
+        let stream = connect_any(vec![dead, blackhole, good]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn knows_when_a_response_is_whole() {
