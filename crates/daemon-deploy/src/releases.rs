@@ -9,6 +9,15 @@ pub struct Release {
     pub port: u16,
     pub deployed_at: i64,
     pub status: String,
+    /// False for apps that don't answer HTTP, like chat bots and workers:
+    /// a rollback then checks the container keeps running instead of
+    /// asking it for a page. Releases recorded before this was kept did.
+    #[serde(default = "answers_http")]
+    pub http: bool,
+}
+
+fn answers_http() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -124,6 +133,7 @@ mod tests {
             port: port_for(commit),
             deployed_at: 0,
             status: "live".into(),
+            http: true,
         }
     }
 

@@ -213,6 +213,7 @@ impl Deployer {
                 port: spec.port.unwrap_or(0),
                 deployed_at: daemon_state::State::now(),
                 status: "live".into(),
+                http: spec.health.is_some(),
             };
             ReleaseLedger::new(&self.state)
                 .promote(service, release.clone(), RETAINED_RELEASES)
@@ -282,7 +283,7 @@ impl Deployer {
         .await?;
 
         progress.phase("health", Some(70)).await;
-        health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
+        Self::check(&name, host_port, spec.health.as_ref(), progress).await?;
 
         if !spec.domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
@@ -294,7 +295,7 @@ impl Deployer {
         }
 
         progress.phase("verify", Some(90)).await;
-        health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
+        Self::check(&name, host_port, spec.health.as_ref(), progress).await?;
 
         let ledger = ReleaseLedger::new(&self.state);
         let release = Release {
@@ -304,6 +305,7 @@ impl Deployer {
             port: host_port,
             deployed_at: daemon_state::State::now(),
             status: "live".into(),
+            http: spec.health.is_some(),
         };
         let evicted = ledger
             .promote(service, release, RETAINED_RELEASES)
@@ -339,6 +341,21 @@ impl Deployer {
             previous: previous.map(|p| p.commit.clone()),
             restart_note: None,
         })
+    }
+
+    /// A release that answers HTTP is asked for its health page. One that
+    /// doesn't, like a chat bot or a worker, passes if its container is
+    /// still running a few seconds after starting.
+    async fn check(
+        container: &str,
+        port: u16,
+        health: Option<&daemon_protocol::HealthCheck>,
+        progress: &daemon_jobs::Progress,
+    ) -> Result<(), Failure> {
+        match health {
+            Some(check) => health::wait_healthy(port, Some(check), progress).await,
+            None => health::wait_running(container, progress).await,
+        }
     }
 
     pub async fn rollback(
@@ -387,7 +404,11 @@ impl Deployer {
         .await?;
 
         progress.phase("health", Some(60)).await;
-        health::wait_healthy(release.port, None, progress).await?;
+        if release.http {
+            health::wait_healthy(release.port, None, progress).await?;
+        } else {
+            health::wait_running(&release.container, progress).await?;
+        }
 
         if !domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
@@ -543,6 +564,7 @@ mod tests {
             port: 20000,
             deployed_at: 0,
             status: "live".into(),
+            http: true,
         };
         let same = release("serveros-shop-aaaaaaaaaaaa");
         let older = release("serveros-shop-bbbbbbbbbbbb");

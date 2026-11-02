@@ -49,6 +49,34 @@ pub async fn wait_healthy(
     )
 }
 
+/// For apps that don't answer HTTP: the container has to still be running,
+/// without restarting, a few seconds after it started. A bot with a bad
+/// token or a missing dependency exits straight away, and that fails here.
+pub async fn wait_running(container: &str, log: &daemon_jobs::Progress) -> Result<(), Failure> {
+    let mut first_restarts = None;
+    for attempt in 1..=3u32 {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let (status, restarts) = crate::container::state(container).await.map_err(|e| {
+            Failure::new(
+                "health",
+                format!("couldn't read the container's state: {e}"),
+            )
+        })?;
+        let first = *first_restarts.get_or_insert(restarts);
+        if status != "running" || restarts != first {
+            return Err(Failure::new(
+                "health",
+                format!("the app stopped after starting (container is {status}, restarted {restarts} times)"),
+            )
+            .with_next_step("Check the service's logs for the error, often a missing token or setting."));
+        }
+        log.line(format!("still running after check {attempt}/3"))
+            .await;
+    }
+    log.line("no web page to check, the app kept running").await;
+    Ok(())
+}
+
 async fn probe(port: u16, check: &HealthCheck) -> Result<(), String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await

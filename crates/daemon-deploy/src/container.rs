@@ -88,6 +88,27 @@ async fn docker_output(args: &[&str]) -> Result<String, String> {
     }
 }
 
+/// A container's status ("running", "restarting", "exited"…) and how many
+/// times Docker has restarted it.
+pub async fn state(name: &str) -> Result<(String, u64), String> {
+    let out = docker_output(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{.State.Status}} {{.RestartCount}}",
+        name,
+    ])
+    .await?;
+    parse_state(&out).ok_or_else(|| format!("unexpected docker output: {}", out.trim()))
+}
+
+fn parse_state(out: &str) -> Option<(String, u64)> {
+    let mut parts = out.split_whitespace();
+    let status = parts.next()?.to_string();
+    let restarts = parts.next()?.parse().ok()?;
+    Some((status, restarts))
+}
+
 /// The folders an image declares with VOLUME.
 pub async fn image_volumes(tag: &str) -> Result<Vec<String>, Failure> {
     let out = docker_output(&[
@@ -447,6 +468,13 @@ fn which(program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_container_state() {
+        assert_eq!(parse_state("running 0\n"), Some(("running".into(), 0)));
+        assert_eq!(parse_state("restarting 4"), Some(("restarting".into(), 4)));
+        assert_eq!(parse_state(""), None);
+    }
 
     #[test]
     fn names_are_derived_from_service_and_commit() {
