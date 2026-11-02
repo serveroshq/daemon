@@ -156,6 +156,15 @@ impl Client {
         self.request("POST", url, &all, Some(&bytes)).await
     }
 
+    pub async fn post(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Response, HttpError> {
+        self.request("POST", url, headers, Some(body)).await
+    }
+
     pub async fn put(
         &self,
         url: &str,
@@ -252,7 +261,19 @@ impl Client {
             let mut chunk = [0u8; 16 * 1024];
 
             loop {
-                let n = tls.read(&mut chunk).await?;
+                let n = match tls.read(&mut chunk).await {
+                    Ok(n) => n,
+                    // Some servers (Sentry's ingest among them) close without
+                    // a TLS close_notify. That's fine once the whole response
+                    // is here; anything shorter is still an error.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof
+                            && response_complete(&raw) =>
+                    {
+                        0
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 if n == 0 {
                     break;
@@ -282,6 +303,31 @@ fn host_of(url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| url.into())
+}
+
+/// Whether `raw` holds a whole response: headers, then exactly the body
+/// its Content-Length or chunked encoding promised.
+fn response_complete(raw: &[u8]) -> bool {
+    let mut header_buf = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut header_buf);
+    let Ok(httparse::Status::Complete(header_len)) = parsed.parse(raw) else {
+        return false;
+    };
+    let body = &raw[header_len..];
+
+    for header in parsed.headers.iter() {
+        let value = String::from_utf8_lossy(header.value);
+        if header.name.eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().ok() == Some(body.len());
+        }
+        if header.name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return dechunk(body).is_some();
+        }
+    }
+
+    false
 }
 
 fn parse_response(raw: &[u8], host: &str) -> Result<Response, HttpError> {
@@ -344,6 +390,24 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knows_when_a_response_is_whole() {
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+        ));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n{}"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+        ));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}"
+        ));
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\n\r\nbody"));
+        assert!(!response_complete(b"HTTP/1.1 200"));
+    }
 
     #[test]
     fn parses_a_plain_response() {

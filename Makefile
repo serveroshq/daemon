@@ -12,6 +12,8 @@ PUBKEY  ?=
 
 PANEL_URL ?=
 DOCS_URL ?=
+# Error reports go here; unset (the default) builds a binary that sends none.
+SENTRY_DSN ?=
 
 export SERVEROS_VERSION=$(VERSION)
 export SERVEROS_COMMIT=$(COMMIT)
@@ -25,6 +27,9 @@ export SERVEROS_PANEL_URL=$(PANEL_URL)
 endif
 ifneq ($(DOCS_URL),)
 export SERVEROS_DOCS_URL=$(DOCS_URL)
+endif
+ifneq ($(SENTRY_DSN),)
+export SERVEROS_SENTRY_DSN=$(SENTRY_DSN)
 endif
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl

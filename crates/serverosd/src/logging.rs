@@ -57,10 +57,15 @@ pub fn init(log_path: &Path, also_stderr: bool) -> anyhow::Result<()> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
+    // Error events and warnings go to error reports too, when they're on.
+    let reports =
+        daemon_core::error_reports::is_on().then(daemon_core::error_reports::tracing_layer);
+
     if also_stderr {
         tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(reports)
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_target(false)
@@ -71,6 +76,7 @@ pub fn init(log_path: &Path, also_stderr: bool) -> anyhow::Result<()> {
         tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(reports)
             .init();
     }
 

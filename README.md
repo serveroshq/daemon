@@ -42,7 +42,7 @@ the Docker socket.
 
 | Crate | What it owns |
 | --- | --- |
-| `daemon-core` | Paths, `daemon.toml`, build info, secret redaction |
+| `daemon-core` | Paths, `daemon.toml`, build info, secret redaction, error reports |
 | `daemon-protocol` | The versioned wire protocol; one driver per major |
 | `daemon-audit` | `actions.log` |
 | `daemon-capability` | The privileged operation set and the broker that gates it |
@@ -123,6 +123,31 @@ firewall = "ufw"     # ufw | nftables | iptables | none
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.
+
+## Error reports
+
+When the daemon crashes or logs an error, it sends a short report to
+ServerOS (we use Sentry) so we can find and fix the bug. Reports are
+scrubbed on the machine before they go: no hostname, IP addresses, users or
+request data, and anything that looks like a token, key, password or env
+value is replaced with `[redacted]`. No file contents are ever attached.
+Each report carries the daemon's version and the machine id the panel gave
+it at enrolment, nothing else that identifies the box.
+
+Only our release builds report; a build from source sends nothing unless
+you give it an address. To turn reports off, either:
+
+```toml
+[error_reports]
+enabled = false
+```
+
+in `/etc/serveros/daemon.toml`, or `SERVEROS_ERROR_REPORTS=0` in the
+service's environment (`systemctl edit serverosd`). Off means the reporting
+code is never started. To send reports to your own Sentry instead, set
+`dsn = "https://..."` in the same section, or `SERVEROS_SENTRY_DSN`.
+`serverosd debug sentry-test` sends one test report and tells you whether
+it arrived. The gateway follows the same two environment variables.
 
 ## Fixtures
 

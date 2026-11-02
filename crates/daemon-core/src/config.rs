@@ -53,6 +53,37 @@ pub struct Config {
     /// it off still loads on an older daemon.
     #[serde(default, skip_serializing_if = "SecurityConfig::is_default")]
     pub security: SecurityConfig,
+    /// Crash and error reports to ServerOS. Only written when changed from
+    /// the default, for the same reason as `security`.
+    #[serde(default, skip_serializing_if = "ErrorReportsConfig::is_default")]
+    pub error_reports: ErrorReportsConfig,
+}
+
+/// Crash and error reports: when the daemon panics or logs an error, a
+/// scrubbed report goes to ServerOS so we can fix it. `enabled = false`
+/// (or `SERVEROS_ERROR_REPORTS=0`) turns them off completely; `dsn` points
+/// them somewhere else instead of the address built into the release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ErrorReportsConfig {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<String>,
+}
+
+impl Default for ErrorReportsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dsn: None,
+        }
+    }
+}
+
+impl ErrorReportsConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// The security watch: SSH settings, failed sign-ins and automatic
@@ -279,6 +310,7 @@ impl Config {
             limits: LimitsConfig::default(),
             integrations: IntegrationsConfig::default(),
             security: SecurityConfig::default(),
+            error_reports: ErrorReportsConfig::default(),
         }
     }
 
@@ -399,6 +431,25 @@ mod tests {
         });
         config.save(&path).unwrap();
 
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn error_reports_are_on_by_default_and_only_written_when_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+        let mut config = Config::new("api.serveros.com", "mch_123");
+        assert!(config.error_reports.enabled);
+        config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("error_reports"));
+
+        config.error_reports.enabled = false;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[error_reports]"));
+        assert!(!text.contains("dsn"));
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 

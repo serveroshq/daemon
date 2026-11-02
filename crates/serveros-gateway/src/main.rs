@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use clap::Parser;
+use daemon_core::error_reports;
 use serveros_gateway::config::Args;
 use serveros_gateway::panel::PanelClient;
 use serveros_gateway::registry::Registry;
@@ -8,16 +9,29 @@ use serveros_gateway::{run_listeners, tls, Context};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::info;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Error reports: the DSN comes from the build or SERVEROS_SENTRY_DSN,
+    // and SERVEROS_ERROR_REPORTS=0 turns them off. No config file here.
+    let _reports = error_reports::init(
+        "serveros-gateway",
+        env!("CARGO_PKG_VERSION"),
+        &error_reports::decide(&error_reports::FileSettings::default()),
+        &[],
+    );
+
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with(tracing_subscriber::fmt::layer())
+        .with(error_reports::is_on().then(error_reports::tracing_layer))
         .init();
 
     let settings = args.load()?;

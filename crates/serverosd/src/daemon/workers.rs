@@ -254,6 +254,7 @@ async fn self_health(app: Arc<App>) {
                 })
                 .await;
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                daemon_core::error_reports::flush(Duration::from_secs(2));
                 std::process::exit(EXIT_RESTART);
             }
         }
@@ -326,6 +327,7 @@ async fn updates(app: Arc<App>) {
                     "restarting into the new release"
                 );
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                daemon_core::error_reports::flush(Duration::from_secs(2));
                 std::process::exit(EXIT_RESTART);
             }
             Err(e) => {

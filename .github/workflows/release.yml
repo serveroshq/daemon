@@ -6,6 +6,8 @@
 #
 # Secrets: SERVEROS_RELEASE_KEY (hex private key from `serveros-release keygen`),
 #          SERVEROS_DEPLOY_TOKEN (the panel's SERVEROS_DEPLOY_TOKEN, to register releases).
+#          SERVEROS_SENTRY_DSN (repository secret, not the release environment's:
+#          the build job bakes it in for error reports; unset means none).
 # Variables: SERVEROS_RELEASE_PUBKEY (the matching public key, baked into the binary),
 #            SERVEROS_PANEL_URL (e.g. https://serveros.com; skipped when unset).
 
@@ -15,7 +17,9 @@ on:
   push:
     tags: ["v*"]
 
-# Only the publish job gets to write, and only it sees the secrets.
+# Only the publish job gets to write, and only it sees the signing key and
+# deploy token. The build job sees just the Sentry DSN, which ships inside
+# the binary anyway.
 permissions:
   contents: read
 
@@ -55,6 +59,7 @@ jobs:
           SERVEROS_CHANNEL: ${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}
           SERVEROS_TARGET: linux-${{ matrix.arch }}
           SERVEROS_RELEASE_PUBKEY: ${{ vars.SERVEROS_RELEASE_PUBKEY }}
+          SERVEROS_SENTRY_DSN: ${{ secrets.SERVEROS_SENTRY_DSN }}
       - name: Stage
         run: |
           mkdir -p dist

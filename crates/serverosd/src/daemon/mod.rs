@@ -50,6 +50,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         }
         BootDecision::RolledBack { from, to } => {
             error!(from, to, "new release failed to start repeatedly; the previous binary was restored and will start now");
+            daemon_core::error_reports::flush(Duration::from_secs(2));
             std::process::exit(EXIT_RESTART);
         }
     };
