@@ -143,8 +143,11 @@ enabled = false
 ```
 
 in `/etc/serveros/daemon.toml`, or `SERVEROS_ERROR_REPORTS=0` in the
-service's environment (`systemctl edit serverosd`). Off means the reporting
-code is never started. To send reports to your own Sentry instead, set
+service's environment (`systemctl edit serverosd`). You can also switch
+them on or off for a machine from its machine policy in the panel. That
+writes the same `enabled` setting and takes effect straight away, no
+restart. `SERVEROS_ERROR_REPORTS=0` always wins: with it set, the reporting
+code is never started and the panel can't turn it back on. To send reports to your own Sentry instead, set
 `dsn = "https://..."` in the same section, or `SERVEROS_SENTRY_DSN`.
 `serverosd debug sentry-test` sends one test report and tells you whether
 it arrived. The gateway follows the same two environment variables.

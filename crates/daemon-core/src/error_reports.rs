@@ -5,8 +5,12 @@
 //!   so only our release builds report. `[error_reports] dsn` in
 //!   `daemon.toml` or the `SERVEROS_SENTRY_DSN` environment variable points
 //!   them somewhere else.
-//! - `[error_reports] enabled = false` or `SERVEROS_ERROR_REPORTS=0` turns
-//!   them off: Sentry is then never started at all.
+//! - `SERVEROS_ERROR_REPORTS=0` turns them off for good: Sentry is then
+//!   never started at all, whatever the panel says.
+//! - `[error_reports] enabled` is the machine's policy, which the panel can
+//!   switch without a restart. The daemon starts Sentry whenever reports
+//!   could go and keeps a gate ([`switch`]) that drops every event and
+//!   breadcrumb while they're off, so nothing is sent.
 //! - Panics and `error!` events are reported; warnings ride along as
 //!   breadcrumbs. Everything is scrubbed before it leaves the machine: no
 //!   hostname, user or request data, secrets and env values redacted, IP
@@ -17,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -63,6 +67,21 @@ pub struct FileSettings {
 }
 
 impl FileSettings {
+    /// The same settings with reports switched on: where they would go
+    /// if the panel turned them on.
+    pub fn switched_on(&self) -> Self {
+        let mut on = self.clone();
+        let mut reports = on.reports.take().unwrap_or_default();
+        reports.enabled = true;
+        on.reports = Some(reports);
+        on
+    }
+
+    /// Whether `daemon.toml` has reports on (they are unless it says not).
+    pub fn enabled(&self) -> bool {
+        !self.unreadable && self.reports.as_ref().is_none_or(|r| r.enabled)
+    }
+
     pub fn read(path: &Path) -> Self {
         let raw = match std::fs::read_to_string(path) {
             Ok(raw) => raw,
@@ -117,13 +136,8 @@ fn decide_with(
     file: &FileSettings,
     built_in: Option<&str>,
 ) -> Decision {
-    if let Some(value) = switch {
-        if matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ) {
-            return Decision::TurnedOff("SERVEROS_ERROR_REPORTS is off");
-        }
+    if vetoed(switch) {
+        return Decision::TurnedOff("SERVEROS_ERROR_REPORTS is off");
     }
     if file.unreadable {
         return Decision::TurnedOff("daemon.toml could not be read");
@@ -142,6 +156,39 @@ fn decide_with(
             dsn: dsn.to_string(),
         });
     found.unwrap_or(Decision::NoDsn)
+}
+
+/// Whether `SERVEROS_ERROR_REPORTS` (given as `value`) turns reports off.
+fn vetoed(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+/// Whether a client was started in this process.
+static STARTED: AtomicBool = AtomicBool::new(false);
+/// Whether reports may leave right now. Checked before anything is queued.
+static SENDING: AtomicBool = AtomicBool::new(false);
+
+/// Turns reports on or off now, without a restart, as the panel's machine
+/// policy says. Returns whether they're going out afterwards: never when
+/// `SERVEROS_ERROR_REPORTS=0` (a local veto the panel can't override) or
+/// when no client could be started (no address).
+pub fn switch(enabled: bool) -> bool {
+    let open = gate_open(
+        vetoed(std::env::var(ENV_SWITCH).ok().as_deref()),
+        enabled,
+        STARTED.load(Ordering::SeqCst),
+    );
+    SENDING.store(open, Ordering::SeqCst);
+    open
+}
+
+fn gate_open(vetoed: bool, enabled: bool, started: bool) -> bool {
+    !vetoed && enabled && started
 }
 
 /// Keeps reports flowing while it lives; dropping it sends what's queued.
@@ -172,12 +219,16 @@ pub fn init(program: &str, version: &str, decision: &Decision, tags: &[(&str, &s
     options.max_breadcrumbs = 30;
     options.user_agent = format!("{program}/{version}").into();
     options.before_send = Some(Arc::new(|event| {
-        if !within_budget(&event) {
+        if !SENDING.load(Ordering::SeqCst) || !within_budget(&event) {
             return None;
         }
         Some(scrub_event(event))
     }));
-    options.before_breadcrumb = Some(Arc::new(|crumb| Some(scrub_breadcrumb(crumb, None))));
+    options.before_breadcrumb = Some(Arc::new(|crumb| {
+        SENDING
+            .load(Ordering::SeqCst)
+            .then(|| scrub_breadcrumb(crumb, None))
+    }));
     options.transport = Some(Arc::new(HttpTransportFactory));
 
     let guard = sentry::init(options);
@@ -187,7 +238,28 @@ pub fn init(program: &str, version: &str, decision: &Decision, tags: &[(&str, &s
         }
     });
 
+    STARTED.store(true, Ordering::SeqCst);
+    SENDING.store(true, Ordering::SeqCst);
+
     Guard(Some(guard))
+}
+
+/// Like [`init`], for the daemon, whose reports the panel can switch later.
+/// The client starts whenever reports could go (an address, a readable
+/// `daemon.toml` and no `SERVEROS_ERROR_REPORTS=0`), even while
+/// `daemon.toml` has them off; the gate then decides what leaves. It has to
+/// start up front: Sentry copies the client into each thread's hub the
+/// first time that thread touches it, so one started later would never
+/// reach the threads already running.
+pub fn init_switchable(
+    program: &str,
+    version: &str,
+    file: &FileSettings,
+    tags: &[(&str, &str)],
+) -> Guard {
+    let guard = init(program, version, &decide(&file.switched_on()), tags);
+    switch(file.enabled());
+    guard
 }
 
 pub fn environment() -> &'static str {
@@ -606,6 +678,56 @@ mod tests {
             decide_with(Some("1"), Some(""), &file(None), None),
             Decision::NoDsn
         );
+    }
+
+    #[test]
+    fn the_gate_needs_no_veto_the_policy_and_a_client() {
+        assert!(gate_open(false, true, true));
+        // The panel turned them off.
+        assert!(!gate_open(false, false, true));
+        // SERVEROS_ERROR_REPORTS=0 beats the panel turning them on.
+        assert!(!gate_open(true, true, true));
+        // No address, so no client to send with.
+        assert!(!gate_open(false, true, false));
+
+        assert!(vetoed(Some(" Off ")));
+        assert!(vetoed(Some("0")));
+        assert!(!vetoed(Some("1")));
+        assert!(!vetoed(None));
+    }
+
+    #[test]
+    fn a_client_starts_on_standby_when_only_the_policy_is_off() {
+        let off = file(Some(ErrorReportsConfig {
+            enabled: false,
+            dsn: Some("https://cfg@x/2".into()),
+        }));
+        assert!(!off.enabled());
+        assert!(matches!(
+            decide_with(None, None, &off, Some(DSN)),
+            Decision::TurnedOff(_)
+        ));
+        // Started anyway, with its address kept, so the panel can open the gate.
+        assert_eq!(
+            decide_with(None, None, &off.switched_on(), Some(DSN)),
+            Decision::On {
+                dsn: "https://cfg@x/2".into()
+            }
+        );
+        assert!(file(None).enabled());
+        assert!(file(None).switched_on().enabled());
+
+        // The local veto and an unreadable file still keep it from starting.
+        assert!(matches!(
+            decide_with(Some("0"), None, &off.switched_on(), Some(DSN)),
+            Decision::TurnedOff(_)
+        ));
+        let unreadable = FileSettings::unreadable();
+        assert!(!unreadable.enabled());
+        assert!(matches!(
+            decide_with(None, None, &unreadable.switched_on(), Some(DSN)),
+            Decision::TurnedOff(_)
+        ));
     }
 
     #[test]

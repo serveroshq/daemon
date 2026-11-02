@@ -52,6 +52,12 @@ pub fn apply(config: &mut Config, settings: MachineSettings) -> Vec<String> {
         config.updates.automatic = automatic;
         changed.push(format!("updates_automatic={automatic}"));
     }
+    if let Some(on) = settings.error_reports {
+        config.error_reports.enabled = on;
+        // Takes effect now; a local SERVEROS_ERROR_REPORTS=0 still wins.
+        daemon_core::error_reports::switch(on);
+        changed.push(format!("error_reports={on}"));
+    }
     if let Some(channel) = settings.updates_channel {
         // Anything else would stop the config saving at all.
         if matches!(channel.as_str(), "stable" | "canary") {
@@ -151,6 +157,37 @@ mod tests {
         assert!(!c.logs.enabled);
         assert!(!c.updates.automatic);
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn error_reports_are_switched_and_saved_to_daemon_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+        let mut c = config();
+
+        let off: MachineSettings = serde_json::from_str(r#"{"error_reports":false}"#).unwrap();
+        let notes = apply(&mut c, off);
+        assert_eq!(notes, vec!["error_reports=false".to_string()]);
+        assert!(!c.error_reports.enabled);
+        assert!(c.validate().is_ok());
+
+        c.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[error_reports]"), "{text}");
+        assert!(!Config::load(&path).unwrap().error_reports.enabled);
+        let file = daemon_core::error_reports::FileSettings::read(&path);
+        assert!(!file.reports.unwrap().enabled);
+
+        let notes = apply(
+            &mut c,
+            MachineSettings {
+                error_reports: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(notes, vec!["error_reports=true".to_string()]);
+        c.save(&path).unwrap();
+        assert!(Config::load(&path).unwrap().error_reports.enabled);
     }
 
     #[test]

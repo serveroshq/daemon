@@ -37,6 +37,11 @@ pub struct Hello {
     /// Missing from daemons that can't be told.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_automatic: Option<bool>,
+    /// Whether crash and error reports are on in `daemon.toml`. Missing
+    /// from daemons that can't be told. A local `SERVEROS_ERROR_REPORTS=0`
+    /// still keeps them off whatever this says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reports: Option<bool>,
     /// The version it stays on; null when it doesn't. Always sent (even as
     /// null), so a panel can tell "no pin" from a daemon that can't say:
     /// those leave it out.
@@ -63,6 +68,9 @@ pub struct MachineSettings {
     pub security_watch: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_automatic: Option<bool>,
+    /// Crash and error reports to ServerOS, switched without a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_reports: Option<bool>,
     /// "stable" or "canary".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_channel: Option<String>,
@@ -1155,6 +1163,7 @@ mod tests {
             mode: None,
             settings: MachineSettings {
                 logs: Some(false),
+                error_reports: Some(false),
                 pinned_version: Some(None),
                 ..Default::default()
             },
@@ -1162,6 +1171,11 @@ mod tests {
         let json = serde_json::to_string(&control).unwrap();
 
         assert_eq!(serde_json::from_str::<Control>(&json).unwrap(), control);
+        assert!(json.contains(r#""error_reports":false"#), "{json}");
+
+        // Left out when not set, so older daemons see nothing new.
+        let quiet = serde_json::to_string(&MachineSettings::default()).unwrap();
+        assert!(!quiet.contains("error_reports"), "{quiet}");
     }
 
     #[test]

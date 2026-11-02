@@ -82,6 +82,9 @@ fn hello(app: &App) -> Hello {
         discovery: Some(config.discovery.enabled),
         logs: Some(config.logs.enabled),
         updates_automatic: Some(config.updates.automatic),
+        // What daemon.toml says, even when SERVEROS_ERROR_REPORTS=0 keeps
+        // reports off locally: the panel shows the policy it set.
+        error_reports: Some(config.error_reports.enabled),
         pinned_version: Some(config.updates.pinned_version.clone()),
     }
 }

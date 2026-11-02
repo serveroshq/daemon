@@ -78,7 +78,10 @@ fn main() {
     let decision = error_reports::decide(&file);
     let tags = error_reports::daemon_tags(file.machine_id.as_deref());
     let tags: Vec<(&str, &str)> = tags.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let reports = error_reports::init("serverosd", BuildInfo::current().version, &decision, &tags);
+    // Started even when daemon.toml has reports off, so the panel can
+    // switch them on later; nothing leaves until then.
+    let reports =
+        error_reports::init_switchable("serverosd", BuildInfo::current().version, &file, &tags);
     let is_run = matches!(cli.command, Command::Run);
 
     let result = match cli.command {
