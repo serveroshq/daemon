@@ -66,7 +66,8 @@ impl Runner {
     }
 
     pub async fn submit(&self, id: Uuid, command: Command) {
-        let payload = serde_json::to_string(&command.job).unwrap_or_default();
+        let secrets = self.handler.known_secrets(&command.job);
+        let payload = recorded_payload(&command.job, &secrets);
         let actor = format!("{:?} {}", command.actor.kind, command.actor.name).to_lowercase();
         let kind = job_kind(&command.job);
 
@@ -135,12 +136,7 @@ impl Runner {
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, cancel_tx);
 
-        let progress = Progress::new(
-            id,
-            Arc::clone(&self.state),
-            self.updates.clone(),
-            self.handler.known_secrets(&command.job),
-        );
+        let progress = Progress::new(id, Arc::clone(&self.state), self.updates.clone(), secrets);
         let ctx = JobContext {
             id,
             command,
@@ -279,6 +275,31 @@ impl Runner {
 
         count
     }
+}
+
+/// The job as state.db keeps it: a setting, token or password the handler
+/// knows of is replaced wherever it is a whole value, and scrubbed from
+/// longer text as the log is, so it never rests on disk.
+fn recorded_payload(job: &Job, secrets: &[String]) -> String {
+    fn scrub(value: &mut serde_json::Value, secrets: &[&str]) {
+        match value {
+            serde_json::Value::String(s) => {
+                *s = if !s.is_empty() && secrets.contains(&s.as_str()) {
+                    daemon_core::redact::REDACTED.to_string()
+                } else {
+                    daemon_core::redact::redact_known(s, secrets)
+                };
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| scrub(v, secrets)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| scrub(v, secrets)),
+            _ => {}
+        }
+    }
+
+    let mut value = serde_json::to_value(job).unwrap_or_default();
+    let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    scrub(&mut value, &secrets);
+    value.to_string()
 }
 
 async fn finish(
@@ -551,5 +572,32 @@ mod tests {
         assert_eq!(update.state, JobState::Failed);
         assert!(update.error.unwrap().message.contains("restarted"));
         assert_eq!(state.job(id).unwrap().unwrap().status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn recorded_jobs_keep_no_secrets() {
+        let job = Job::ServiceExec {
+            service: "docker:abc".into(),
+            command: "pg_dump -h \"$SOURCE_HOST\" > /tmp/x".into(),
+            timeout_secs: Some(3600),
+            env: [
+                ("SOURCE_PASSWORD", "pa\"ss\\word-with-quotes"),
+                ("SOURCE_PORT", "5432"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        };
+        let secrets = vec!["pa\"ss\\word-with-quotes".to_string(), "5432".to_string()];
+        let payload = recorded_payload(&job, &secrets);
+
+        assert!(!payload.contains("word-with-quotes"), "{payload}");
+        assert!(!payload.contains("5432"), "{payload}");
+        // What isn't a secret is kept, and it is still the job's JSON.
+        let back: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(back["type"], "service_exec");
+        assert_eq!(back["env"]["SOURCE_PASSWORD"], "[redacted]");
+        assert_eq!(back["command"], "pg_dump -h \"$SOURCE_HOST\" > /tmp/x");
+        assert_eq!(back["timeout_secs"], 3600);
     }
 }

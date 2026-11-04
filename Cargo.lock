@@ -558,6 +558,7 @@ dependencies = [
  "daemon-core",
  "daemon-jobs",
  "daemon-protocol",
+ "daemon-services",
  "daemon-state",
  "libc",
  "rand 0.8.8",
@@ -606,6 +607,7 @@ name = "daemon-services"
 version = "0.1.0"
 dependencies = [
  "daemon-core",
+ "daemon-jobs",
  "daemon-protocol",
  "daemon-state",
  "httparse",
@@ -616,6 +618,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

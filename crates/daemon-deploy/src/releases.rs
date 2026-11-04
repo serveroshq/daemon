@@ -172,4 +172,32 @@ mod tests {
         );
         assert!((20_000..30_000).contains(&port_for("shop", "deadbeef")));
     }
+
+    #[test]
+    fn an_app_and_its_copies_at_one_commit_get_different_ports() {
+        // The names the panel gives an app's copies in other environments.
+        let apps = [
+            "shop",
+            "shop-staging",
+            "shop-staging-2",
+            "shop-preview",
+            "shop-dev",
+            "api",
+            "api-staging",
+            "web",
+            "web-staging",
+        ];
+        for commit in [
+            "0123456789abcdef0123456789abcdef01234567",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "a1b2c3d",
+        ] {
+            let mut ports: Vec<u16> = apps.iter().map(|app| port_for(app, commit)).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            assert_eq!(ports.len(), apps.len(), "a port is shared at {commit}");
+        }
+        // The name and commit don't run together: "ab"+"c" isn't "a"+"bc".
+        assert_ne!(port_for("ab", "c"), port_for("a", "bc"));
+    }
 }

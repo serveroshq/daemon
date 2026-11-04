@@ -33,6 +33,7 @@ impl Handler for JobHandler {
             Job::Deploy(spec) => spec.env.values().cloned().collect(),
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
+            Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
             _ => Vec::new(),
         }
     }

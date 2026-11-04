@@ -1285,6 +1285,50 @@ mod tests {
     }
 
     #[test]
+    fn service_exec_settings_round_trip_and_are_optional() {
+        // An older panel sends no settings.
+        let old: Job = serde_json::from_value(serde_json::json!({
+            "type": "service_exec",
+            "service": "docker:abc123",
+            "command": "psql -c 'select 1'",
+        }))
+        .unwrap();
+        assert_eq!(
+            old,
+            Job::ServiceExec {
+                service: "docker:abc123".into(),
+                command: "psql -c 'select 1'".into(),
+                timeout_secs: None,
+                env: BTreeMap::new(),
+            }
+        );
+        // And none are sent back out, so an older daemon reads it too.
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("env").is_none(), "{json}");
+
+        let job = Job::ServiceExec {
+            service: "docker:abc123".into(),
+            command: "pg_dump".into(),
+            timeout_secs: Some(3600),
+            env: BTreeMap::from([
+                ("SOURCE_HOST".to_string(), "10.64.1.3".to_string()),
+                ("SOURCE_PASSWORD".to_string(), "p@ss \"w0rd\"".to_string()),
+            ]),
+        };
+        let json = serde_json::to_value(&job).unwrap();
+        assert_eq!(json["type"], "service_exec");
+        assert_eq!(json["env"]["SOURCE_HOST"], "10.64.1.3");
+        assert_eq!(serde_json::from_value::<Job>(json).unwrap(), job);
+
+        // The panel sends an empty object as {} when there are none.
+        let empty: Job = serde_json::from_value(serde_json::json!({
+            "type": "service_exec", "service": "x", "command": "true", "env": {},
+        }))
+        .unwrap();
+        assert!(matches!(empty, Job::ServiceExec { env, .. } if env.is_empty()));
+    }
+
+    #[test]
     fn terminal_states_are_terminal() {
         assert!(JobState::Failed.is_terminal());
         assert!(!JobState::Running.is_terminal());
