@@ -322,20 +322,24 @@ fn parse_target(text: &str) -> Option<SocketAddrV4> {
     (allowed && target.port() > 0).then_some(target)
 }
 
-/// Who may connect to an exposed port: peers on the network, local
-/// containers, and the machine itself.
-pub fn may_connect(network: &Cidr, from: IpAddr) -> bool {
-    match from {
-        IpAddr::V4(ip) => {
-            network.contains(ip) || DOCKER_RANGE.contains(ip) || LOOPBACK_RANGE.contains(ip)
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.to_ipv4_mapped().is_some_and(|v4| {
-                    network.contains(v4) || DOCKER_RANGE.contains(v4) || LOOPBACK_RANGE.contains(v4)
-                })
-        }
-    }
+/// Who may connect to an exposed port: peers on the network, the machine
+/// itself, and local containers, meaning an address in 172.16.0.0/12 that
+/// is on one of the machine's Docker bridges (`bridges`, their subnets).
+/// The range alone isn't enough: a provider or VPC network can be in it
+/// too, and anything there that routes the network's addresses to this
+/// machine would otherwise get in.
+pub fn may_connect(network: &Cidr, bridges: &[Cidr], from: IpAddr) -> bool {
+    let v4 = match from {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(ip) if ip.is_loopback() => return true,
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(v4) => v4,
+            None => return false,
+        },
+    };
+    network.contains(v4)
+        || LOOPBACK_RANGE.contains(v4)
+        || (DOCKER_RANGE.contains(v4) && bridges.iter().any(|b| b.contains(v4)))
 }
 
 #[cfg(test)]
@@ -496,11 +500,22 @@ mod tests {
     #[test]
     fn only_the_network_containers_and_loopback_may_connect() {
         let net = Cidr::parse("10.88.3.0/24").unwrap();
-        assert!(may_connect(&net, "10.88.3.9".parse().unwrap()));
-        assert!(may_connect(&net, "172.18.0.2".parse().unwrap()));
-        assert!(may_connect(&net, "127.0.0.1".parse().unwrap()));
-        assert!(may_connect(&net, "::1".parse().unwrap()));
-        assert!(!may_connect(&net, "10.88.4.9".parse().unwrap()));
-        assert!(!may_connect(&net, "203.0.113.5".parse().unwrap()));
+        let bridges = [
+            Cidr::parse("172.17.0.0/16").unwrap(),
+            Cidr::parse("172.18.0.0/16").unwrap(),
+        ];
+        let ok = |ip: &str| may_connect(&net, &bridges, ip.parse().unwrap());
+        assert!(ok("10.88.3.9"));
+        assert!(ok("172.17.0.2"));
+        assert!(ok("172.18.0.2"));
+        assert!(ok("127.0.0.1"));
+        assert!(ok("::1"));
+        assert!(ok("::ffff:172.17.0.2"));
+        assert!(!ok("10.88.4.9"));
+        assert!(!ok("203.0.113.5"));
+        // In Docker's range, but a VPC or wan network, not a bridge here.
+        assert!(!ok("172.31.250.20"));
+        assert!(!may_connect(&net, &[], "172.17.0.2".parse().unwrap()));
+        assert!(!ok("fd00::1"));
     }
 }

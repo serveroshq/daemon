@@ -135,7 +135,8 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   the panel lists. Services are offered on that address by small TCP
   forwarders that only point at loopback or the Docker bridge. The
   firewall lets in the UDP port, the network on its interface, and local
-  containers (172.16.0.0/12) reaching an offered port; nftables and
+  containers reaching an offered port, only over Docker's bridges
+  (`docker*`, `br-*`: a provider network in 172.16.0.0/12 isn't let in); nftables and
   iptables keep these in a chain of the network's own (`net_{id}`,
   `SOS-{id}`). The private key is made on the machine, kept root-only in
   `/var/lib/serveros/networks`, and never sent; networks come back up when

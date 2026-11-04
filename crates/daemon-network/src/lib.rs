@@ -12,6 +12,7 @@
 
 pub mod exec;
 pub mod forward;
+pub mod ifaces;
 pub mod render;
 pub mod spec;
 
@@ -969,7 +970,8 @@ mod tests {
         assert_eq!(
             fake.take(),
             vec![
-                "ufw delete allow proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
+                "ufw delete allow in on docker+ proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
+                "ufw delete allow in on br-+ proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
                 "ufw allow 51831/udp",
                 "ufw allow in on sosp7k2q9 from 10.88.3.0/24",
             ]
@@ -1000,7 +1002,8 @@ mod tests {
                 "nft flush chain inet serveros net_p7k2q9",
                 "nft add rule inet serveros net_p7k2q9 udp dport 51831 accept",
                 "nft add rule inet serveros net_p7k2q9 iifname \"sosp7k2q9\" ip saddr 10.88.3.0/24 accept",
-                "nft add rule inet serveros net_p7k2q9 ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
+                "nft add rule inet serveros net_p7k2q9 iifname \"docker*\" ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
+                "nft add rule inet serveros net_p7k2q9 iifname \"br-*\" ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
                 "nft -a list chain inet serveros input",
                 "nft insert rule inet serveros input jump net_p7k2q9",
             ]
@@ -1062,7 +1065,8 @@ mod tests {
                 "iptables -F SOS-p7k2q9",
                 "iptables -A SOS-p7k2q9 -p udp --dport 51831 -j ACCEPT",
                 "iptables -A SOS-p7k2q9 -i sosp7k2q9 -s 10.88.3.0/24 -j ACCEPT",
-                "iptables -A SOS-p7k2q9 -s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
+                "iptables -A SOS-p7k2q9 -i docker+ -s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
+                "iptables -A SOS-p7k2q9 -i br-+ -s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
                 "iptables -C INPUT -j SOS-p7k2q9",
                 "iptables -I INPUT 1 -j SOS-p7k2q9",
             ]

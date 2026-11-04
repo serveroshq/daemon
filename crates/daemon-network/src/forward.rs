@@ -12,6 +12,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use super::ifaces::bridge_subnets;
 use super::spec::{may_connect, Cidr, ExposePlan};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -133,8 +134,8 @@ async fn serve(
                 continue;
             }
         };
-        if !may_connect(&network, peer.ip()) {
-            debug!(%peer, %target, "refused a connection from outside the network");
+        if !may_connect(&network, &bridge_subnets(), peer.ip()) {
+            debug!(%peer, %target, "refused a connection from outside the network and the machine's containers");
             continue;
         }
         let mut stopped = stopped.clone();

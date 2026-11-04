@@ -36,8 +36,47 @@ pub enum Rule {
     /// Everything arriving on the interface from the network.
     FromNetwork { interface: String, cidr: Cidr },
     /// Local containers reaching an exposed port on this machine's network
-    /// address (they come in over docker0 or a br- bridge).
-    LocalToExpose { address: Ipv4Addr, port: u16 },
+    /// address. Only from Docker's bridges: matching the source range alone
+    /// would also let in anything on a wan or provider network that happens
+    /// to be in 172.16.0.0/12 (an AWS VPC is 172.31.0.0/16) and routes the
+    /// network's addresses to this machine.
+    LocalToExpose {
+        bridge: Bridge,
+        address: Ipv4Addr,
+        port: u16,
+    },
+}
+
+/// The interfaces Docker's containers arrive on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Bridge {
+    /// docker0, and docker_gwbridge for swarm.
+    Docker,
+    /// A user-defined network's br-{id}.
+    UserDefined,
+}
+
+pub const BRIDGES: [Bridge; 2] = [Bridge::Docker, Bridge::UserDefined];
+
+impl Bridge {
+    /// The interface name prefix, as `docker` or `br-`.
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Bridge::Docker => "docker",
+            Bridge::UserDefined => "br-",
+        }
+    }
+
+    /// iptables' (and so ufw's) wildcard: `docker+`.
+    pub fn iptables_name(self) -> String {
+        format!("{}+", self.prefix())
+    }
+
+    /// nftables' wildcard: `docker*`.
+    pub fn nft_name(self) -> String {
+        format!("{}*", self.prefix())
+    }
 }
 
 pub fn rules_for(plan: &Plan) -> Vec<Rule> {
@@ -50,9 +89,12 @@ pub fn rules_for(plan: &Plan) -> Vec<Rule> {
             cidr: plan.address.network(),
         },
     ];
-    rules.extend(plan.expose.iter().map(|e| Rule::LocalToExpose {
-        address: plan.address.ip,
-        port: e.port,
+    rules.extend(plan.expose.iter().flat_map(|e| {
+        BRIDGES.map(|bridge| Rule::LocalToExpose {
+            bridge,
+            address: plan.address.ip,
+            port: e.port,
+        })
     }));
     rules
 }
@@ -69,7 +111,14 @@ impl Rule {
                 "from".into(),
                 cidr.to_string(),
             ],
-            Rule::LocalToExpose { address, port } => vec![
+            Rule::LocalToExpose {
+                bridge,
+                address,
+                port,
+            } => vec![
+                "in".into(),
+                "on".into(),
+                bridge.iptables_name(),
                 "proto".into(),
                 "tcp".into(),
                 "from".into(),
@@ -90,9 +139,14 @@ impl Rule {
             Rule::FromNetwork { interface, cidr } => {
                 format!("iifname \"{interface}\" ip saddr {cidr} accept")
             }
-            Rule::LocalToExpose { address, port } => {
-                format!("ip saddr {DOCKER_RANGE} ip daddr {address} tcp dport {port} accept")
-            }
+            Rule::LocalToExpose {
+                bridge,
+                address,
+                port,
+            } => format!(
+                "iifname \"{}\" ip saddr {DOCKER_RANGE} ip daddr {address} tcp dport {port} accept",
+                bridge.nft_name()
+            ),
         }
     }
 
@@ -115,7 +169,13 @@ impl Rule {
                     cidr.to_string(),
                 ]
             }
-            Rule::LocalToExpose { address, port } => vec![
+            Rule::LocalToExpose {
+                bridge,
+                address,
+                port,
+            } => vec![
+                "-i".into(),
+                bridge.iptables_name(),
                 "-s".into(),
                 DOCKER_RANGE.to_string(),
                 "-d".into(),
@@ -217,6 +277,12 @@ mod tests {
                     cidr: Cidr::parse("10.88.3.0/24").unwrap(),
                 },
                 Rule::LocalToExpose {
+                    bridge: Bridge::Docker,
+                    address: Ipv4Addr::new(10, 88, 3, 2),
+                    port: 5432,
+                },
+                Rule::LocalToExpose {
+                    bridge: Bridge::UserDefined,
                     address: Ipv4Addr::new(10, 88, 3, 2),
                     port: 5432,
                 },
@@ -233,7 +299,8 @@ mod tests {
             vec![
                 "51831/udp",
                 "in on sosp7k2q9 from 10.88.3.0/24",
-                "proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
+                "in on docker+ proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
+                "in on br-+ proto tcp from 172.16.0.0/12 to 10.88.3.2 port 5432",
             ]
         );
 
@@ -243,7 +310,8 @@ mod tests {
             vec![
                 "udp dport 51831 accept",
                 "iifname \"sosp7k2q9\" ip saddr 10.88.3.0/24 accept",
-                "ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
+                "iifname \"docker*\" ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
+                "iifname \"br-*\" ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
             ]
         );
 
@@ -253,7 +321,8 @@ mod tests {
             vec![
                 "-p udp --dport 51831 -j ACCEPT",
                 "-i sosp7k2q9 -s 10.88.3.0/24 -j ACCEPT",
-                "-s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
+                "-i docker+ -s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
+                "-i br-+ -s 172.16.0.0/12 -d 10.88.3.2 -p tcp --dport 5432 -j ACCEPT",
             ]
         );
 
