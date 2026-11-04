@@ -371,6 +371,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             service,
             command,
             timeout_secs,
+            env,
         } => {
             let managed = managed(&app, &service).await?;
             let container = super::service_ops::container_of(&managed)
@@ -387,7 +388,8 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Service(ServiceOp::Exec {
                 service: managed.key.clone(),
             }))?;
-            let result = super::service_ops::exec(&ctx, &container, &command, timeout_secs).await;
+            let result =
+                super::service_ops::exec(&ctx, &container, &command, timeout_secs, &env).await;
             let summary: String = command.chars().take(80).collect();
             grant.finish(&result.as_ref().map(|_| ()), Some(&summary));
             result

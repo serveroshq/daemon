@@ -9,7 +9,8 @@ use tokio::process::Command;
 
 use super::app::App;
 
-const MAX_EXEC: Duration = Duration::from_secs(300);
+/// Long enough to copy a database from one machine to another.
+const MAX_EXEC: Duration = Duration::from_secs(3600);
 
 pub fn container_of(service: &ManagedService) -> Option<&str> {
     match &service.run_by {
@@ -23,6 +24,7 @@ pub async fn exec(
     container: &str,
     command: &str,
     timeout_secs: Option<u64>,
+    env: &std::collections::BTreeMap<String, String>,
 ) -> Result<Value, Failure> {
     let timeout = timeout_secs
         .map(Duration::from_secs)
@@ -32,11 +34,23 @@ pub async fn exec(
 
     ctx.progress.line(format!("$ {command}")).await;
 
+    // Each setting goes in by name only (`-e NAME`): docker reads its value
+    // from our environment, so it never appears in an argument list.
+    if let Some(bad) = env.keys().find(|name| !valid_env_name(name)) {
+        return Err(Failure::new("exec", format!("{bad} isn't a setting name")));
+    }
+    let mut args: Vec<&str> = vec!["exec"];
+    for name in env.keys() {
+        args.extend(["-e", name.as_str()]);
+    }
+    args.extend([container, "sh", "-c", command]);
+    let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
     match run_child(
         "docker",
-        &["exec", container, "sh", "-c", command],
+        &args,
         None,
-        &[],
+        &pairs,
         timeout,
         &mut cancel,
         &ctx.progress,
@@ -581,5 +595,29 @@ mod tests {
     fn sanitise_matches_the_deployer() {
         assert_eq!(sanitise("my app.v2"), "my-app-v2");
         assert_eq!(sanitise("cache_1"), "cache_1");
+    }
+}
+
+/// Letters, digits and underscores, not starting with a digit, and none of
+/// the names the runner sets itself.
+fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !matches!(name, "PATH" | "HOME" | "LC_ALL")
+}
+
+#[cfg(test)]
+mod env_name_tests {
+    use super::valid_env_name;
+
+    #[test]
+    fn names() {
+        assert!(valid_env_name("SOURCE_URL"));
+        assert!(valid_env_name("_X1"));
+        assert!(!valid_env_name("1X"));
+        assert!(!valid_env_name("A-B"));
+        assert!(!valid_env_name("PATH"));
+        assert!(!valid_env_name(""));
     }
 }

@@ -665,6 +665,11 @@ pub enum Job {
         command: String,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Settings handed to the command inside the container, by name,
+        /// so secrets (a database password) stay out of the command line,
+        /// the job's log and `ps`.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
     },
     ServiceRepair {
         service: String,
