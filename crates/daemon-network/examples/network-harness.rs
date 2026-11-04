@@ -9,6 +9,11 @@
 //!       --socket /run/sosnet.sock
 //!   echo '{"type":"network",...}' | socat - UNIX-CONNECT:/run/sosnet.sock
 //!
+//! It also takes `service_exec` jobs, run through the daemon's own `exec`
+//! (settings handed to `docker exec -e NAME` by name, their values scrubbed
+//! from the log), with `service` naming the container directly since the
+//! harness keeps no registry of services.
+//!
 //! Every job update is also appended to `{state}/harness.log`.
 
 use std::io::Write;
@@ -36,15 +41,33 @@ impl Handler for NetworkHandler {
         let networks = Arc::clone(&self.networks);
         let backend = self.backend;
         Box::pin(async move {
-            // As serverosd's handler: the id is checked first, then applied.
-            let Job::Network(spec) = ctx.command.job.clone() else {
-                return Err(Failure::new("harness", "only network jobs here"));
-            };
-            daemon_network::spec::check_network_id(&spec.network)?;
-            networks
-                .apply(&SystemExec, backend, &spec, Some(&ctx.progress))
-                .await
+            match ctx.command.job.clone() {
+                // As serverosd's handler: the id is checked first, then applied.
+                Job::Network(spec) => {
+                    daemon_network::spec::check_network_id(&spec.network)?;
+                    networks
+                        .apply(&SystemExec, backend, &spec, Some(&ctx.progress))
+                        .await
+                }
+                Job::ServiceExec {
+                    service,
+                    command,
+                    timeout_secs,
+                    env,
+                } => {
+                    daemon_services::exec::exec(&ctx, &service, &command, timeout_secs, &env).await
+                }
+                _ => Err(Failure::new(
+                    "harness",
+                    "only network and service_exec jobs here",
+                )),
+            }
         })
+    }
+
+    // As serverosd's handler: an exec job's settings are scrubbed from its log.
+    fn known_secrets(&self, job: &Job) -> Vec<String> {
+        daemon_services::exec::secrets(job)
     }
 }
 
@@ -107,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&state),
         Arc::new(NetworkHandler { networks, backend }),
         tx,
-        Duration::from_secs(900),
+        Duration::from_secs(3600),
     );
 
     let _ = std::fs::remove_file(&socket);

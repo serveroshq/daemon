@@ -38,6 +38,10 @@ IF1=sos$NET1
 IF2=sos$NET2
 PG_IMAGE=postgres:16-alpine
 REDIS_IMAGE=redis:7-alpine
+# Scenario 14 copies a database between machines with the images the
+# panel deploys, only on a (the original) and b (the copy).
+COPY_PG_IMAGE=postgres:17
+COPY_MY_IMAGE=mysql:8.4
 PGPASS=e2e-secret
 SOCK=/run/sosnet.sock
 STATE=/var/lib/serveros
@@ -204,6 +208,75 @@ wait_handshakes() {
     return 1
 }
 
+# ------------------------------------------------- data copy (scenario 14)
+
+# The commands the panel runs inside the copy's database container to fill
+# it from the original over the project's network, as it sends them: the
+# copy's own login from its container's environment, the original's from
+# SOURCE_*, handed in by name.
+PG_COPY=$(cat <<'SH'
+set -e
+trap 'rm -f /tmp/serveros-copy.sql' EXIT
+PGPASSWORD="$SOURCE_PASSWORD" pg_dump -h "$SOURCE_HOST" -p "$SOURCE_PORT" -U "$SOURCE_USER" -d "$SOURCE_DB" --clean --if-exists --no-owner --no-privileges -f /tmp/serveros-copy.sql
+psql -v ON_ERROR_STOP=1 -q -o /dev/null -U "$POSTGRES_USER" -d "$POSTGRES_DB" -f /tmp/serveros-copy.sql
+echo "Copied $SOURCE_DB."
+SH
+)
+MY_COPY=$(cat <<'SH'
+set -e
+trap 'rm -f /tmp/serveros-copy.sql' EXIT
+MYSQL_PWD="$SOURCE_PASSWORD" mysqldump -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root --single-transaction --no-tablespaces --routines --triggers "$SOURCE_DB" > /tmp/serveros-copy.sql
+MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql -u root "$MYSQL_DATABASE" < /tmp/serveros-copy.sql
+echo "Copied $SOURCE_DB."
+SH
+)
+# Passwords long and odd enough that finding one anywhere means it leaked.
+SRC_PG_PASS='src-PG-pa55word-7f3c9e1d'
+DST_PG_PASS='dst-PG-pa55word-0b8a2c44'
+SRC_MY_PASS='src-MY-pa55word-5e6d7a90'
+DST_MY_PASS='dst-MY-pa55word-c1d2e3f4'
+BAD_PASS='wrong-pa55word-9a8b7c6d5e'
+
+exec_json() { # container command env-json
+    jq -cn --arg s "$1" --arg c "$2" --argjson e "$3" \
+        '{type:"service_exec",service:$s,command:$c,timeout_secs:3600,env:$e}'
+}
+pg_env() { # password
+    jq -cn --arg p "$1" '{SOURCE_HOST:"10.64.7.2",SOURCE_PORT:"5432",SOURCE_USER:"app",SOURCE_PASSWORD:$p,SOURCE_DB:"shop"}'
+}
+my_env() { # password
+    jq -cn --arg p "$1" '{SOURCE_HOST:"10.64.7.2",SOURCE_PORT:"3306",SOURCE_PASSWORD:$p,SOURCE_DB:"shop"}'
+}
+exit_code() { printf '%s' "$1" | jq -r '.result.exit_code // "none"'; }
+copied() { # answer: the job finished and its command exited 0
+    [ "$(printf '%s' "$1" | jq -r .state)" = succeeded ] && [ "$(exit_code "$1")" = 0 ] \
+        || { printf '%s\n' "$1" | jq -c '{state, result, error, log: (.log[-6:])}'; return 1; }
+}
+
+# Run on b while a job runs: every process's arguments, as ps shows them
+# and straight from /proc, over and over, until stopped.
+ps_watch_start() {
+    m b rm -f /tmp/ps.txt /tmp/ps.stop
+    msh b "nohup sh -c 'while [ ! -e /tmp/ps.stop ]; do ps -eww -o args; for f in /proc/[0-9]*/cmdline; do tr \"\\000\" \" \" <\$f 2>/dev/null; echo; done; done >>/tmp/ps.txt' >/dev/null 2>&1 &"
+}
+ps_watch_stop() { m b touch /tmp/ps.stop; sleep 1; m b cp /tmp/ps.txt /tmp/ps-$1.txt; }
+ps_saw() { m b grep -qF -- "$2" /tmp/ps-$1.txt; }
+
+pg_sum() { # machine container user db
+    m "$1" docker exec "$2" psql -U "$3" -d "$4" -tAc \
+        "select count(*) || ':' || md5(coalesce(string_agg(id || '|' || name || '|' || price, ',' order by id), '')) from items"
+}
+my_sum() { # machine container password
+    m "$1" docker exec -e MYSQL_PWD="$3" "$2" mysql -u root -N -B shop -e \
+        "select concat(count(*), ':', coalesce(sum(crc32(concat(id, '|', name, '|', price))), 0)) from items"
+}
+same() { [ "$1" = "$2" ] || { echo "$1 != $2"; return 1; }; }
+log_says() { printf '%s' "$1" | jq -r '.log[]' | grep -q -- "$2"; }
+nowhere() { # secret: not in any job answer, nor anywhere in b's state (state.db, its WAL, the job log) or harness output
+    ! grep -qF -- "$1" "$OUT/$BACKEND/answers.jsonl" \
+        && ! m b grep -rqaF -- "$1" $STATE /var/log/harness.out
+}
+
 start_harness() {
     msh "$1" "nohup /opt/network-harness serve --state $STATE --firewall $BACKEND --socket $SOCK >>/var/log/harness.out 2>&1 &"
     local i
@@ -266,7 +339,7 @@ docker run --rm --privileged --entrypoint sh serveros-e2e-machine -c 'ip link ad
 
 say "== saving the test images"
 mkdir -p "$OUT/images"
-for image in $PG_IMAGE $REDIS_IMAGE; do
+for image in $PG_IMAGE $REDIS_IMAGE $COPY_PG_IMAGE $COPY_MY_IMAGE; do
     file=$OUT/images/$(echo $image | tr ':/' '__').tar
     [ -f "$file" ] || { docker pull -q $image >/dev/null && docker save -o "$file" $image; } || exit 1
 done
@@ -291,7 +364,14 @@ start_machines() {
         m $who test -f /run/machine-ready || { say "machine $who didn't come up"; docker logs $PREFIX-$who; return 1; }
     done
     for who in a b c; do
-        for f in "$OUT"/images/*.tar; do m $who docker load -q -i /images/$(basename "$f") >/dev/null; done
+        for image in $PG_IMAGE $REDIS_IMAGE; do
+            m $who docker load -q -i /images/$(echo $image | tr ':/' '__').tar >/dev/null
+        done
+    done
+    for who in a b; do
+        for image in $COPY_PG_IMAGE $COPY_MY_IMAGE; do
+            m $who docker load -q -i /images/$(echo $image | tr ':/' '__').tar >/dev/null
+        done
     done
     m b docker run -d --name pg -p 127.0.0.1:5432:5432 -e POSTGRES_PASSWORD=$PGPASS $PG_IMAGE >/dev/null
     m c docker run -d --name redis -p 127.0.0.1:6379:6379 $REDIS_IMAGE >/dev/null
@@ -445,6 +525,125 @@ run_backend() {
     check "200 sequential: 0 failures" sh -c "echo '$soak' | grep -q 'sequential ok=200 bad=0'"
     check "50 parallel: all 50 ok" sh -c "echo '$soak' | grep -q '50 P-ok' && ! echo '$soak' | grep -q P-bad"
 
+    scenario 14 "data copy across machines: service_exec in b's database container, from a's over the network"
+    local before after answer_pg
+    # a: the originals, listening on a's 127.0.0.1 only, offered to the
+    # project on a's network address.
+    m a docker run -d --name src-pg -p 127.0.0.1:5432:5432 -e POSTGRES_USER=app -e POSTGRES_DB=shop \
+        -e POSTGRES_PASSWORD=$SRC_PG_PASS $COPY_PG_IMAGE >/dev/null
+    m a docker run -d --name src-my -p 127.0.0.1:3306:3306 -e MYSQL_DATABASE=shop \
+        -e MYSQL_ROOT_PASSWORD=$SRC_MY_PASS $COPY_MY_IMAGE >/dev/null
+    # b: the copies, empty, each with a password of its own.
+    m b docker run -d --name copy-pg -e POSTGRES_USER=app -e POSTGRES_DB=shop \
+        -e POSTGRES_PASSWORD=$DST_PG_PASS $COPY_PG_IMAGE >/dev/null
+    m b docker run -d --name copy-my -e MYSQL_DATABASE=shop -e MYSQL_ROOT_PASSWORD=$DST_MY_PASS $COPY_MY_IMAGE >/dev/null
+    local i
+    for i in $(seq 90); do
+        m a docker exec src-pg pg_isready -q -h 127.0.0.1 && m b docker exec copy-pg pg_isready -q -h 127.0.0.1 && break
+        sleep 1
+    done
+    # MySQL's image starts a server to initialise, then the real one on 3306.
+    for i in $(seq 180); do
+        m a docker exec -e MYSQL_PWD=$SRC_MY_PASS src-my mysql -u root -h 127.0.0.1 -P 3306 -e 'select 1' >/dev/null 2>&1 \
+            && m b docker exec -e MYSQL_PWD=$DST_MY_PASS copy-my mysql -u root -h 127.0.0.1 -P 3306 -e 'select 1' >/dev/null 2>&1 && break
+        sleep 1
+    done
+    m a docker exec src-pg psql -q -U app -d shop -c "
+        create table items (id serial primary key, name text not null, price numeric(10,2));
+        insert into items (name, price) select 'item ' || g, g * 1.5 from generate_series(1, 200000) g;
+        create index items_name on items (name);
+        create view cheap as select * from items where price < 10;" >/dev/null
+    docker exec -i $PREFIX-a docker exec -i -e MYSQL_PWD=$SRC_MY_PASS src-my mysql -u root shop <<'SQL'
+set session cte_max_recursion_depth = 100000;
+create table items (id int auto_increment primary key, name varchar(64) not null, price decimal(10,2));
+insert into items (name, price) with recursive g(n) as (select 1 union all select n + 1 from g where n < 20000) select concat('item ', n), n * 1.5 from g;
+create table audit (id int auto_increment primary key, item int);
+create trigger items_audit after insert on items for each row insert into audit (item) values (new.id);
+create procedure item_count() select count(*) from items;
+SQL
+    EXP_A='[{"port":5432,"target":"127.0.0.1:5432"},{"port":3306,"target":"127.0.0.1:3306"}]'
+    check "a offers its databases on 10.64.7.2" net1_up "a b c"
+
+    before=$(pg_sum a src-pg app shop)
+    say "        > original on a: $before"
+    ps_watch_start
+    answer_pg=$(job b "$(exec_json copy-pg "$PG_COPY" "$(pg_env $SRC_PG_PASS)")")
+    ps_watch_stop pg1
+    check "postgres: copy job on b succeeds, its command exits 0" copied "$answer_pg"
+    say "        > $(printf '%s' "$answer_pg" | jq -c '{state, result, log}' | cut -c1-200)"
+    check "postgres: the copy has every row of the original" same "$(pg_sum b copy-pg app shop)" "$before"
+    check "postgres: and its index and view" same "$(m b docker exec copy-pg psql -U app -d shop -tAc \
+        "select (select count(*) from pg_indexes where indexname = 'items_name') || ':' || (select count(*) from cheap)")" "1:6"
+    check "postgres: the original is unchanged" same "$(pg_sum a src-pg app shop)" "$before"
+    check "postgres: no dump left in the copy's container" m b docker exec copy-pg test ! -e /tmp/serveros-copy.sql
+    check "postgres: the copy keeps its own password" sh -c "docker exec $PREFIX-b docker exec -e PGPASSWORD=$DST_PG_PASS copy-pg \
+        psql -h 127.0.0.1 -U app -d shop -tAc 'select 1' | grep -qx 1"
+    check "(ps on b saw the copy running: docker exec -e SOURCE_PASSWORD)" ps_saw pg1 "-e SOURCE_PASSWORD"
+    check "(ps on b saw the copy running: pg_dump -h 10.64.7.2)" ps_saw pg1 "pg_dump -h 10.64.7.2"
+    refute "postgres: the original's password never in ps on b" ps_saw pg1 "$SRC_PG_PASS"
+
+    # Again, after the original changed and the copy got a row of its own.
+    m a docker exec src-pg psql -q -U app -d shop -c "insert into items (name, price) values ('added on a', 1); delete from items where id = 7" >/dev/null
+    m b docker exec copy-pg psql -q -U app -d shop -c "insert into items (id, name, price) values (999999, 'only on b', 2)" >/dev/null
+    before=$(pg_sum a src-pg app shop)
+    ps_watch_start
+    answer=$(job b "$(exec_json copy-pg "$PG_COPY" "$(pg_env $SRC_PG_PASS)")")
+    ps_watch_stop pg2
+    check "postgres: a second copy succeeds" copied "$answer"
+    check "postgres: it replaces the copy (the original's rows, no duplicates, none of b's own)" \
+        same "$(pg_sum b copy-pg app shop)" "$before"
+    refute "postgres: the original's password never in ps on b, second copy" ps_saw pg2 "$SRC_PG_PASS"
+
+    after=$(pg_sum b copy-pg app shop)
+    ps_watch_start
+    answer=$(job b "$(exec_json copy-pg "$PG_COPY" "$(pg_env $BAD_PASS)")")
+    ps_watch_stop pgbad
+    say "        > wrong password: $(printf '%s' "$answer" | jq -c '{state, result, log: (.log[-2:])}' | cut -c1-220)"
+    check "postgres: a wrong password: the command exits non-zero" [ "$(exit_code "$answer")" != 0 ]
+    check "postgres: and says why" log_says "$answer" 'password authentication failed'
+    check "postgres: a failed copy leaves the copy as it was" same "$(pg_sum b copy-pg app shop)" "$after"
+    refute "postgres: the wrong password never in ps on b" ps_saw pgbad "$BAD_PASS"
+
+    before=$(my_sum a src-my $SRC_MY_PASS)
+    say "        > original on a: $before"
+    ps_watch_start
+    answer=$(job b "$(exec_json copy-my "$MY_COPY" "$(my_env $SRC_MY_PASS)")")
+    ps_watch_stop my1
+    check "mysql: copy job on b succeeds, its command exits 0" copied "$answer"
+    say "        > $(printf '%s' "$answer" | jq -c '{state, result, log}' | cut -c1-200)"
+    check "mysql: the copy has every row of the original" same "$(my_sum b copy-my $DST_MY_PASS)" "$before"
+    check "mysql: and its trigger and routine" same "$(m b docker exec -e MYSQL_PWD=$DST_MY_PASS copy-my mysql -u root -N -B shop -e \
+        "select concat((select count(*) from information_schema.triggers where trigger_schema = 'shop'), ':', (select count(*) from information_schema.routines where routine_schema = 'shop'))")" "1:1"
+    check "mysql: the original is unchanged" same "$(my_sum a src-my $SRC_MY_PASS)" "$before"
+    check "mysql: the copy keeps its own root password" m b docker exec -e MYSQL_PWD=$DST_MY_PASS copy-my mysql -u root -h 127.0.0.1 -e 'select 1'
+    m a docker exec -e MYSQL_PWD=$SRC_MY_PASS src-my mysql -u root shop -e "insert into items (name, price) values ('added on a', 1)"
+    m b docker exec -e MYSQL_PWD=$DST_MY_PASS copy-my mysql -u root shop -e "insert into items (id, name, price) values (999999, 'only on b', 2)"
+    before=$(my_sum a src-my $SRC_MY_PASS)
+    answer=$(job b "$(exec_json copy-my "$MY_COPY" "$(my_env $SRC_MY_PASS)")")
+    check "mysql: a second copy succeeds" copied "$answer"
+    check "mysql: it replaces the copy (no duplicates, none of b's own)" same "$(my_sum b copy-my $DST_MY_PASS)" "$before"
+    answer=$(job b "$(exec_json copy-my "$MY_COPY" "$(my_env $BAD_PASS)")")
+    check "mysql: a wrong password: the command exits non-zero" [ "$(exit_code "$answer")" != 0 ]
+    refute "mysql: the original's password never in ps on b" ps_saw my1 "$SRC_MY_PASS"
+
+    for secret in "$SRC_PG_PASS" "$SRC_MY_PASS" "$BAD_PASS"; do
+        check "${secret%%-pa55word*} password: in no job answer, job log, state.db or harness output" nowhere "$secret"
+    done
+
+    m x ip route add 10.64.7.2/32 via $WAN_A >/dev/null 2>&1
+    refute "outsider (routing 10.64.7.2 to a) can't psql the original" \
+        m x timeout 15 env PGPASSWORD=$SRC_PG_PASS PGCONNECT_TIMEOUT=5 psql -h 10.64.7.2 -U app -d shop -tAc 'select 1'
+    if [ $BACKEND != none ]; then
+        refute "outsider can't open a TCP connection to 10.64.7.2:5432" tcp_open x 10.64.7.2 5432
+        refute "outsider can't open a TCP connection to 10.64.7.2:3306" tcp_open x 10.64.7.2 3306
+    fi
+    refute "outsider can't reach a's wan address on 5432" tcp_open x $WAN_A 5432
+    m x ip route del 10.64.7.2/32 via $WAN_A >/dev/null 2>&1
+    EXP_A='[]'
+    net1_up "a b c" >/dev/null
+    m a docker rm -f src-pg src-my >/dev/null
+    m b docker rm -f copy-pg copy-my >/dev/null
+
     scenario 9 "reboot of b: restore on start"
     stop_harness b
     m b ip link del dev $IF1
@@ -527,7 +726,7 @@ printf '%-10s' scenario
 for b in "${BACKENDS[@]}"; do printf '%-10s' "$b"; done
 printf '\n'
 failed=0
-for s in setup 0 1 2 3 4 6 7 8 9 10 11 12 13; do
+for s in setup 0 1 2 3 4 6 7 8 9 10 11 12 13 14; do
     grep -q "|$s|" "$RESULTS" || continue
     printf '%-10s' "$s"
     for b in "${BACKENDS[@]}"; do

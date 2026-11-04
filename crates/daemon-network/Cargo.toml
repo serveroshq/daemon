@@ -20,5 +20,7 @@ curve25519-dalek.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# The harness example runs service_exec jobs through the daemon's own code.
+daemon-services.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
