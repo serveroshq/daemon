@@ -73,6 +73,7 @@ make build          # debug build
 make test           # the whole suite
 make clippy         # lints, warnings denied
 make linux-check    # type-check for Linux from macOS via Docker
+make e2e-networks   # project networks and data copies on real WireGuard, in Docker
 make release        # static musl binaries in dist/ (needs cargo-zigbuild on macOS)
 ```
 
@@ -143,6 +144,9 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   there would otherwise win. The private key is made on the machine, kept root-only in
   `/var/lib/serveros/networks`, and never sent; networks come back up when
   the daemon starts. `wireguard-tools` is installed if `wg` is missing.
+  The job's fields, checks and results, and how the panel copies a
+  database between machines over the network, are in
+  [docs/project-networks.md](docs/project-networks.md).
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.
