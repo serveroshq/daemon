@@ -138,7 +138,9 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   containers reaching an offered port, only over Docker's bridges
   (`docker*`, `br-*`: a provider network in 172.16.0.0/12 isn't let in); nftables and
   iptables keep these in a chain of the network's own (`net_{id}`,
-  `SOS-{id}`). The private key is made on the machine, kept root-only in
+  `SOS-{id}`). With nftables they also go, tagged `serveros:net_{id}`, at
+  the top of every other inet table's input chain, since a `policy drop`
+  there would otherwise win. The private key is made on the machine, kept root-only in
   `/var/lib/serveros/networks`, and never sent; networks come back up when
   the daemon starts. `wireguard-tools` is installed if `wg` is missing.
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base

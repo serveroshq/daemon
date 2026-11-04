@@ -78,8 +78,15 @@ async fn note(progress: Option<&Progress>, line: impl Into<String>) {
     }
 }
 
+/// Failure output is the end of what the tool printed.
+const FAILURE_LINES: usize = 40;
+
 fn failed(phase: &str, message: impl Into<String>, out: ExecOutput) -> Failure {
-    Failure::new(phase, message).with_output(out.lines)
+    let mut lines = out.lines;
+    if lines.len() > FAILURE_LINES {
+        lines.drain(..lines.len() - FAILURE_LINES);
+    }
+    Failure::new(phase, message).with_output(lines)
 }
 
 impl Networks {
@@ -559,11 +566,20 @@ async fn apply_firewall<E: Exec>(
         FirewallBackend::Nftables => {
             require(exec, "nft", NFT_PATHS, "apt install nftables")?;
             let chain = nft_chain(&plan.network);
+            nft(exec, &[&format!("add table {NFT_TABLE}")]).await?;
+            // Made only if missing: `add chain` with a policy on a chain
+            // that exists would reset whatever policy it has now.
+            let input = format!("list chain {NFT_TABLE} {NFT_INPUT}");
+            if !exec.run("nft", &args(&[&input]), QUICK).await.ok {
+                nft(
+                    exec,
+                    &[&format!(
+                        "add chain {NFT_TABLE} {NFT_INPUT} {{ type filter hook input priority 0; policy accept; }}"
+                    )],
+                )
+                .await?;
+            }
             let mut steps = vec![
-                format!("add table {NFT_TABLE}"),
-                format!(
-                    "add chain {NFT_TABLE} {NFT_INPUT} {{ type filter hook input priority 0; policy accept; }}"
-                ),
                 format!("add chain {NFT_TABLE} {chain}"),
                 format!("flush chain {NFT_TABLE} {chain}"),
             ];
@@ -583,6 +599,26 @@ async fn apply_firewall<E: Exec>(
                     &[&format!("insert rule {NFT_TABLE} {NFT_INPUT} jump {chain}")],
                 )
                 .await?;
+            }
+
+            // Every base chain on the input hook has its say, and a drop in
+            // any of them is final: an accept in our table doesn't get past
+            // the operator's `policy drop`. So the rules also go at the top
+            // of each other inet input chain, tagged so they can be found
+            // and taken out again.
+            let tag = nft_tag(&plan.network);
+            for (table, other) in nft_input_chains(exec).await? {
+                untag_nft_chain(exec, &table, &other, &tag).await?;
+                for rule in rules.iter().rev() {
+                    nft(
+                        exec,
+                        &[&format!(
+                            "insert rule inet {table} {other} {} comment \"{tag}\"",
+                            rule.nft_expression()
+                        )],
+                    )
+                    .await?;
+                }
             }
         }
         FirewallBackend::Iptables => {
@@ -646,6 +682,10 @@ async fn remove_firewall<E: Exec>(
             // Gone already is fine.
             let _ = nft(exec, &[&format!("flush chain {NFT_TABLE} {chain}")]).await;
             let _ = nft(exec, &[&format!("delete chain {NFT_TABLE} {chain}")]).await;
+            let tag = nft_tag(network);
+            for (table, other) in nft_input_chains(exec).await.unwrap_or_default() {
+                untag_nft_chain(exec, &table, &other, &tag).await?;
+            }
         }
         FirewallBackend::Iptables => {
             let chain = iptables_chain(network);
@@ -657,6 +697,78 @@ async fn remove_firewall<E: Exec>(
             let _ = exec.run("iptables", &args(&["-F", &chain]), QUICK).await;
             let _ = exec.run("iptables", &args(&["-X", &chain]), QUICK).await;
         }
+    }
+    Ok(())
+}
+
+/// The comment on the rules a network adds to other tables' chains.
+pub fn nft_tag(network: &str) -> String {
+    format!("serveros:{}", nft_chain(network))
+}
+
+/// The base chains on the input hook in inet tables other than ours, as
+/// `nft -j list chains` lists them. ip and ip6 tables are left alone: those
+/// are iptables-nft's, and it can't read rules the nft tool adds.
+pub fn other_input_chains(json: &str) -> Vec<(String, String)> {
+    let Ok(listing) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let ours = NFT_TABLE.trim_start_matches("inet ");
+    listing["nftables"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let chain = item.get("chain")?;
+            let field = |k: &str| chain.get(k).and_then(Value::as_str);
+            let (table, name) = (field("table")?, field("name")?);
+            (field("family")? == "inet" && field("hook")? == "input" && table != ours)
+                .then(|| (table.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
+/// The handles of rules carrying `tag`, in `nft -a list chain` output.
+pub fn tagged_handles(lines: &[String], tag: &str) -> Vec<u64> {
+    let marker = format!("comment \"{tag}\"");
+    lines
+        .iter()
+        .filter(|line| line.contains(&marker))
+        .filter_map(|line| line.rsplit_once("# handle ")?.1.trim().parse().ok())
+        .collect()
+}
+
+/// Table and chain names nft prints are plain words; anything else is left
+/// alone rather than pasted into a command.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
+async fn nft_input_chains<E: Exec>(exec: &E) -> Result<Vec<(String, String)>, Failure> {
+    let listed = nft(exec, &["-j", "list", "chains"]).await?;
+    Ok(other_input_chains(&listed.lines.join("\n"))
+        .into_iter()
+        .filter(|(table, chain)| plain_name(table) && plain_name(chain))
+        .collect())
+}
+
+async fn untag_nft_chain<E: Exec>(
+    exec: &E,
+    table: &str,
+    chain: &str,
+    tag: &str,
+) -> Result<(), Failure> {
+    let listing = format!("list chain inet {table} {chain}");
+    let listed = nft(exec, &["-a", &listing]).await?;
+    for handle in tagged_handles(&listed.lines, tag) {
+        nft(
+            exec,
+            &[&format!("delete rule inet {table} {chain} handle {handle}")],
+        )
+        .await?;
     }
     Ok(())
 }
@@ -981,6 +1093,12 @@ mod tests {
     #[tokio::test]
     async fn nftables_rules_live_in_a_chain_of_the_network_s_own() {
         let fake = machine();
+        // A fresh machine: no ServerOS input chain yet, no other tables.
+        fake.answer(
+            "nft list chain inet serveros input",
+            false,
+            &["No such file or directory"],
+        );
         let plan = spec::plan(&up_spec(
             51831,
             vec![NetworkExpose {
@@ -989,7 +1107,7 @@ mod tests {
             }],
         ))
         .unwrap();
-        let applied = apply_firewall(&fake, FirewallBackend::Nftables, &plan, None, None)
+        apply_firewall(&fake, FirewallBackend::Nftables, &plan, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -997,6 +1115,7 @@ mod tests {
             fake.take(),
             vec![
                 "nft add table inet serveros",
+                "nft list chain inet serveros input",
                 "nft add chain inet serveros input { type filter hook input priority 0; policy accept; }",
                 "nft add chain inet serveros net_p7k2q9",
                 "nft flush chain inet serveros net_p7k2q9",
@@ -1006,27 +1125,56 @@ mod tests {
                 "nft add rule inet serveros net_p7k2q9 iifname \"br-*\" ip saddr 172.16.0.0/12 ip daddr 10.88.3.2 tcp dport 5432 accept",
                 "nft -a list chain inet serveros input",
                 "nft insert rule inet serveros input jump net_p7k2q9",
+                "nft -j list chains",
             ]
         );
+    }
 
+    #[tokio::test]
+    async fn nftables_rules_also_go_into_the_operator_s_input_chains() {
+        let fake = machine();
+        // Our input chain exists (its policy is left as it is), the jump is
+        // there, and the operator has inet filter with policy drop; ip
+        // filter is iptables-nft's and is left alone.
         fake.answer(
             "nft -a list chain inet serveros input",
             true,
+            &["\t\tjump net_p7k2q9 # handle 12"],
+        );
+        fake.answer(
+            "nft -j list chains",
+            true,
+            &[r#"{"nftables": [{"metainfo": {"version": "1.0.6"}}, {"chain": {"family": "inet", "table": "filter", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": 0, "policy": "drop"}}, {"chain": {"family": "inet", "table": "serveros", "name": "input", "handle": 1, "type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}, {"chain": {"family": "ip", "table": "filter", "name": "INPUT", "handle": 1, "type": "filter", "hook": "input", "prio": 0, "policy": "accept"}}, {"chain": {"family": "inet", "table": "filter", "name": "forward", "handle": 2, "type": "filter", "hook": "forward", "prio": 0, "policy": "drop"}}]}"#],
+        );
+        fake.answer(
+            "nft -a list chain inet filter input",
+            true,
             &[
-                "\t\tjump net_p7k2q9 # handle 12",
-                "\t\ttcp dport 22 accept # handle 4",
+                "\t\tudp dport 51831 accept comment \"serveros:net_p7k2q9\" # handle 30",
+                "\t\tudp dport 9 accept comment \"serveros:net_other\" # handle 31",
+                "\t\tct state established,related accept # handle 2",
             ],
         );
-        apply_firewall(
-            &fake,
-            FirewallBackend::Nftables,
-            &plan,
-            Some(&applied),
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(!fake.take().iter().any(|c| c.contains("insert rule")));
+        let plan = spec::plan(&up_spec(51831, vec![])).unwrap();
+        let applied = apply_firewall(&fake, FirewallBackend::Nftables, &plan, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let calls = fake.take();
+        assert!(!calls.iter().any(|c| c.contains("policy")), "{calls:?}");
+        assert!(!calls
+            .iter()
+            .any(|c| c.contains("insert rule inet serveros input")));
+        assert!(!calls.iter().any(|c| c.contains(" ip filter")));
+        assert_eq!(
+            calls[calls.len() - 4..],
+            [
+                "nft -a list chain inet filter input",
+                "nft delete rule inet filter input handle 30",
+                "nft insert rule inet filter input iifname \"sosp7k2q9\" ip saddr 10.88.3.0/24 accept comment \"serveros:net_p7k2q9\"",
+                "nft insert rule inet filter input udp dport 51831 accept comment \"serveros:net_p7k2q9\"",
+            ]
+        );
 
         remove_firewall(&fake, "p7k2q9", &applied, None)
             .await
@@ -1038,8 +1186,24 @@ mod tests {
                 "nft delete rule inet serveros input handle 12",
                 "nft flush chain inet serveros net_p7k2q9",
                 "nft delete chain inet serveros net_p7k2q9",
+                "nft -j list chains",
+                "nft -a list chain inet filter input",
+                "nft delete rule inet filter input handle 30",
             ]
         );
+    }
+
+    #[test]
+    fn reads_nft_listings() {
+        assert!(other_input_chains("").is_empty());
+        assert!(other_input_chains("not json").is_empty());
+        let lines = vec![
+            "udp dport 1 accept comment \"serveros:net_a\" # handle 7".to_string(),
+            "udp dport 2 accept comment \"serveros:net_ab\" # handle 8".to_string(),
+        ];
+        assert_eq!(tagged_handles(&lines, "serveros:net_a"), vec![7]);
+        assert!(plain_name("filter"));
+        assert!(!plain_name("filter; flush ruleset"));
     }
 
     #[tokio::test]

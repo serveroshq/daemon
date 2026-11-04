@@ -7,12 +7,14 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-const KEEP_LINES: usize = 40;
+/// Enough for any listing these tools print for one machine; error
+/// messages are cut shorter where they become a job's output.
+const KEEP_LINES: usize = 20_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExecOutput {
     pub ok: bool,
-    /// stdout then stderr, the last lines only.
+    /// stdout then stderr.
     pub lines: Vec<String>,
 }
 
