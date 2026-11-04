@@ -1061,6 +1061,29 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(json!({"status": result?}))
         }
 
+        Job::Network(spec) => {
+            // Checked before the audit line, which names the network.
+            super::network::spec::check_network_id(&spec.network)?;
+            let grant = authorize(Operation::Machine(MachineOp::WriteNetwork {
+                network: spec.network.clone(),
+            }))?;
+            let backend = app.config.read().unwrap().integrations.firewall;
+            let result = app
+                .networks
+                .apply(
+                    &super::network::exec::SystemExec,
+                    backend,
+                    &spec,
+                    Some(&ctx.progress),
+                )
+                .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(&format!("{:?}", spec.action).to_lowercase()),
+            );
+            result
+        }
+
         Job::SshKey {
             user,
             action,

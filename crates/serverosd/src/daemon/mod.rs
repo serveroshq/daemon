@@ -7,6 +7,7 @@ mod handler;
 mod local;
 mod log_shipper;
 mod machine;
+mod network;
 mod packages;
 mod service_ops;
 mod service_stats;
@@ -133,6 +134,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         workers::spawn_all(Arc::clone(&app));
         local::serve(Arc::clone(&app));
         tls_ask::serve(Arc::clone(&app));
+        tokio::spawn(network::restore_all(Arc::clone(&app)));
 
         let control = tokio::spawn(control::run(Arc::clone(&app), outbound_rx));
 

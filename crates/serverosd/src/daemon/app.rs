@@ -53,6 +53,8 @@ pub struct App {
     pub on_trial: Option<(String, String)>,
     pub started: Instant,
     pub facts: RwLock<MachineFacts>,
+    /// Project networks: WireGuard interfaces and their forwarders.
+    pub networks: super::network::Networks,
     pub status: RwLock<ConnectionStatus>,
     pub pending_update: Mutex<Option<(Candidate, bool)>>,
     /// Wakes discovery early: when the panel turns it on.
@@ -117,6 +119,9 @@ impl App {
                 .chain([paths.jobs_dir(), paths.state_dir.join("apps")]),
         ));
 
+        let networks =
+            super::network::Networks::new(Arc::clone(&state), paths.state_dir.join("networks"));
+
         Self {
             deployer: Deployer {
                 paths: paths.clone(),
@@ -151,6 +156,7 @@ impl App {
             on_trial,
             started: Instant::now(),
             facts: RwLock::new(facts),
+            networks,
             status: RwLock::new(ConnectionStatus::default()),
             pending_update: Mutex::new(None),
             discovery_wake: tokio::sync::Notify::new(),

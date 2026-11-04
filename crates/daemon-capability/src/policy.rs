@@ -256,6 +256,18 @@ mod tests {
     }
 
     #[test]
+    fn private_networks_are_changes_blocked_in_read_only_mode() {
+        let network = Operation::Machine(MachineOp::WriteNetwork {
+            network: "p7k2q9".into(),
+        });
+
+        assert_eq!(network.verb(), "network.write");
+        assert_eq!(network.target(), "p7k2q9");
+        assert!(network.mutates());
+        assert!(checks_for(&network).contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn running_a_command_is_confirmed_and_blocked_in_read_only_mode() {
         let exec = Operation::Service(ServiceOp::Exec {
             service: "docker:abc123def456".into(),

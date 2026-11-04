@@ -127,6 +127,18 @@ firewall = "ufw"     # ufw | nftables | iptables | none
 - **Firewall**: ufw rules pass through verbatim. nftables and iptables
   take the port form (`22/tcp`, `from 10.0.0.0/8 to any port 5432`);
   nftables rules live in a table ServerOS owns (`inet serveros`).
+- **Project networks**: the `network` job gives a project its own
+  WireGuard network across machines. Each machine gets an interface named
+  `sos{network}` (`sosp7k2q9`; network ids are at most 12 characters, so
+  the name fits the kernel's 15), one address on it, and exactly the peers
+  the panel lists. Services are offered on that address by small TCP
+  forwarders that only point at loopback or the Docker bridge. The
+  firewall lets in the UDP port, the network on its interface, and local
+  containers (172.16.0.0/12) reaching an offered port; nftables and
+  iptables keep these in a chain of the network's own (`net_{id}`,
+  `SOS-{id}`). The private key is made on the machine, kept root-only in
+  `/var/lib/serveros/networks`, and never sent; networks come back up when
+  the daemon starts. `wireguard-tools` is installed if `wg` is missing.
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.

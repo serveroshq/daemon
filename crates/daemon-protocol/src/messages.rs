@@ -713,6 +713,62 @@ pub enum Job {
         #[serde(default)]
         path: Option<String>,
     },
+    /// A project's private WireGuard network on this machine: bring it up
+    /// as exactly the given state (peers and exposed ports replaced
+    /// wholesale), or take it down.
+    Network(Box<NetworkSpec>),
+}
+
+/// One project network as this machine should have it. "up" is declarative
+/// and idempotent; "down" only needs `network`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkSpec {
+    /// The project's network id, `[a-z0-9]{1,12}`; the interface is
+    /// `sos{network}`.
+    pub network: String,
+    pub action: NetworkAction,
+    /// This machine's address on the network with its prefix, like
+    /// `10.88.3.2/24`. Needed for up.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// The UDP port the interface listens on. Needed for up.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
+    /// Every peer the interface should have; any others are removed.
+    #[serde(default)]
+    pub peers: Vec<NetworkPeer>,
+    /// Every port to offer on this machine's network address; any others
+    /// are closed.
+    #[serde(default)]
+    pub expose: Vec<NetworkExpose>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkAction {
+    Up,
+    Down,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkPeer {
+    /// The peer's WireGuard public key, base64.
+    pub public_key: String,
+    /// The peer's address on the network, like `10.88.3.3/32`.
+    pub address: String,
+    /// Where to reach it, `host:port`; left out for a peer that can only
+    /// dial in.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// A port offered on this machine's network address, forwarded to a
+/// service listening on loopback or the Docker bridge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkExpose {
+    pub port: u16,
+    /// `127.0.0.1:5432`, say.
+    pub target: String,
 }
 
 /// A package at a version, as the package manager writes it: Debian
@@ -1084,6 +1140,51 @@ mod tests {
                 packages: vec!["nginx".into()],
                 hold: true,
             }
+        );
+    }
+
+    #[test]
+    fn network_jobs_read_the_panel_s_json() {
+        let raw = serde_json::json!({
+            "type": "network",
+            "network": "p7k2q9",
+            "action": "up",
+            "address": "10.88.3.2/24",
+            "listen_port": 51831,
+            "peers": [
+                {"public_key": "aGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd28=", "address": "10.88.3.3/32", "endpoint": "203.0.113.5:51831"},
+                {"public_key": "d29ybGQgaGVsbG8gd29ybGQgaGVsbG8gd29ybGQgaGU=", "address": "10.88.3.4/32"}
+            ],
+            "expose": [{"port": 5432, "target": "127.0.0.1:5432"}]
+        });
+        let job: Job = serde_json::from_value(raw.clone()).unwrap();
+        let Job::Network(spec) = &job else {
+            panic!("not a network job: {job:?}");
+        };
+        assert_eq!(spec.action, NetworkAction::Up);
+        assert_eq!(spec.address.as_deref(), Some("10.88.3.2/24"));
+        assert_eq!(spec.listen_port, Some(51831));
+        assert_eq!(spec.peers[1].endpoint, None);
+        assert_eq!(spec.expose[0].target, "127.0.0.1:5432");
+
+        let mut back = serde_json::to_value(&job).unwrap();
+        back["peers"][1].as_object_mut().unwrap().remove("endpoint");
+        assert_eq!(back, raw);
+
+        let down: Job = serde_json::from_value(
+            serde_json::json!({"type": "network", "network": "p7k2q9", "action": "down"}),
+        )
+        .unwrap();
+        assert_eq!(
+            down,
+            Job::Network(Box::new(NetworkSpec {
+                network: "p7k2q9".into(),
+                action: NetworkAction::Down,
+                address: None,
+                listen_port: None,
+                peers: vec![],
+                expose: vec![],
+            }))
         );
     }
 

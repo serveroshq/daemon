@@ -21,6 +21,7 @@ pub enum MachineOp {
     ReadFirewall,
     WriteFirewall { rule: String },
     ManageSshKeys { user: String },
+    WriteNetwork { network: String },
     ReadJournal { unit: Option<String> },
     ReadNamedLog { path: PathBuf },
 }
@@ -85,6 +86,7 @@ impl Operation {
                 MachineOp::ReadFirewall => "firewall.read",
                 MachineOp::WriteFirewall { .. } => "firewall.write",
                 MachineOp::ManageSshKeys { .. } => "ssh.keys",
+                MachineOp::WriteNetwork { .. } => "network.write",
                 MachineOp::ReadJournal { .. } => "journal.read",
                 MachineOp::ReadNamedLog { .. } => "log.read",
             },
@@ -146,6 +148,7 @@ impl Operation {
                 ),
                 MachineOp::WriteFirewall { rule } => rule.clone(),
                 MachineOp::ManageSshKeys { user } => user.clone(),
+                MachineOp::WriteNetwork { network } => network.clone(),
                 MachineOp::ReadJournal { unit } => unit.clone().unwrap_or_else(|| "system".into()),
                 MachineOp::ReadNamedLog { path } => path.display().to_string(),
                 _ => "machine".into(),
@@ -203,6 +206,7 @@ impl Operation {
                     | MachineOp::Reboot
                     | MachineOp::WriteFirewall { .. }
                     | MachineOp::ManageSshKeys { .. }
+                    | MachineOp::WriteNetwork { .. }
             ),
             Operation::Service(s) => !matches!(
                 s,

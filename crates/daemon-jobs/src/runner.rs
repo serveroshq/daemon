@@ -364,6 +364,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Snapshots { .. } => "snapshots",
         Job::DiskUsage { .. } => "disk_usage",
         Job::ServiceClone { .. } => "service_clone",
+        Job::Network(_) => "network",
     }
 }
 
@@ -507,6 +508,21 @@ mod tests {
         runner.submit(Uuid::new_v4(), command(Job::Reboot)).await;
         let updates = collect_until_terminal(&mut rx).await;
         assert_eq!(updates.last().unwrap().state, JobState::Refused);
+
+        let network = Job::Network(Box::new(daemon_protocol::NetworkSpec {
+            network: "p7k2q9".into(),
+            action: daemon_protocol::NetworkAction::Down,
+            address: None,
+            listen_port: None,
+            peers: vec![],
+            expose: vec![],
+        }));
+        assert!(mutates(&network));
+        runner.submit(Uuid::new_v4(), command(network)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
 
         runner.submit(Uuid::new_v4(), command(Job::Discover)).await;
         assert_eq!(
