@@ -245,7 +245,7 @@ impl Deployer {
 
         progress.phase("start", Some(60)).await;
         let name = container::container_name(service, commit);
-        let host_port = releases::port_for(commit);
+        let host_port = releases::port_for(service, commit);
         let container_port = spec.port.unwrap_or(80);
 
         // Folders the Dockerfile declares with VOLUME are the app's data:

@@ -114,9 +114,15 @@ impl<'a> ReleaseLedger<'a> {
     }
 }
 
-pub fn port_for(commit: &str) -> u16 {
-    let hash = commit
+/// The local port a release listens on, from its app's name and commit, so
+/// two apps at the same commit on one machine (production and a staging
+/// copy of it) don't both ask for the same port. Each release keeps the port
+/// it was given, so this only decides new ones.
+pub fn port_for(service: &str, commit: &str) -> u16 {
+    let hash = service
         .bytes()
+        .chain(std::iter::once(b'\n'))
+        .chain(commit.bytes())
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     20_000 + (hash % 10_000) as u16
 }
@@ -130,7 +136,7 @@ mod tests {
             commit: commit.into(),
             image: format!("serveros/app:{commit}"),
             container: format!("serveros-app-{commit}"),
-            port: port_for(commit),
+            port: port_for("app", commit),
             deployed_at: 0,
             status: "live".into(),
             http: true,
@@ -159,7 +165,11 @@ mod tests {
 
     #[test]
     fn ports_are_stable_and_in_range() {
-        assert_eq!(port_for("abc123"), port_for("abc123"));
-        assert!((20_000..30_000).contains(&port_for("deadbeef")));
+        assert_eq!(port_for("shop", "abc123"), port_for("shop", "abc123"));
+        assert_ne!(
+            port_for("shop", "abc123"),
+            port_for("shop-staging", "abc123")
+        );
+        assert!((20_000..30_000).contains(&port_for("shop", "deadbeef")));
     }
 }
