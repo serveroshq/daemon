@@ -117,6 +117,13 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   owns (`/etc/caddy/serveros.d` or `/etc/nginx/serveros.d`), validated
   before reload, reverted if validation fails. Caddy handles TLS itself;
   with nginx, TLS stays whatever certbot or the operator set up.
+- **Wildcard subdomains**: a service on `*.example.com` gets a Caddy site
+  with on-demand TLS, so each subdomain gets its own certificate the first
+  time it's visited, over the usual HTTP challenge, with no DNS provider.
+  The daemon adds `on_demand_tls { ask … }` to the Caddyfile's global
+  options and answers Caddy's question on `127.0.0.1:47019`, saying yes
+  only for a name one label under a wildcard in its own site files. A
+  Caddyfile that already sets `on_demand_tls` is left alone.
 - **Firewall**: ufw rules pass through verbatim. nftables and iptables
   take the port form (`22/tcp`, `from 10.0.0.0/8 to any port 5432`);
   nftables rules live in a table ServerOS owns (`inet serveros`).

@@ -10,6 +10,7 @@ mod machine;
 mod packages;
 mod service_ops;
 mod service_stats;
+mod tls_ask;
 mod workers;
 
 use std::sync::Arc;
@@ -131,6 +132,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         workers::forward_streams(Arc::clone(&app));
         workers::spawn_all(Arc::clone(&app));
         local::serve(Arc::clone(&app));
+        tls_ask::serve(Arc::clone(&app));
 
         let control = tokio::spawn(control::run(Arc::clone(&app), outbound_rx));
 
