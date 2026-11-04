@@ -576,7 +576,7 @@ async fn apply_firewall<E: Exec>(
             }
             let listing = format!("list chain {NFT_TABLE} {NFT_INPUT}");
             let listed = nft(exec, &["-a", &listing]).await?;
-            if super::machine::nft_handle(&listed.lines, &format!("jump {chain}")).is_none() {
+            if nft_handle(&listed.lines, &format!("jump {chain}")).is_none() {
                 nft(
                     exec,
                     &[&format!("insert rule {NFT_TABLE} {NFT_INPUT} jump {chain}")],
@@ -632,9 +632,7 @@ async fn remove_firewall<E: Exec>(
             let chain = nft_chain(network);
             let listing = format!("list chain {NFT_TABLE} {NFT_INPUT}");
             if let Ok(listed) = nft(exec, &["-a", &listing]).await {
-                if let Some(handle) =
-                    super::machine::nft_handle(&listed.lines, &format!("jump {chain}"))
-                {
+                if let Some(handle) = nft_handle(&listed.lines, &format!("jump {chain}")) {
                     nft(
                         exec,
                         &[&format!(
@@ -709,51 +707,41 @@ async fn iptables<E: Exec>(exec: &E, a: &[String]) -> Result<(), Failure> {
     }
 }
 
-/// Every stored network, applied again: after a reboot nothing of them is
-/// left but the firewall rules.
-pub async fn restore_all(app: Arc<super::App>) {
-    let specs = app.networks.stored();
-    if specs.is_empty() {
-        return;
-    }
-    let backend = app
-        .config
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .integrations
-        .firewall;
+/// Each tool's answer to "which rule is this?": the handle nft prints
+/// after a rule matching `expression`, in `nft -a list` output.
+pub fn nft_handle(lines: &[String], expression: &str) -> Option<u64> {
+    lines.iter().find_map(|line| {
+        let (rule, handle) = line.trim().rsplit_once("# handle ")?;
+        (rule.trim() == expression)
+            .then(|| handle.trim().parse().ok())
+            .flatten()
+    })
+}
 
-    for spec in specs {
-        let grant = app.broker.authorize(daemon_capability::Request {
-            actor: daemon_audit::Actor::daemon(),
-            operation: daemon_capability::Operation::Machine(
-                daemon_capability::MachineOp::WriteNetwork {
-                    network: spec.network.clone(),
-                },
-            ),
-            confirmed: false,
-        });
-        let grant = match grant {
-            Ok(g) => g,
-            Err(denied) => {
-                tracing::warn!(network = %spec.network, reason = %denied, "not bringing a network back up");
+impl Networks {
+    /// Every stored network, applied again, as the daemon does when it
+    /// starts: after a reboot nothing of them is left but what the firewall
+    /// keeps. `permit` is asked first for each (the daemon's capability
+    /// check; `None` skips the network) and `finish` is told how it went.
+    pub async fn restore<E: Exec, G>(
+        &self,
+        exec: &E,
+        backend: FirewallBackend,
+        permit: impl Fn(&str) -> Option<G>,
+        finish: impl Fn(G, &str, &Result<Value, Failure>),
+    ) -> usize {
+        let mut restored = 0;
+        for spec in self.stored() {
+            let Some(grant) = permit(&spec.network) else {
                 continue;
+            };
+            let result = self.apply(exec, backend, &spec, None).await;
+            if result.is_ok() {
+                restored += 1;
             }
-        };
-        let result = app
-            .networks
-            .apply(&exec::SystemExec, backend, &spec, None)
-            .await;
-        grant.finish(
-            &result.as_ref().map(|_| ()),
-            Some("brought back up on start"),
-        );
-        match result {
-            Ok(_) => tracing::info!(network = %spec.network, "network up"),
-            Err(e) => {
-                tracing::warn!(network = %spec.network, error = %e, "couldn't bring a network back up")
-            }
+            finish(grant, &spec.network, &result);
         }
+        restored
     }
 }
 

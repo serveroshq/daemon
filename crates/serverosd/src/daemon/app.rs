@@ -54,7 +54,7 @@ pub struct App {
     pub started: Instant,
     pub facts: RwLock<MachineFacts>,
     /// Project networks: WireGuard interfaces and their forwarders.
-    pub networks: super::network::Networks,
+    pub networks: daemon_network::Networks,
     pub status: RwLock<ConnectionStatus>,
     pub pending_update: Mutex<Option<(Candidate, bool)>>,
     /// Wakes discovery early: when the panel turns it on.
@@ -120,7 +120,7 @@ impl App {
         ));
 
         let networks =
-            super::network::Networks::new(Arc::clone(&state), paths.state_dir.join("networks"));
+            daemon_network::Networks::new(Arc::clone(&state), paths.state_dir.join("networks"));
 
         Self {
             deployer: Deployer {

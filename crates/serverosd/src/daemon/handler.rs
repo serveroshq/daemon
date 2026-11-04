@@ -1063,7 +1063,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::Network(spec) => {
             // Checked before the audit line, which names the network.
-            super::network::spec::check_network_id(&spec.network)?;
+            daemon_network::spec::check_network_id(&spec.network)?;
             let grant = authorize(Operation::Machine(MachineOp::WriteNetwork {
                 network: spec.network.clone(),
             }))?;
@@ -1071,7 +1071,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let result = app
                 .networks
                 .apply(
-                    &super::network::exec::SystemExec,
+                    &daemon_network::exec::SystemExec,
                     backend,
                     &spec,
                     Some(&ctx.progress),

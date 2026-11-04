@@ -62,6 +62,7 @@ the Docker socket.
 | `daemon-supervisor` | Self-health and the resource budget |
 | `daemon-selfupdate` | Signed, policy-gated updates with automatic rollback |
 | `daemon-uninstall` | The manifest of what ServerOS created, and its removal |
+| `daemon-network` | Project networks: WireGuard interfaces, their firewall rules, forwarders |
 | `serverosd` | The binary: CLI, control loop, job handler, workers |
 | `release-tool` | Key generation, signing, and manifests for CI |
 
