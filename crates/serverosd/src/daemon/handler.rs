@@ -1010,6 +1010,15 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
+        Job::PackageAdd { packages: names } => {
+            let grant = authorize(Operation::Machine(MachineOp::AddPackages {
+                packages: names.clone(),
+            }))?;
+            let result = packages::add_packages(&ctx, &names).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(names.join(" ").as_str()));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
         Job::PackageInstallVersions {
             packages: versions,
             allow_downgrade,

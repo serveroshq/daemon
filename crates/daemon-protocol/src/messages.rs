@@ -631,6 +631,13 @@ pub enum Job {
     PackageInstall {
         packages: Vec<String>,
     },
+    /// Install packages that aren't on the machine yet, by name, from the
+    /// repositories it already has. A job of its own rather than a field on
+    /// `PackageInstall` (which only upgrades), so a daemon that predates it
+    /// refuses the job instead of upgrading and reporting success.
+    PackageAdd {
+        packages: Vec<String>,
+    },
     /// Install exactly these versions, for machines that should match each
     /// other or a version tested elsewhere. A job of its own rather than a
     /// field on `PackageInstall`, so a daemon that predates it drops the job
@@ -1135,6 +1142,14 @@ mod tests {
                     version: "1:3.0.7-28.el9".into(),
                 }],
                 allow_downgrade: true,
+            }
+        );
+
+        let raw = serde_json::json!({"type": "package_add", "packages": ["git", "unzip"]});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::PackageAdd {
+                packages: vec!["git".into(), "unzip".into()],
             }
         );
 

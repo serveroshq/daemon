@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use daemon_jobs::{run_child, ChildOutcome, Failure, Progress};
+use daemon_jobs::{capture_child, run_child, ChildOutcome, Failure, Progress};
 use tokio::sync::watch;
 
 pub struct BuildLimits {
@@ -228,25 +228,35 @@ pub async fn build(
 
     let cpu = format!("CPUQuota={}%", limits.cpu_percent);
     let mem = format!("MemoryMax={}M", limits.memory_mb);
-    let docker_args = [
-        "build",
-        "--pull",
-        "--progress=plain",
-        "-f",
-        dockerfile,
-        "-t",
-        tag,
-        ".",
-    ];
+    // BuildKit needs Docker's buildx plugin, which distro packages (Ubuntu's
+    // docker.io) often leave out; without it, the classic builder.
+    let buildkit = has_buildx(cancel).await;
+    if !buildkit {
+        progress
+            .line("buildx isn't installed, so building with Docker's classic builder")
+            .await;
+    }
+    let mut docker_args = vec!["build", "--pull"];
+    if buildkit {
+        docker_args.push("--progress=plain");
+    }
+    docker_args.extend(["-f", dockerfile, "-t", tag, "."]);
+    let env = builder_env(buildkit);
 
-    let outcome = if Path::new("/run/systemd/system").is_dir() && which("systemd-run") {
+    let scoped = scopes_work(cancel).await;
+    if !scoped {
+        progress
+            .line("systemd can't put the build in a scope here, so it runs without CPU and memory limits")
+            .await;
+    }
+    let outcome = if scoped {
         let mut args: Vec<&str> = vec!["--scope", "--quiet", "-p", &cpu, "-p", &mem, "docker"];
         args.extend(docker_args.iter());
         run_child(
             "systemd-run",
             &args,
             Some(workspace),
-            &[("DOCKER_BUILDKIT", "1")],
+            env,
             timeout,
             cancel,
             progress,
@@ -258,7 +268,7 @@ pub async fn build(
             "docker",
             &docker_args,
             Some(workspace),
-            &[("DOCKER_BUILDKIT", "1")],
+            env,
             timeout,
             cancel,
             progress,
@@ -439,11 +449,12 @@ pub async fn compose_up(
 
     args.extend(["up", "-d", "--build", "--remove-orphans"].map(String::from));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env = builder_env(has_buildx(cancel).await);
     let outcome = run_child(
         "docker",
         &arg_refs,
         Some(dir),
-        &[("DOCKER_BUILDKIT", "1")],
+        env,
         timeout,
         cancel,
         progress,
@@ -456,6 +467,91 @@ pub async fn compose_up(
     } else {
         Err(failure_from("build", outcome, "docker compose up"))
     }
+}
+
+/// A container's last log lines, what it wrote to stdout then stderr (where
+/// most crashes go), for a failure to carry once it's gone.
+pub async fn logs_tail(container: &str, lines: usize, progress: &Progress) -> Vec<String> {
+    let (_tx, mut cancel) = watch::channel(false);
+    let tail = lines.to_string();
+    let captured = capture_child(
+        "docker",
+        &["logs", "--tail", &tail, container],
+        &[],
+        Duration::from_secs(15),
+        &mut cancel,
+        lines,
+    )
+    .await;
+    let mut out: Vec<String> = captured.stdout().to_vec();
+    out.extend(captured.stderr().iter().cloned());
+    let skip = out.len().saturating_sub(lines);
+    // An app's output can hold connection strings and keys: scrubbed like
+    // the job's own log before it goes anywhere.
+    out.into_iter()
+        .skip(skip)
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| progress.scrub(&l))
+        .collect()
+}
+
+static HAS_BUILDX: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static SCOPES_WORK: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+/// Whether this machine's Docker has the buildx plugin BuildKit needs.
+/// Asked once per daemon run: it doesn't change while the daemon runs
+/// (installing buildx is followed by a restart, like any package).
+async fn has_buildx(_cancel: &mut watch::Receiver<bool>) -> bool {
+    *HAS_BUILDX
+        .get_or_init(|| async {
+            // Its own cancel: a job's cancel mustn't decide the answer for every later build.
+            let (_tx, mut never) = watch::channel(false);
+            capture_child(
+                "docker",
+                &["buildx", "version"],
+                &[],
+                Duration::from_secs(15),
+                &mut never,
+                5,
+            )
+            .await
+            .code()
+                == Some(0)
+        })
+        .await
+}
+
+fn builder_env(buildkit: bool) -> &'static [(&'static str, &'static str)] {
+    if buildkit {
+        &[("DOCKER_BUILDKIT", "1")]
+    } else {
+        &[("DOCKER_BUILDKIT", "0")]
+    }
+}
+
+/// Whether a build can run in a systemd scope (for its CPU and memory
+/// limits). Having systemd isn't enough: inside containers and some LXC
+/// hosts `systemd-run --scope` can't create one and the build never starts,
+/// so it's tried first, and without one the build runs as it is.
+async fn scopes_work(_cancel: &mut watch::Receiver<bool>) -> bool {
+    *SCOPES_WORK
+        .get_or_init(|| async {
+            let (_tx, mut never) = watch::channel(false);
+            Path::new("/run/systemd/system").is_dir()
+                && which("systemd-run")
+                && capture_child(
+                    "systemd-run",
+                    &["--scope", "--quiet", "true"],
+                    &[],
+                    Duration::from_secs(15),
+                    &mut never,
+                    5,
+                )
+                .await
+                .code()
+                    == Some(0)
+        })
+        .await
 }
 
 fn which(program: &str) -> bool {

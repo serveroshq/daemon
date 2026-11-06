@@ -231,6 +231,20 @@ mod tests {
     }
 
     #[test]
+    fn adding_packages_is_a_confirmed_change() {
+        let add = Operation::Machine(MachineOp::AddPackages {
+            packages: vec!["git".into(), "unzip".into()],
+        });
+        let checks = checks_for(&add);
+
+        assert_eq!(add.verb(), "packages.add");
+        assert_eq!(add.target(), "git,unzip");
+        assert!(add.mutates());
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
         let remove = Operation::Service(ServiceOp::Remove {
             service: "docker:abc123def456".into(),

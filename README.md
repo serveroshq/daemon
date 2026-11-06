@@ -5,7 +5,7 @@ binary that connects out to the panel, discovers what is already running,
 adopts it without a restart, and does the deploying, backing up, and
 watching on the panel's behalf.
 
-It runs as root, because updating packages, editing firewall rules, and
+It runs as root, because installing and updating packages, editing firewall rules, and
 driving systemd and Docker need root. It is not a remote shell: everything
 it can do is a fixed, reviewed list in `crates/daemon-capability`, every
 privileged action is written to `/var/log/serveros/actions.log` in plain

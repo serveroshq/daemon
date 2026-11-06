@@ -76,6 +76,12 @@ pub async fn run_child(
     #[cfg(not(unix))]
     let _ = run_as;
 
+    // A cancel an earlier step already saw (changed() won't fire again for
+    // it): don't start this one at all.
+    if *cancel.borrow() {
+        return ChildOutcome::Cancelled { tail: Vec::new() };
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return ChildOutcome::Unstartable(format!("could not start {program}: {e}")),
@@ -428,6 +434,32 @@ mod tests {
             logged.extend(update.log);
         }
         assert!(logged.iter().any(|l| l == "password=[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_an_earlier_step_saw_stops_the_next_one_starting() {
+        let (progress, _rx) = progress();
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        // The earlier step consumed the change; this one must still see it.
+        cancel.borrow_and_update();
+        let marker = std::env::temp_dir().join(format!("serveros-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let outcome = run_child(
+            "touch",
+            &[marker.to_str().unwrap()],
+            None,
+            &[],
+            Duration::from_secs(5),
+            &mut cancel,
+            &progress,
+            None,
+        )
+        .await;
+
+        assert!(matches!(outcome, ChildOutcome::Cancelled { .. }));
+        assert!(!marker.exists(), "the command must not have run");
     }
 
     #[tokio::test]

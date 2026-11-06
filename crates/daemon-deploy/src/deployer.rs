@@ -345,16 +345,29 @@ impl Deployer {
 
     /// A release that answers HTTP is asked for its health page. One that
     /// doesn't, like a chat bot or a worker, passes if its container is
-    /// still running a few seconds after starting.
+    /// still running a few seconds after starting. One that fails carries
+    /// the container's last log lines, which usually say why (it crashed on
+    /// start, or listens on another port), since the container is removed.
     async fn check(
         container: &str,
         port: u16,
         health: Option<&daemon_protocol::HealthCheck>,
         progress: &daemon_jobs::Progress,
     ) -> Result<(), Failure> {
-        match health {
+        let result = match health {
             Some(check) => health::wait_healthy(port, Some(check), progress).await,
             None => health::wait_running(container, progress).await,
+        };
+        match result {
+            Err(failure) if failure.output_tail.is_empty() => {
+                let logs = container::logs_tail(container, 40, progress).await;
+                Err(if logs.is_empty() {
+                    failure
+                } else {
+                    failure.with_output(logs)
+                })
+            }
+            other => other,
         }
     }
 

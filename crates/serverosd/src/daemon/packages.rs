@@ -324,8 +324,12 @@ fn check_names(packages: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+/// A plain package name. It can't end in `-`: apt reads `nginx-` on an
+/// install line as "remove nginx" (a trailing `+` only means install, and
+/// real names like `g++` end in one).
 fn valid_package_name(name: &str) -> bool {
     !name.is_empty()
+        && !name.ends_with('-')
         && name.len() <= 200
         && name
             .chars()
@@ -418,6 +422,209 @@ pub async fn install_packages(
         installed: installed_versions(manager, packages, &mut cancel).await,
     })
 }
+
+/// Packages one `package_add` may install: a few tools, not a system.
+const MAX_ADD_PACKAGES: usize = 20;
+
+/// Install packages that aren't on the machine yet, from the repositories
+/// it already has (it never adds one). apt refreshes its lists first, as a
+/// fresh machine's are often stale. Already installed is fine: nothing
+/// changes. Held packages stay held.
+pub async fn add_packages(ctx: &JobContext, packages: &[String]) -> Result<PackageReport, Failure> {
+    let manager = manager().ok_or_else(|| {
+        Failure::new(
+            "unsupported",
+            "no supported package manager (apt, dnf, yum) on this machine",
+        )
+    })?;
+    if packages.len() > MAX_ADD_PACKAGES {
+        return Err(Failure::new(
+            "packages",
+            format!("name at most {MAX_ADD_PACKAGES} packages to add at once"),
+        ));
+    }
+    check_names(packages)?;
+
+    let mut cancel = ctx.cancel.clone();
+    let progress = &ctx.progress;
+    let names: Vec<&str> = packages.iter().map(String::as_str).collect();
+
+    let outcome = if manager == "apt" {
+        progress.phase("refresh", Some(15)).await;
+        let _ = run_child(
+            "apt-get",
+            &["update", "-q", "-o", "DPkg::Lock::Timeout=120"],
+            None,
+            APT_ENV,
+            Duration::from_secs(300),
+            &mut cancel,
+            progress,
+            None,
+        )
+        .await;
+        if *cancel.borrow() {
+            return Err(Failure::new("cancelled", "package install cancelled"));
+        }
+        // What it would do, first: refuse if it would remove anything, or if
+        // the names pull in far more than a few tools (an old apt reads an
+        // unknown name with . or + in it as a pattern).
+        let mut plan_args = vec!["install", "-s", "-q", "--no-install-recommends", "--"];
+        plan_args.extend(&names);
+        let plan = capture_child(
+            "apt-get",
+            &plan_args,
+            APT_ENV,
+            Duration::from_secs(120),
+            &mut cancel,
+            MAX_LISTED,
+        )
+        .await;
+        if plan.code() != Some(0) {
+            let output: Vec<String> = plan.stderr().iter().chain(plan.stdout()).cloned().collect();
+            let skip = output.len().saturating_sub(20);
+            return Err(Failure::new("apply", "apt can't install those")
+                .with_output(output.into_iter().skip(skip).collect())
+                .with_next_step(
+                    "Check the names: they have to be packages this machine's repositories have.",
+                ));
+        }
+        let removes = plan
+            .stdout()
+            .iter()
+            .filter(|l| l.starts_with("Remv "))
+            .count();
+        let installs = plan
+            .stdout()
+            .iter()
+            .filter(|l| l.starts_with("Inst "))
+            .count();
+        if removes > 0 {
+            return Err(Failure::new(
+                "apply",
+                format!("installing those would remove {removes} packages, so nothing was changed"),
+            )
+            .with_output(
+                plan.stdout()
+                    .iter()
+                    .filter(|l| l.starts_with("Remv "))
+                    .take(20)
+                    .cloned()
+                    .collect(),
+            )
+            .with_next_step(
+                "They conflict with what's installed: a person has to decide which to keep.",
+            ));
+        }
+        if installs > MAX_ADD_PLAN {
+            return Err(Failure::new(
+                "apply",
+                format!("those names would install {installs} packages, so nothing was changed"),
+            )
+            .with_next_step("Name the exact packages wanted."));
+        }
+
+        progress.phase("install", Some(40)).await;
+        let mut args = vec![
+            "install",
+            "-y",
+            "-q",
+            "--no-install-recommends",
+            // Never take something out to make room: it fails instead.
+            "--no-remove",
+            "-o",
+            "DPkg::Lock::Timeout=120",
+            "-o",
+            "Dpkg::Options::=--force-confold",
+            "--",
+        ];
+        args.extend(&names);
+        run_child(
+            "apt-get",
+            &args,
+            None,
+            APT_ENV,
+            ctx.timeout,
+            &mut cancel,
+            progress,
+            None,
+        )
+        .await
+    } else {
+        progress.phase("install", Some(30)).await;
+        // yum on EL7 skips names it can't find and still succeeds; dnf doesn't.
+        let mut args = vec!["-y", "-q"];
+        if manager == "yum" {
+            args.push("--setopt=skip_missing_names_on_install=False");
+        }
+        args.extend(["install", "--"]);
+        args.extend(&names);
+        run_child(
+            manager,
+            &args,
+            None,
+            &[],
+            ctx.timeout,
+            &mut cancel,
+            progress,
+            None,
+        )
+        .await
+    };
+
+    match outcome {
+        ChildOutcome::Exited { code: 0, .. } => {}
+        ChildOutcome::Cancelled { tail } => {
+            return Err(Failure::new("cancelled", "package install cancelled").with_output(tail))
+        }
+        other => {
+            return Err(
+                Failure::new("apply", format!("{manager} install did not complete"))
+                    .with_output(other.tail().to_vec())
+                    .with_next_step(
+                        "Check the output: a name the machine's repositories don't have, or a broken package, needs a person.",
+                    ),
+            )
+        }
+    }
+
+    // Every name asked for has to be there now, whatever the manager said.
+    let installed = installed_versions(manager, packages, &mut cancel).await;
+    let missing: Vec<&str> = packages
+        .iter()
+        .map(String::as_str)
+        .filter(|p| {
+            let bare = p.split(':').next().unwrap_or(p);
+            !installed.iter().any(|v| v.name == *p || v.name == bare)
+        })
+        .collect();
+    if !missing.is_empty() {
+        return Err(Failure::new(
+            "apply",
+            format!(
+                "{manager} finished but these aren't installed: {}",
+                missing.join(", ")
+            ),
+        )
+        .with_next_step(
+            "Check the names: they have to be packages this machine's repositories have.",
+        ));
+    }
+
+    Ok(PackageReport {
+        manager: manager.into(),
+        upgradable: Vec::new(),
+        security: Vec::new(),
+        reboot_required: reboot_required(manager, &mut cancel).await,
+        applied: true,
+        packages: Vec::new(),
+        held: held(manager, &mut cancel).await,
+        os: os_release(),
+        installed,
+    })
+}
+
+/// Packages one package_add may bring in, dependencies and all.
+const MAX_ADD_PLAN: usize = 150;
 
 const MAX_VERSION_LEN: usize = 128;
 
@@ -1324,6 +1531,35 @@ fn parse_os_release(text: &str) -> OsRelease {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_names_cant_remove_or_pass_options() {
+        for good in [
+            "git",
+            "build-essential",
+            "libssl3",
+            "g++",
+            "python3.12",
+            "lib32z1:i386",
+        ] {
+            assert!(valid_package_name(good), "{good}");
+        }
+        // apt reads a trailing - as "remove".
+        for bad in [
+            "nginx-",
+            "openssh-server-",
+            "-y",
+            "--purge",
+            "",
+            "a b",
+            "pkg=1.0",
+            "../x",
+            "pkg/stable",
+        ] {
+            assert!(!valid_package_name(bad), "{bad}");
+        }
+        assert!(check_names(&["git".into(), "nginx-".into()]).is_err());
+    }
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
