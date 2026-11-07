@@ -9,6 +9,7 @@ mod log_shipper;
 mod machine;
 mod network;
 mod packages;
+mod ports;
 mod service_ops;
 mod service_stats;
 mod tls_ask;
@@ -135,6 +136,9 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         local::serve(Arc::clone(&app));
         tls_ask::serve(Arc::clone(&app));
         tokio::spawn(network::restore_all(Arc::clone(&app)));
+
+        let firewall = app.config.read().unwrap().integrations.firewall;
+        ports::restore(firewall, &paths.state_dir).await;
 
         let control = tokio::spawn(control::run(Arc::clone(&app), outbound_rx));
 

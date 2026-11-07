@@ -71,8 +71,8 @@ pub fn parse_port_rule(rule: &str) -> Option<PortRule> {
 impl PortRule {
     pub fn nft_expression(&self, action: FirewallAction) -> String {
         let verdict = match action {
-            FirewallAction::Deny => "drop",
-            FirewallAction::Allow | FirewallAction::Delete => "accept",
+            FirewallAction::Deny | FirewallAction::Close => "drop",
+            FirewallAction::Allow | FirewallAction::Delete | FirewallAction::Open => "accept",
         };
         let source = match &self.source {
             Some(s) if s.contains(':') => format!("ip6 saddr {s} "),
@@ -97,8 +97,8 @@ impl PortRule {
             self.port.to_string(),
             "-j".to_string(),
             match action {
-                FirewallAction::Deny => "DROP",
-                FirewallAction::Allow | FirewallAction::Delete => "ACCEPT",
+                FirewallAction::Deny | FirewallAction::Close => "DROP",
+                FirewallAction::Allow | FirewallAction::Delete | FirewallAction::Open => "ACCEPT",
             }
             .to_string(),
         ]);
@@ -149,7 +149,7 @@ fn require_tool(tool: &str, paths: &[&str], install: &str) -> Result<(), Failure
     }
 }
 
-async fn run(
+pub(super) async fn run(
     ctx: &JobContext,
     program: &str,
     args: &[&str],
@@ -178,8 +178,8 @@ async fn firewall_ufw(
     require_tool("ufw", &["/usr/sbin/ufw"], "apt install ufw")?;
 
     let mut args: Vec<&str> = match action {
-        FirewallAction::Allow => vec!["allow"],
-        FirewallAction::Deny => vec!["deny"],
+        FirewallAction::Allow | FirewallAction::Open => vec!["allow"],
+        FirewallAction::Deny | FirewallAction::Close => vec!["deny"],
         FirewallAction::Delete => vec!["delete", "allow"],
     };
     args.extend(rule.split_whitespace());
@@ -238,7 +238,10 @@ async fn firewall_nft(
     }
 
     match action {
-        FirewallAction::Allow | FirewallAction::Deny => {
+        FirewallAction::Allow
+        | FirewallAction::Deny
+        | FirewallAction::Open
+        | FirewallAction::Close => {
             let add = format!("add rule {NFT_TABLE} {NFT_CHAIN} {expression}");
             let outcome = run(ctx, "nft", &[add.as_str()], 30).await;
             if !outcome.success() {

@@ -2,6 +2,7 @@ pub mod classify;
 pub mod cron;
 pub mod docker;
 pub mod exec;
+pub mod firewall;
 pub mod listeners;
 pub mod scanner;
 pub mod systemd;
