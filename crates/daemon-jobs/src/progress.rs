@@ -74,7 +74,9 @@ impl Progress {
         self.log([line.into()]).await;
     }
 
-    pub(crate) fn scrub(&self, line: &str) -> String {
+    /// A line with secrets taken out: the usual patterns, and the values this
+    /// job was told are secret.
+    pub fn scrub(&self, line: &str) -> String {
         let known: Vec<&str> = self.known_secrets.iter().map(String::as_str).collect();
         daemon_core::redact::redact_known(&redact(line), &known)
     }

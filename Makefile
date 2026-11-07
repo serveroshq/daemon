@@ -12,6 +12,8 @@ PUBKEY  ?=
 
 PANEL_URL ?=
 DOCS_URL ?=
+# Error reports go here; unset (the default) builds a binary that sends none.
+SENTRY_DSN ?=
 
 export SERVEROS_VERSION=$(VERSION)
 export SERVEROS_COMMIT=$(COMMIT)
@@ -26,10 +28,13 @@ endif
 ifneq ($(DOCS_URL),)
 export SERVEROS_DOCS_URL=$(DOCS_URL)
 endif
+ifneq ($(SENTRY_DSN),)
+export SERVEROS_SENTRY_DSN=$(SENTRY_DSN)
+endif
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-.PHONY: build test check clippy fmt release gateway linux-check messy-check clean
+.PHONY: build test check clippy fmt release gateway linux-check messy-check e2e-networks clean
 
 build:
 	cargo build --workspace
@@ -72,6 +77,12 @@ linux-check:
 ## (tests/fixtures/messy-server) and assert what it must find.
 messy-check:
 	scripts/messy-server.sh
+
+## Project networks end to end: machines in Docker, each with its own
+## dockerd, joined over real WireGuard, through every firewall backend.
+## BACKENDS="ufw none" to run only some.
+e2e-networks:
+	tests/e2e/networks/run.sh $(BACKENDS)
 
 clean:
 	cargo clean

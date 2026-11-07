@@ -1,13 +1,18 @@
 mod app;
 mod backup_ops;
+mod clone;
 mod control;
+mod disk_usage;
 mod handler;
 mod local;
 mod log_shipper;
 mod machine;
+mod network;
+mod packages;
 mod ports;
 mod service_ops;
 mod service_stats;
+mod tls_ask;
 mod workers;
 
 use std::sync::Arc;
@@ -48,6 +53,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         }
         BootDecision::RolledBack { from, to } => {
             error!(from, to, "new release failed to start repeatedly; the previous binary was restored and will start now");
+            daemon_core::error_reports::flush(Duration::from_secs(2));
             std::process::exit(EXIT_RESTART);
         }
     };
@@ -128,6 +134,8 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         workers::forward_streams(Arc::clone(&app));
         workers::spawn_all(Arc::clone(&app));
         local::serve(Arc::clone(&app));
+        tls_ask::serve(Arc::clone(&app));
+        tokio::spawn(network::restore_all(Arc::clone(&app)));
 
         let firewall = app.config.read().unwrap().integrations.firewall;
         ports::restore(firewall, &paths.state_dir).await;

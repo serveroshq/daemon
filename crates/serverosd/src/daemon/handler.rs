@@ -15,7 +15,7 @@ use daemon_streams::LogTail;
 use serde_json::{json, Value};
 
 use super::app::App;
-use super::{machine, ports};
+use super::{machine, packages, ports};
 
 pub struct JobHandler {
     pub app: Arc<App>,
@@ -30,21 +30,38 @@ impl Handler for JobHandler {
     fn known_secrets(&self, job: &Job) -> Vec<String> {
         match job {
             Job::Deploy(spec) => spec.env.values().cloned().collect(),
+            Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
+            Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
             _ => Vec::new(),
         }
     }
 }
 
+/// Who asked for the job, and where from: the panel's job id always, and
+/// for an agent the MCP call (via, client, tool, call id), so each line in
+/// actions.log traces back to the request that caused it.
 fn actor_of(ctx: &JobContext) -> Actor {
     let a = &ctx.command.actor;
-    match a.kind {
+    let actor = match a.kind {
         ActorKind::User => Actor::user(&a.name),
         ActorKind::Automation | ActorKind::Panel => Actor::automation(&a.name),
         ActorKind::Scheduler => Actor::scheduler(),
         ActorKind::Local => Actor::local(&a.name),
         ActorKind::Daemon => Actor::daemon(),
+    };
+    let mut actor = actor.with("job", ctx.id.to_string());
+    for (key, value) in [
+        ("via", &a.via),
+        ("client", &a.client),
+        ("tool", &a.tool),
+        ("call", &a.call),
+    ] {
+        if let Some(value) = value {
+            actor = actor.with(key, value.clone());
+        }
     }
+    actor
 }
 
 fn denied(d: daemon_capability::Denied) -> Failure {
@@ -230,8 +247,13 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::Facts => {
             let grant = authorize(Operation::Machine(MachineOp::ReadFacts))?;
-            let facts = daemon_telemetry::gather_facts();
-            *app.facts.write().unwrap_or_else(|p| p.into_inner()) = facts.clone();
+            let facts = {
+                let mut current = app.facts.write().unwrap_or_else(|p| p.into_inner());
+                let mut facts = daemon_telemetry::gather_facts();
+                facts.security = current.security.clone();
+                *current = facts.clone();
+                facts
+            };
             app.send(Outbound::Facts(facts.clone())).await;
             grant.finish::<String>(&Ok(()), None);
             Ok(serde_json::to_value(facts).unwrap_or(Value::Null))
@@ -321,10 +343,35 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             }))
         }
 
+        Job::ServiceInspect { service } => {
+            // Any container, adopted or not: discovery reads the same thing.
+            let container = service
+                .strip_prefix("docker:")
+                .filter(|c| daemon_services::docker::valid_container_ref(c))
+                .ok_or_else(|| {
+                    Failure::new(
+                        "inspect",
+                        format!("{service:?} isn't a container, so there's no config to show"),
+                    )
+                })?
+                .to_string();
+            let grant = authorize(Operation::Service(ServiceOp::Inspect {
+                service: service.clone(),
+            }))?;
+            let result = DockerAdapter::default()
+                .inspect(&container)
+                .await
+                .map(|inspect| json!({ "inspect": inspect }))
+                .map_err(|e| Failure::new("inspect", e.to_string()));
+            grant.finish(&result.as_ref().map(|_| ()), None);
+            result
+        }
+
         Job::ServiceExec {
             service,
             command,
             timeout_secs,
+            env,
         } => {
             let managed = managed(&app, &service).await?;
             let container = super::service_ops::container_of(&managed)
@@ -341,7 +388,8 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Service(ServiceOp::Exec {
                 service: managed.key.clone(),
             }))?;
-            let result = super::service_ops::exec(&ctx, &container, &command, timeout_secs).await;
+            let result =
+                super::service_ops::exec(&ctx, &container, &command, timeout_secs, &env).await;
             let summary: String = command.chars().take(80).collect();
             grant.finish(&result.as_ref().map(|_| ()), Some(&summary));
             result
@@ -376,7 +424,9 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Service(ServiceOp::Remove {
                 service: managed.key.clone(),
             }))?;
-            let result = if adopted {
+            let result = if let RunBy::Systemd { unit } = &managed.run_by {
+                super::service_ops::remove_systemd(&app, &ctx, &managed, unit).await
+            } else if adopted {
                 super::service_ops::remove_adopted(&app, &ctx, &managed, delete_data).await
             } else {
                 super::service_ops::remove(&app, &ctx, &managed, delete_data).await
@@ -662,6 +712,70 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(value)
         }
 
+        Job::Release(spec) => {
+            let owner = managed(&app, &spec.service).await?;
+            let grant = authorize(Operation::Deploy(DeployOp::Release {
+                service: owner.name.clone(),
+                path: PathBuf::from(&spec.path),
+            }))?;
+            let user = match daemon_deploy::native::AppUser::lookup(&spec.user) {
+                Ok(user) => user,
+                Err(failure) => {
+                    grant.finish(&Err(failure.clone()), None);
+                    return Err(failure);
+                }
+            };
+            let reload_app = Arc::clone(&app);
+            let reload_actor = actor.clone();
+            let reload = move |wanted: daemon_protocol::ReleaseReload| -> daemon_deploy::native::ReloadFuture {
+                let app = Arc::clone(&reload_app);
+                let actor = reload_actor.clone();
+                Box::pin(async move {
+                    let target = managed(&app, &wanted.service).await?;
+                    let service = target.name.clone();
+                    let op = match wanted.action {
+                        ServiceAction::Start => ServiceOp::Start { service },
+                        ServiceAction::Stop => ServiceOp::Stop { service },
+                        ServiceAction::Restart => ServiceOp::Restart { service },
+                        ServiceAction::Reload => ServiceOp::Reload { service },
+                    };
+                    let grant = app
+                        .broker
+                        .authorize(Request {
+                            actor,
+                            operation: Operation::Service(op),
+                            confirmed,
+                        })
+                        .map_err(denied)?;
+                    let result = lifecycle(&target, Some(wanted.action), None).await.map(|_| ());
+                    grant.finish(&result, None);
+                    result
+                })
+            };
+            let result = daemon_deploy::native::release(&ctx, &spec, &user, &reload).await;
+            // An atomic release's files live beside the app's folder, which is
+            // now a link to them: ServerOS may open them as it could the folder.
+            if result.is_ok() && spec.mode == daemon_protocol::ReleaseMode::Atomic {
+                let releases =
+                    PathBuf::from(format!("{}-releases", spec.path.trim_end_matches('/')));
+                if !owner.roots.contains(&releases) {
+                    let mut owner = owner.clone();
+                    owner.roots.push(releases.clone());
+                    let _ = Registry::new(&app.state).upsert(owner);
+                }
+                app.add_roots(&[releases]);
+            }
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("commit {}", &r.commit[..7.min(r.commit.len())]))
+                    .as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
         Job::Rollback {
             service,
             release,
@@ -718,6 +832,46 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 fields.insert("restored".into(), Value::Array(restored));
             }
             Ok(value)
+        }
+
+        Job::ServiceClone {
+            service,
+            name,
+            port,
+            container_port,
+            domain,
+            copy_data,
+        } => {
+            let managed = managed(&app, &service).await?;
+            let grant = authorize(Operation::Service(ServiceOp::Create {
+                service: name.clone(),
+            }))?;
+            ctx.progress
+                .line(format!("cloning {} as {name}", managed.name))
+                .await;
+            let result = super::clone::clone(
+                &app,
+                &ctx,
+                &managed,
+                super::clone::CloneRequest {
+                    name: name.clone(),
+                    port,
+                    container_port,
+                    domain,
+                    copy_data,
+                },
+            )
+            .await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(&name));
+            result
+        }
+
+        Job::DiskUsage { path } => {
+            let path = super::disk_usage::checked_path(path)?;
+            let grant = authorize(Operation::Machine(MachineOp::ReadMetrics))?;
+            let result = super::disk_usage::report(&path).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(&path));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
 
         Job::Snapshots { service } => {
@@ -825,7 +979,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             } else {
                 MachineOp::QueryPackageUpdates
             }))?;
-            let result = machine::package_updates(&ctx, apply, security_only).await;
+            let result = packages::package_updates(&ctx, apply, security_only).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result
@@ -847,10 +1001,56 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let grant = authorize(Operation::Machine(MachineOp::ApplyPackageUpdates {
                 security_only: false,
             }))?;
-            let result = machine::install_packages(&ctx, &packages).await;
+            let result = packages::install_packages(&ctx, &packages).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 Some(format!("{} packages", packages.len())).as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::PackageAdd { packages: names } => {
+            let grant = authorize(Operation::Machine(MachineOp::AddPackages {
+                packages: names.clone(),
+            }))?;
+            let result = packages::add_packages(&ctx, &names).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some(names.join(" ").as_str()));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::PackageInstallVersions {
+            packages: versions,
+            allow_downgrade,
+        } => {
+            let grant = authorize(Operation::Machine(MachineOp::ApplyPackageUpdates {
+                security_only: false,
+            }))?;
+            let result = packages::install_versions(&ctx, &versions, allow_downgrade).await;
+            let note = versions
+                .iter()
+                .map(|p| format!("{}={}", p.name, p.version))
+                .collect::<Vec<_>>()
+                .join(" ");
+            grant.finish(&result.as_ref().map(|_| ()), Some(note.as_str()));
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::PackageHold {
+            packages: names,
+            hold,
+        } => {
+            let grant = authorize(Operation::Machine(MachineOp::HoldPackages {
+                hold,
+                packages: names.clone(),
+            }))?;
+            let result = packages::hold_packages(&ctx, &names, hold).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("{} held", r.held.len()))
+                    .as_deref(),
             );
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
@@ -879,6 +1079,29 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             }
             grant.finish(&result.as_ref().map(|_| ()), None);
             Ok(json!({"status": result?}))
+        }
+
+        Job::Network(spec) => {
+            // Checked before the audit line, which names the network.
+            daemon_network::spec::check_network_id(&spec.network)?;
+            let grant = authorize(Operation::Machine(MachineOp::WriteNetwork {
+                network: spec.network.clone(),
+            }))?;
+            let backend = app.config.read().unwrap().integrations.firewall;
+            let result = app
+                .networks
+                .apply(
+                    &daemon_network::exec::SystemExec,
+                    backend,
+                    &spec,
+                    Some(&ctx.progress),
+                )
+                .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(&format!("{:?}", spec.action).to_lowercase()),
+            );
+            result
         }
 
         Job::SshKey {

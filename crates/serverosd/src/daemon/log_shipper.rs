@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use daemon_core::redact::redact;
 use daemon_import::history::History;
 use daemon_protocol::driver::Outbound;
 use daemon_protocol::{LogBatch, LogEntry, LogStream, ServiceStatus};
@@ -26,13 +25,7 @@ const MAX_LINE_BYTES: usize = 8 * 1024;
 const NEW_CONTAINER_LOOKBACK_MS: i64 = 30_000;
 
 pub async fn run(app: Arc<App>) {
-    let (enabled, cap) = {
-        let c = app.config.read().unwrap();
-        (c.logs.enabled, c.logs.lines_per_second.max(1) as usize)
-    };
-    if !enabled {
-        return;
-    }
+    let cap = app.config.read().unwrap().logs.lines_per_second.max(1) as usize;
 
     let (tx, rx) = mpsc::channel::<LogEntry>(4096);
     let dropped = Arc::new(AtomicU64::new(0));
@@ -54,6 +47,21 @@ pub async fn run(app: Arc<App>) {
         tick.tick().await;
         app.supervisor.tick("log_shipper");
 
+        // Turned off, by daemon.toml or the panel: stop reading anything.
+        // Turned back on, it starts from then, not from where it stopped.
+        if !app.config.read().unwrap().logs.enabled {
+            for (_, task) in containers.drain() {
+                task.abort();
+            }
+            if let Some((_, task)) = journal.take() {
+                task.abort();
+            }
+            shipper.cursors.lock().unwrap().clear();
+            *journal_cursor.lock().unwrap() = None;
+            first = true;
+            continue;
+        }
+
         if let Some(running) = running_containers().await {
             containers.retain(|id, task| {
                 let keep = running.contains_key(id) && !task.is_finished();
@@ -64,6 +72,14 @@ pub async fn run(app: Arc<App>) {
             });
 
             for (id, name) in running {
+                // A skipped service isn't even read; one skipped since it
+                // started stops being read.
+                if daemon_core::logskip::skips_service(&name) {
+                    if let Some(task) = containers.remove(&id) {
+                        task.abort();
+                    }
+                    continue;
+                }
                 if containers.contains_key(&id) {
                     continue;
                 }
@@ -264,6 +280,10 @@ impl Shipper {
         line: &str,
         admit: Admit,
     ) -> bool {
+        // Never sent: a skipped service, or a line a skip pattern matches.
+        if daemon_core::logskip::skips_line(Some(name), line) {
+            return !self.tx.is_closed();
+        }
         let ts = ts.unwrap_or_else(now_ms);
 
         let mut entries = Vec::with_capacity(2);
@@ -291,7 +311,7 @@ impl Shipper {
             ts,
             stream,
             priority,
-            line: clip(&redact(line)),
+            line: clip(&daemon_core::ipmask::outgoing(line)),
         });
 
         {
@@ -379,6 +399,7 @@ fn systemd_units(app: &App) -> BTreeSet<String> {
         .filter(|s| s.status == ServiceStatus::Running)
         .filter_map(|s| s.key.strip_prefix("systemd:"))
         .filter(|unit| !unit.starts_with("serverosd"))
+        .filter(|unit| !daemon_core::logskip::skips_service(unit))
         .map(str::to_string)
         .collect()
 }

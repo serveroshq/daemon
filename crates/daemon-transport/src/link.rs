@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use tracing::{debug, info, warn};
 
-use crate::{tls, HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT};
+use crate::{tls, CONNECT_TIMEOUT, HANDSHAKE_TIMEOUT, HEARTBEAT_INTERVAL, LIVENESS_TIMEOUT};
 
 #[derive(Debug, Error)]
 pub enum LinkError {
@@ -22,6 +22,8 @@ pub enum LinkError {
         url: String,
         source: Box<tokio_tungstenite::tungstenite::Error>,
     },
+    #[error("the panel did not answer the connection within {0:?}")]
+    ConnectTimeout(Duration),
     #[error("the panel did not answer the handshake within {0:?}")]
     HandshakeTimeout(Duration),
     #[error("the panel closed the connection during the handshake")]
@@ -71,13 +73,21 @@ impl Link {
         ServerName::try_from(host.clone())
             .map_err(|e| LinkError::HandshakeMalformed(e.to_string()))?;
 
-        let (socket, _) = tokio_tungstenite::connect_async_tls_with_config(
-            url,
-            None,
-            false,
-            Some(Connector::Rustls(tls_config)),
+        // Dialling (TCP, TLS and the WebSocket upgrade) gets a deadline too.
+        // Without one, a dial the gateway never answered (say the panel's
+        // machine froze or rebooted mid-handshake) waits forever: nothing is
+        // sent after the TLS hello, so no reset ever arrives to end it.
+        let (socket, _) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            tokio_tungstenite::connect_async_tls_with_config(
+                url,
+                None,
+                false,
+                Some(Connector::Rustls(tls_config)),
+            ),
         )
         .await
+        .map_err(|_| LinkError::ConnectTimeout(CONNECT_TIMEOUT))?
         .map_err(|source| LinkError::Connect {
             url: url.into(),
             source: Box::new(source),

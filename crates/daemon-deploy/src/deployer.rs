@@ -213,6 +213,7 @@ impl Deployer {
                 port: spec.port.unwrap_or(0),
                 deployed_at: daemon_state::State::now(),
                 status: "live".into(),
+                http: spec.health.is_some(),
             };
             ReleaseLedger::new(&self.state)
                 .promote(service, release.clone(), RETAINED_RELEASES)
@@ -244,15 +245,37 @@ impl Deployer {
 
         progress.phase("start", Some(60)).await;
         let name = container::container_name(service, commit);
-        let host_port = releases::port_for(commit);
+        let host_port = releases::port_for(service, commit);
         let container_port = spec.port.unwrap_or(80);
+
+        // Folders the Dockerfile declares with VOLUME are the app's data:
+        // each is a volume every release mounts, so a deploy never starts
+        // it over empty. Read the previous release's before it can go.
+        let previous_volumes = match previous {
+            Some(prev) => container::container_volumes(&prev.container).await,
+            None => Default::default(),
+        };
+        let volumes = container::plan_volumes(
+            service,
+            &container::image_volumes(&tag).await?,
+            &previous_volumes,
+        );
+        for (volume, path) in &volumes {
+            container::ensure_volume(volume, service).await?;
+            progress
+                .line(format!("{path} is kept in volume {volume} between deploys"))
+                .await;
+        }
+
         container::remove(&name, progress).await;
         container::run(
             &name,
             &tag,
+            service,
             host_port,
             container_port,
             env_file.as_deref(),
+            &volumes,
             Duration::from_secs(120),
             cancel,
             progress,
@@ -260,7 +283,7 @@ impl Deployer {
         .await?;
 
         progress.phase("health", Some(70)).await;
-        health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
+        Self::check(&name, host_port, spec.health.as_ref(), progress).await?;
 
         if !spec.domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
@@ -272,7 +295,7 @@ impl Deployer {
         }
 
         progress.phase("verify", Some(90)).await;
-        health::wait_healthy(host_port, spec.health.as_ref(), progress).await?;
+        Self::check(&name, host_port, spec.health.as_ref(), progress).await?;
 
         let ledger = ReleaseLedger::new(&self.state);
         let release = Release {
@@ -282,12 +305,13 @@ impl Deployer {
             port: host_port,
             deployed_at: daemon_state::State::now(),
             status: "live".into(),
+            http: spec.health.is_some(),
         };
         let evicted = ledger
             .promote(service, release, RETAINED_RELEASES)
             .map_err(|e| Failure::new("record", e.to_string()))?;
 
-        if let Some(prev) = previous {
+        if let Some(prev) = to_drain(previous, &name) {
             progress.phase("drain", Some(95)).await;
             tokio::time::sleep(Duration::from_secs(5)).await;
             if let Err(e) =
@@ -317,6 +341,34 @@ impl Deployer {
             previous: previous.map(|p| p.commit.clone()),
             restart_note: None,
         })
+    }
+
+    /// A release that answers HTTP is asked for its health page. One that
+    /// doesn't, like a chat bot or a worker, passes if its container is
+    /// still running a few seconds after starting. One that fails carries
+    /// the container's last log lines, which usually say why (it crashed on
+    /// start, or listens on another port), since the container is removed.
+    async fn check(
+        container: &str,
+        port: u16,
+        health: Option<&daemon_protocol::HealthCheck>,
+        progress: &daemon_jobs::Progress,
+    ) -> Result<(), Failure> {
+        let result = match health {
+            Some(check) => health::wait_healthy(port, Some(check), progress).await,
+            None => health::wait_running(container, progress).await,
+        };
+        match result {
+            Err(failure) if failure.output_tail.is_empty() => {
+                let logs = container::logs_tail(container, 40, progress).await;
+                Err(if logs.is_empty() {
+                    failure
+                } else {
+                    failure.with_output(logs)
+                })
+            }
+            other => other,
+        }
     }
 
     pub async fn rollback(
@@ -365,7 +417,11 @@ impl Deployer {
         .await?;
 
         progress.phase("health", Some(60)).await;
-        health::wait_healthy(release.port, None, progress).await?;
+        if release.http {
+            health::wait_healthy(release.port, None, progress).await?;
+        } else {
+            health::wait_running(&release.container, progress).await?;
+        }
 
         if !domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
@@ -400,6 +456,13 @@ impl Deployer {
             restart_note: None,
         })
     }
+}
+
+/// The release to stop once the new one is live: the one before it, unless
+/// it was the same commit deployed again, whose container the new one has
+/// already replaced (same name), so stopping it would take the app down.
+fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Release> {
+    previous.filter(|prev| prev.container != container)
 }
 
 const MAX_JOB_FILES: usize = 64;
@@ -503,6 +566,28 @@ mod tests {
         let mut big = std::collections::BTreeMap::new();
         big.insert("big".to_string(), "x".repeat(MAX_JOB_FILE_BYTES + 1));
         assert!(write_files(dir.path(), &big).is_err());
+    }
+
+    #[test]
+    fn redeploying_the_live_commit_does_not_stop_it() {
+        let release = |container: &str| Release {
+            commit: "a".repeat(40),
+            image: "serveros/shop:aaaaaaaaaaaa".into(),
+            container: container.into(),
+            port: 20000,
+            deployed_at: 0,
+            status: "live".into(),
+            http: true,
+        };
+        let same = release("serveros-shop-aaaaaaaaaaaa");
+        let older = release("serveros-shop-bbbbbbbbbbbb");
+
+        assert!(to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa").is_none());
+        assert_eq!(
+            to_drain(Some(&older), "serveros-shop-aaaaaaaaaaaa").map(|r| r.container.as_str()),
+            Some("serveros-shop-bbbbbbbbbbbb")
+        );
+        assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
     }
 
     #[test]

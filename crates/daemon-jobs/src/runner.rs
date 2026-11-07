@@ -66,7 +66,8 @@ impl Runner {
     }
 
     pub async fn submit(&self, id: Uuid, command: Command) {
-        let payload = serde_json::to_string(&command.job).unwrap_or_default();
+        let secrets = self.handler.known_secrets(&command.job);
+        let payload = recorded_payload(&command.job, &secrets);
         let actor = format!("{:?} {}", command.actor.kind, command.actor.name).to_lowercase();
         let kind = job_kind(&command.job);
 
@@ -135,12 +136,7 @@ impl Runner {
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, cancel_tx);
 
-        let progress = Progress::new(
-            id,
-            Arc::clone(&self.state),
-            self.updates.clone(),
-            self.handler.known_secrets(&command.job),
-        );
+        let progress = Progress::new(id, Arc::clone(&self.state), self.updates.clone(), secrets);
         let ctx = JobContext {
             id,
             command,
@@ -281,6 +277,31 @@ impl Runner {
     }
 }
 
+/// The job as state.db keeps it: a setting, token or password the handler
+/// knows of is replaced wherever it is a whole value, and scrubbed from
+/// longer text as the log is, so it never rests on disk.
+fn recorded_payload(job: &Job, secrets: &[String]) -> String {
+    fn scrub(value: &mut serde_json::Value, secrets: &[&str]) {
+        match value {
+            serde_json::Value::String(s) => {
+                *s = if !s.is_empty() && secrets.contains(&s.as_str()) {
+                    daemon_core::redact::REDACTED.to_string()
+                } else {
+                    daemon_core::redact::redact_known(s, secrets)
+                };
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| scrub(v, secrets)),
+            serde_json::Value::Object(map) => map.values_mut().for_each(|v| scrub(v, secrets)),
+            _ => {}
+        }
+    }
+
+    let mut value = serde_json::to_value(job).unwrap_or_default();
+    let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    scrub(&mut value, &secrets);
+    value.to_string()
+}
+
 async fn finish(
     state: &State,
     updates: &mpsc::Sender<JobUpdate>,
@@ -332,6 +353,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Facts => "facts",
         Job::ServiceAction { .. } => "service_action",
         Job::ServiceLogs { .. } => "service_logs",
+        Job::ServiceInspect { .. } => "service_inspect",
         Job::ReadFile { .. } => "read_file",
         Job::WriteFile { .. } => "write_file",
         Job::ListDir { .. } => "list_dir",
@@ -339,6 +361,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Chmod { .. } => "chmod",
         Job::Chown { .. } => "chown",
         Job::Deploy(_) => "deploy",
+        Job::Release(_) => "release",
         Job::Rollback { .. } => "rollback",
         Job::Backup { .. } => "backup",
         Job::BackupTo { .. } => "backup_to",
@@ -346,6 +369,9 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Restore { .. } => "restore",
         Job::PackageUpdates { .. } => "package_updates",
         Job::PackageInstall { .. } => "package_install",
+        Job::PackageInstallVersions { .. } => "package_install_versions",
+        Job::PackageAdd { .. } => "package_add",
+        Job::PackageHold { .. } => "package_hold",
         Job::Reboot => "reboot",
         Job::FirewallRule { .. } => "firewall_rule",
         Job::SshKey { .. } => "ssh_key",
@@ -358,6 +384,9 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",
         Job::Snapshots { .. } => "snapshots",
+        Job::DiskUsage { .. } => "disk_usage",
+        Job::ServiceClone { .. } => "service_clone",
+        Job::Network(_) => "network",
     }
 }
 
@@ -367,11 +396,13 @@ pub fn mutates(job: &Job) -> bool {
         Job::Discover
             | Job::Facts
             | Job::ServiceLogs { .. }
+            | Job::ServiceInspect { .. }
             | Job::ReadFile { .. }
             | Job::ListDir { .. }
             | Job::TailLogs { .. }
             | Job::PackageUpdates { apply: false, .. }
             | Job::Snapshots { .. }
+            | Job::DiskUsage { .. }
     )
 }
 
@@ -411,6 +442,10 @@ mod tests {
                 kind: ActorKind::User,
                 name: "dylan@serveros.com".into(),
                 id: None,
+                via: None,
+                client: None,
+                tool: None,
+                call: None,
             },
             confirmed: true,
             timeout_secs: None,
@@ -496,6 +531,21 @@ mod tests {
         let updates = collect_until_terminal(&mut rx).await;
         assert_eq!(updates.last().unwrap().state, JobState::Refused);
 
+        let network = Job::Network(Box::new(daemon_protocol::NetworkSpec {
+            network: "p7k2q9".into(),
+            action: daemon_protocol::NetworkAction::Down,
+            address: None,
+            listen_port: None,
+            peers: vec![],
+            expose: vec![],
+        }));
+        assert!(mutates(&network));
+        runner.submit(Uuid::new_v4(), command(network)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
+
         runner.submit(Uuid::new_v4(), command(Job::Discover)).await;
         assert_eq!(
             collect_until_terminal(&mut rx).await.last().unwrap().state,
@@ -523,5 +573,32 @@ mod tests {
         assert_eq!(update.state, JobState::Failed);
         assert!(update.error.unwrap().message.contains("restarted"));
         assert_eq!(state.job(id).unwrap().unwrap().status, JobStatus::Failed);
+    }
+
+    #[test]
+    fn recorded_jobs_keep_no_secrets() {
+        let job = Job::ServiceExec {
+            service: "docker:abc".into(),
+            command: "pg_dump -h \"$SOURCE_HOST\" > /tmp/x".into(),
+            timeout_secs: Some(3600),
+            env: [
+                ("SOURCE_PASSWORD", "pa\"ss\\word-with-quotes"),
+                ("SOURCE_PORT", "5432"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+        };
+        let secrets = vec!["pa\"ss\\word-with-quotes".to_string(), "5432".to_string()];
+        let payload = recorded_payload(&job, &secrets);
+
+        assert!(!payload.contains("word-with-quotes"), "{payload}");
+        assert!(!payload.contains("5432"), "{payload}");
+        // What isn't a secret is kept, and it is still the job's JSON.
+        let back: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(back["type"], "service_exec");
+        assert_eq!(back["env"]["SOURCE_PASSWORD"], "[redacted]");
+        assert_eq!(back["command"], "pg_dump -h \"$SOURCE_HOST\" > /tmp/x");
+        assert_eq!(back["timeout_secs"], 3600);
     }
 }

@@ -76,6 +76,16 @@ fn hello(app: &App) -> Hello {
         supported_majors: daemon_protocol::SUPPORTED_MAJORS.to_vec(),
         facts,
         oldest_local_sample_ts: app.state.oldest_sample_ts().ok().flatten(),
+        log_ip_masking: Some(crate::settings::masking_name(config.logs.mask_ips).to_string()),
+        log_skip: Some(crate::settings::skip_to_wire(&config.logs.skip)),
+        security_watch: Some(config.security.watch),
+        discovery: Some(config.discovery.enabled),
+        logs: Some(config.logs.enabled),
+        updates_automatic: Some(config.updates.automatic),
+        // What daemon.toml says, even when SERVEROS_ERROR_REPORTS=0 keeps
+        // reports off locally: the panel shows the policy it set.
+        error_reports: Some(config.error_reports.enabled),
+        pinned_version: Some(config.updates.pinned_version.clone()),
     }
 }
 
@@ -268,26 +278,27 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                     .await;
                 }
             }
-            Control::Reconfigure {
-                updates_channel,
-                pinned_version,
-                mode,
-            } => {
-                let mut changed = Vec::new();
-                {
+            Control::Reconfigure { mode, settings } => {
+                let security_watch = settings.security_watch;
+                let discovery_on = settings.discovery == Some(true);
+                let mut changed = {
                     let mut config = app.config.write().unwrap();
-                    if let Some(channel) = updates_channel {
-                        config.updates.channel = channel.clone();
-                        changed.push(format!("channel={channel}"));
+                    let changed = crate::settings::apply(&mut config, settings);
+                    if !changed.is_empty() {
+                        if let Err(e) = config.save(&app.paths.config_file()) {
+                            warn!(error = %e, "couldn't save the panel's settings; they hold until the daemon restarts");
+                        }
                     }
-                    if let Some(pin) = pinned_version {
-                        changed.push(format!(
-                            "pin={}",
-                            pin.clone().unwrap_or_else(|| "none".into())
-                        ));
-                        config.updates.pinned_version = pin;
-                    }
-                    let _ = config.save(&app.paths.config_file());
+                    changed
+                };
+                if security_watch.is_some() {
+                    // Read (or clear) it now rather than at the next tick.
+                    let app = Arc::clone(app);
+                    tokio::spawn(async move { super::workers::refresh_security(&app).await });
+                }
+                if discovery_on {
+                    // Look now rather than at the next interval.
+                    app.discovery_wake.notify_one();
                 }
                 if let Some(mode) = mode {
                     app.runner().set_mode(mode);

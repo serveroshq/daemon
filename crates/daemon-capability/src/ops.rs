@@ -16,10 +16,13 @@ pub enum MachineOp {
     ListContainers,
     QueryPackageUpdates,
     ApplyPackageUpdates { security_only: bool },
+    HoldPackages { hold: bool, packages: Vec<String> },
+    AddPackages { packages: Vec<String> },
     Reboot,
     ReadFirewall,
     WriteFirewall { rule: String },
     ManageSshKeys { user: String },
+    WriteNetwork { network: String },
     ReadJournal { unit: Option<String> },
     ReadNamedLog { path: PathBuf },
 }
@@ -31,6 +34,7 @@ pub enum ServiceOp {
     Restart { service: String },
     Reload { service: String },
     ReadLogs { service: String },
+    Inspect { service: String },
     ReadUsage { service: String },
     ReadConfig { service: String, path: PathBuf },
     Create { service: String },
@@ -51,6 +55,7 @@ pub enum DeployOp {
     ObtainCertificate { domains: Vec<String> },
     WriteEnvFile { service: String, path: PathBuf },
     Rollback { service: String },
+    Release { service: String, path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,10 +82,14 @@ impl Operation {
                 MachineOp::ListContainers => "machine.containers",
                 MachineOp::QueryPackageUpdates => "packages.query",
                 MachineOp::ApplyPackageUpdates { .. } => "packages.apply",
+                MachineOp::HoldPackages { .. } => "packages.hold",
+                // Installing what isn't there yet, from the machine's own repositories.
+                MachineOp::AddPackages { .. } => "packages.add",
                 MachineOp::Reboot => "machine.reboot",
                 MachineOp::ReadFirewall => "firewall.read",
                 MachineOp::WriteFirewall { .. } => "firewall.write",
                 MachineOp::ManageSshKeys { .. } => "ssh.keys",
+                MachineOp::WriteNetwork { .. } => "network.write",
                 MachineOp::ReadJournal { .. } => "journal.read",
                 MachineOp::ReadNamedLog { .. } => "log.read",
             },
@@ -90,6 +99,7 @@ impl Operation {
                 ServiceOp::Restart { .. } => "service.restart",
                 ServiceOp::Reload { .. } => "service.reload",
                 ServiceOp::ReadLogs { .. } => "service.logs",
+                ServiceOp::Inspect { .. } => "service.inspect",
                 ServiceOp::ReadUsage { .. } => "service.usage",
                 ServiceOp::ReadConfig { .. } => "service.config",
                 ServiceOp::Create { .. } => "service.create",
@@ -108,6 +118,7 @@ impl Operation {
                 DeployOp::ObtainCertificate { .. } => "deploy.tls",
                 DeployOp::WriteEnvFile { .. } => "deploy.env",
                 DeployOp::Rollback { .. } => "deploy.rollback",
+                DeployOp::Release { .. } => "deploy.release",
             },
             Operation::Data(d) => match d {
                 DataOp::Snapshot { .. } => "backup.create",
@@ -133,8 +144,15 @@ impl Operation {
                 MachineOp::ApplyPackageUpdates {
                     security_only: false,
                 } => "all updates".into(),
+                MachineOp::HoldPackages { hold, packages } => format!(
+                    "{} {}",
+                    if *hold { "hold" } else { "unhold" },
+                    packages.join(",")
+                ),
+                MachineOp::AddPackages { packages } => packages.join(","),
                 MachineOp::WriteFirewall { rule } => rule.clone(),
                 MachineOp::ManageSshKeys { user } => user.clone(),
+                MachineOp::WriteNetwork { network } => network.clone(),
                 MachineOp::ReadJournal { unit } => unit.clone().unwrap_or_else(|| "system".into()),
                 MachineOp::ReadNamedLog { path } => path.display().to_string(),
                 _ => "machine".into(),
@@ -145,6 +163,7 @@ impl Operation {
                 | ServiceOp::Restart { service }
                 | ServiceOp::Reload { service }
                 | ServiceOp::ReadLogs { service }
+                | ServiceOp::Inspect { service }
                 | ServiceOp::ReadUsage { service }
                 | ServiceOp::Create { service }
                 | ServiceOp::Update { service }
@@ -161,7 +180,9 @@ impl Operation {
                 | DeployOp::SwapContainers { service }
                 | DeployOp::WriteProxyConfig { service }
                 | DeployOp::Rollback { service } => service.clone(),
-                DeployOp::WriteEnvFile { service, path } => format!("{service} {}", path.display()),
+                DeployOp::WriteEnvFile { service, path } | DeployOp::Release { service, path } => {
+                    format!("{service} {}", path.display())
+                }
                 DeployOp::ObtainCertificate { domains } => domains.join(","),
             },
             Operation::Data(d) => match d {
@@ -185,13 +206,17 @@ impl Operation {
             Operation::Machine(m) => matches!(
                 m,
                 MachineOp::ApplyPackageUpdates { .. }
+                    | MachineOp::HoldPackages { .. }
+                    | MachineOp::AddPackages { .. }
                     | MachineOp::Reboot
                     | MachineOp::WriteFirewall { .. }
                     | MachineOp::ManageSshKeys { .. }
+                    | MachineOp::WriteNetwork { .. }
             ),
             Operation::Service(s) => !matches!(
                 s,
                 ServiceOp::ReadLogs { .. }
+                    | ServiceOp::Inspect { .. }
                     | ServiceOp::ReadUsage { .. }
                     | ServiceOp::ReadConfig { .. }
             ),
@@ -204,6 +229,8 @@ impl Operation {
         matches!(
             self,
             Operation::Machine(MachineOp::ApplyPackageUpdates { .. })
+                | Operation::Machine(MachineOp::HoldPackages { .. })
+                | Operation::Machine(MachineOp::AddPackages { .. })
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })
@@ -220,6 +247,7 @@ impl Operation {
             Operation::Deploy(DeployOp::FetchSource { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::Build { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::WriteEnvFile { path, .. }) => Some(path),
+            Operation::Deploy(DeployOp::Release { path, .. }) => Some(path),
             Operation::Data(DataOp::Browse { path })
             | Operation::Data(DataOp::ReadFile { path })
             | Operation::Data(DataOp::WriteFile { path })

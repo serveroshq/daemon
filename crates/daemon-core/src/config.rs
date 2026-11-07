@@ -49,6 +49,61 @@ pub struct Config {
     pub limits: LimitsConfig,
     #[serde(default)]
     pub integrations: IntegrationsConfig,
+    /// Only written when the watch is off, so a config that never turned
+    /// it off still loads on an older daemon.
+    #[serde(default, skip_serializing_if = "SecurityConfig::is_default")]
+    pub security: SecurityConfig,
+    /// Crash and error reports to ServerOS. Only written when changed from
+    /// the default, for the same reason as `security`.
+    #[serde(default, skip_serializing_if = "ErrorReportsConfig::is_default")]
+    pub error_reports: ErrorReportsConfig,
+}
+
+/// Crash and error reports: when the daemon panics or logs an error, a
+/// scrubbed report goes to ServerOS so we can fix it. `enabled = false`
+/// (or `SERVEROS_ERROR_REPORTS=0`) turns them off completely; `dsn` points
+/// them somewhere else instead of the address built into the release.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ErrorReportsConfig {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<String>,
+}
+
+impl Default for ErrorReportsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dsn: None,
+        }
+    }
+}
+
+impl ErrorReportsConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The security watch: SSH settings, failed sign-ins and automatic
+/// updates, read every few minutes and sent with the machine's facts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct SecurityConfig {
+    pub watch: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self { watch: true }
+    }
+}
+
+impl SecurityConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -159,6 +214,15 @@ pub struct DiscoveryConfig {
 pub struct LogsConfig {
     pub enabled: bool,
     pub lines_per_second: u32,
+    /// Replace IP addresses in log lines before they leave the machine.
+    /// Only written when on, so a config that never used it still loads
+    /// on an older daemon.
+    #[serde(skip_serializing_if = "crate::ipmask::IpMasking::is_off")]
+    pub mask_ips: crate::ipmask::IpMasking,
+    /// Services and line patterns that are never sent. Only written when
+    /// there are some, for the same reason.
+    #[serde(skip_serializing_if = "crate::logskip::LogSkip::is_empty")]
+    pub skip: crate::logskip::LogSkip,
 }
 
 impl Default for LogsConfig {
@@ -166,6 +230,8 @@ impl Default for LogsConfig {
         Self {
             enabled: true,
             lines_per_second: 100,
+            mask_ips: crate::ipmask::IpMasking::Off,
+            skip: crate::logskip::LogSkip::default(),
         }
     }
 }
@@ -243,6 +309,8 @@ impl Config {
             files: FilesConfig::default(),
             limits: LimitsConfig::default(),
             integrations: IntegrationsConfig::default(),
+            security: SecurityConfig::default(),
+            error_reports: ErrorReportsConfig::default(),
         }
     }
 
@@ -345,6 +413,43 @@ mod tests {
 
         config.save(&path).unwrap();
 
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn keeps_log_skip_rules_and_leaves_them_out_when_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+        let mut config = Config::new("api.serveros.com", "mch_123");
+        config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("skip"));
+
+        config.logs.skip.services.push("wings".into());
+        config.logs.skip.patterns.push(crate::logskip::SkipPattern {
+            service: Some("nginx*".into()),
+            pattern: r"\d+".into(),
+        });
+        config.save(&path).unwrap();
+
+        assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn error_reports_are_on_by_default_and_only_written_when_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.toml");
+        let mut config = Config::new("api.serveros.com", "mch_123");
+        assert!(config.error_reports.enabled);
+        config.save(&path).unwrap();
+        assert!(!std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("error_reports"));
+
+        config.error_reports.enabled = false;
+        config.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[error_reports]"));
+        assert!(!text.contains("dsn"));
         assert_eq!(Config::load(&path).unwrap(), config);
     }
 

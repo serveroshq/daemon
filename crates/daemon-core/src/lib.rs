@@ -1,6 +1,9 @@
 pub mod buildinfo;
 pub mod config;
+pub mod error_reports;
+pub mod ipmask;
 pub mod links;
+pub mod logskip;
 pub mod paths;
 pub mod redact;
 

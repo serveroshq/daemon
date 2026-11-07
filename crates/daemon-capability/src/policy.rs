@@ -217,6 +217,34 @@ mod tests {
     }
 
     #[test]
+    fn holding_packages_is_a_confirmed_change() {
+        let hold = Operation::Machine(MachineOp::HoldPackages {
+            hold: true,
+            packages: vec!["openssl".into(), "nginx".into()],
+        });
+        let checks = checks_for(&hold);
+
+        assert_eq!(hold.verb(), "packages.hold");
+        assert_eq!(hold.target(), "hold openssl,nginx");
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
+    fn adding_packages_is_a_confirmed_change() {
+        let add = Operation::Machine(MachineOp::AddPackages {
+            packages: vec!["git".into(), "unzip".into()],
+        });
+        let checks = checks_for(&add);
+
+        assert_eq!(add.verb(), "packages.add");
+        assert_eq!(add.target(), "git,unzip");
+        assert!(add.mutates());
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
         let remove = Operation::Service(ServiceOp::Remove {
             service: "docker:abc123def456".into(),
@@ -239,6 +267,18 @@ mod tests {
         assert!(checks.contains(&Check::Confirmation));
         assert!(checks.contains(&Check::ReadOnlyMode));
         assert!(checks.contains(&Check::CreatedOrAdopted));
+    }
+
+    #[test]
+    fn private_networks_are_changes_blocked_in_read_only_mode() {
+        let network = Operation::Machine(MachineOp::WriteNetwork {
+            network: "p7k2q9".into(),
+        });
+
+        assert_eq!(network.verb(), "network.write");
+        assert_eq!(network.target(), "p7k2q9");
+        assert!(network.mutates());
+        assert!(checks_for(&network).contains(&Check::ReadOnlyMode));
     }
 
     #[test]

@@ -5,7 +5,7 @@ binary that connects out to the panel, discovers what is already running,
 adopts it without a restart, and does the deploying, backing up, and
 watching on the panel's behalf.
 
-It runs as root, because updating packages, editing firewall rules, and
+It runs as root, because installing and updating packages, editing firewall rules, and
 driving systemd and Docker need root. It is not a remote shell: everything
 it can do is a fixed, reviewed list in `crates/daemon-capability`, every
 privileged action is written to `/var/log/serveros/actions.log` in plain
@@ -42,7 +42,7 @@ the Docker socket.
 
 | Crate | What it owns |
 | --- | --- |
-| `daemon-core` | Paths, `daemon.toml`, build info, secret redaction |
+| `daemon-core` | Paths, `daemon.toml`, build info, secret redaction, error reports |
 | `daemon-protocol` | The versioned wire protocol; one driver per major |
 | `daemon-audit` | `actions.log` |
 | `daemon-capability` | The privileged operation set and the broker that gates it |
@@ -62,6 +62,7 @@ the Docker socket.
 | `daemon-supervisor` | Self-health and the resource budget |
 | `daemon-selfupdate` | Signed, policy-gated updates with automatic rollback |
 | `daemon-uninstall` | The manifest of what ServerOS created, and its removal |
+| `daemon-network` | Project networks: WireGuard interfaces, their firewall rules, forwarders |
 | `serverosd` | The binary: CLI, control loop, job handler, workers |
 | `release-tool` | Key generation, signing, and manifests for CI |
 
@@ -72,6 +73,7 @@ make build          # debug build
 make test           # the whole suite
 make clippy         # lints, warnings denied
 make linux-check    # type-check for Linux from macOS via Docker
+make e2e-networks   # project networks and data copies on real WireGuard, in Docker
 make release        # static musl binaries in dist/ (needs cargo-zigbuild on macOS)
 ```
 
@@ -117,12 +119,65 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   owns (`/etc/caddy/serveros.d` or `/etc/nginx/serveros.d`), validated
   before reload, reverted if validation fails. Caddy handles TLS itself;
   with nginx, TLS stays whatever certbot or the operator set up.
+- **Wildcard subdomains**: a service on `*.example.com` gets a Caddy site
+  with on-demand TLS, so each subdomain gets its own certificate the first
+  time it's visited, over the usual HTTP challenge, with no DNS provider.
+  The daemon adds `on_demand_tls { ask … }` to the Caddyfile's global
+  options and answers Caddy's question on `127.0.0.1:47019`, saying yes
+  only for a name one label under a wildcard in its own site files. A
+  Caddyfile that already sets `on_demand_tls` is left alone.
 - **Firewall**: ufw rules pass through verbatim. nftables and iptables
   take the port form (`22/tcp`, `from 10.0.0.0/8 to any port 5432`);
   nftables rules live in a table ServerOS owns (`inet serveros`).
+- **Project networks**: the `network` job gives a project its own
+  WireGuard network across machines. Each machine gets an interface named
+  `sos{network}` (`sosp7k2q9`; network ids are at most 12 characters, so
+  the name fits the kernel's 15), one address on it, and exactly the peers
+  the panel lists. Services are offered on that address by small TCP
+  forwarders that only point at loopback or the Docker bridge. The
+  firewall lets in the UDP port, the network on its interface, and local
+  containers reaching an offered port, only over Docker's bridges
+  (`docker*`, `br-*`: a provider network in 172.16.0.0/12 isn't let in); nftables and
+  iptables keep these in a chain of the network's own (`net_{id}`,
+  `SOS-{id}`). With nftables they also go, tagged `serveros:net_{id}`, at
+  the top of every other inet table's input chain, since a `policy drop`
+  there would otherwise win. The private key is made on the machine, kept root-only in
+  `/var/lib/serveros/networks`, and never sent; networks come back up when
+  the daemon starts. `wireguard-tools` is installed if `wg` is missing.
+  The job's fields, checks and results, and how the panel copies a
+  database between machines over the network, are in
+  [docs/project-networks.md](docs/project-networks.md).
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.
+
+## Error reports
+
+When the daemon crashes or logs an error, it sends a short report to
+ServerOS (we use Sentry) so we can find and fix the bug. Reports are
+scrubbed on the machine before they go: no hostname, IP addresses, users or
+request data, and anything that looks like a token, key, password or env
+value is replaced with `[redacted]`. No file contents are ever attached.
+Each report carries the daemon's version and the machine id the panel gave
+it at enrolment, nothing else that identifies the box.
+
+Only our release builds report; a build from source sends nothing unless
+you give it an address. To turn reports off, either:
+
+```toml
+[error_reports]
+enabled = false
+```
+
+in `/etc/serveros/daemon.toml`, or `SERVEROS_ERROR_REPORTS=0` in the
+service's environment (`systemctl edit serverosd`). You can also switch
+them on or off for a machine from its machine policy in the panel. That
+writes the same `enabled` setting and takes effect straight away, no
+restart. `SERVEROS_ERROR_REPORTS=0` always wins: with it set, the reporting
+code is never started and the panel can't turn it back on. To send reports to your own Sentry instead, set
+`dsn = "https://..."` in the same section, or `SERVEROS_SENTRY_DSN`.
+`serverosd debug sentry-test` sends one test report and tells you whether
+it arrived. The gateway follows the same two environment variables.
 
 ## Fixtures
 

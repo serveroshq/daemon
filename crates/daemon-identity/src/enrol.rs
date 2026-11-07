@@ -45,6 +45,10 @@ pub struct EnrolResponse {
     pub panel_host: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// What the panel decided for this machine (logs, discovery, updates),
+    /// written into its config before the daemon first starts.
+    #[serde(default)]
+    pub settings: Option<daemon_protocol::MachineSettings>,
 }
 
 #[derive(Debug, Deserialize)]

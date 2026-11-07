@@ -13,6 +13,9 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long dialling the gateway (TCP, TLS, WebSocket upgrade) may take.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub fn control_url(host: &str, port: u16) -> String {
     if port == 443 {
         format!("wss://{host}/daemon/control")

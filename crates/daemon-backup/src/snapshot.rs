@@ -486,10 +486,10 @@ impl Snapshotter {
 /// Dumps every database in a MySQL or MariaDB container as root, with the
 /// password its image was started with (none if it allows that). Run with
 /// `sh -c` inside the container; it has no single quotes.
-const MYSQL_DUMP: &str = r#"D=mysqldump; command -v mariadb-dump >/dev/null 2>&1 && D=mariadb-dump; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $D --all-databases --single-transaction --routines --triggers --events -uroot "$@""#;
+pub const MYSQL_DUMP: &str = r#"D=mysqldump; command -v mariadb-dump >/dev/null 2>&1 && D=mariadb-dump; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $D --all-databases --single-transaction --routines --triggers --events -uroot "$@""#;
 
 /// Loads a dump into a MySQL or MariaDB container, the same way.
-const MYSQL_CLIENT: &str = r#"C=mysql; command -v mariadb >/dev/null 2>&1 && C=mariadb; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $C -uroot "$@""#;
+pub const MYSQL_CLIENT: &str = r#"C=mysql; command -v mariadb >/dev/null 2>&1 && C=mariadb; P="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; if [ -n "$P" ]; then set -- -p"$P"; fi; exec $C -uroot "$@""#;
 
 fn target_for(service: &ManagedService) -> String {
     match &service.run_by {

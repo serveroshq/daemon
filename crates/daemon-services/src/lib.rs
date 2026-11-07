@@ -1,5 +1,7 @@
 pub mod adoption;
+pub mod clone;
 pub mod docker;
+pub mod exec;
 pub mod registry;
 pub mod systemd;
 

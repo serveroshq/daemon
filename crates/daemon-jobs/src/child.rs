@@ -76,6 +76,12 @@ pub async fn run_child(
     #[cfg(not(unix))]
     let _ = run_as;
 
+    // A cancel an earlier step already saw (changed() won't fire again for
+    // it): don't start this one at all.
+    if *cancel.borrow() {
+        return ChildOutcome::Cancelled { tail: Vec::new() };
+    }
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => return ChildOutcome::Unstartable(format!("could not start {program}: {e}")),
@@ -182,6 +188,178 @@ pub async fn run_child(
     }
 }
 
+/// What a listing command printed: its whole stdout (up to a cap) kept apart
+/// from stderr, for output that's parsed rather than shown, where the last
+/// [`TAIL_LINES`] lines of a mixed stream would lose most of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Captured {
+    Exited {
+        code: i32,
+        stdout: Vec<String>,
+        /// The last lines of stderr.
+        stderr: Vec<String>,
+        /// More than the cap was printed; `stdout` holds the first lines.
+        truncated: bool,
+    },
+    TimedOut,
+    Cancelled,
+    Unstartable(String),
+}
+
+impl Captured {
+    pub fn code(&self) -> Option<i32> {
+        match self {
+            Captured::Exited { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    pub fn stdout(&self) -> &[String] {
+        match self {
+            Captured::Exited { stdout, .. } => stdout,
+            _ => &[],
+        }
+    }
+
+    pub fn stderr(&self) -> &[String] {
+        match self {
+            Captured::Exited { stderr, .. } => stderr,
+            _ => &[],
+        }
+    }
+}
+
+enum Next {
+    Exited(std::io::Result<std::process::ExitStatus>),
+    TimedOut,
+    Cancelled,
+    Continue,
+}
+
+/// Runs a command to read what it prints, rather than to watch it: stdout is
+/// kept whole up to `max_lines` and nothing goes to the job's live log. The
+/// environment is the same clean one [`run_child`] gives.
+pub async fn capture_child(
+    program: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    timeout: Duration,
+    cancel: &mut watch::Receiver<bool>,
+    max_lines: usize,
+) -> Captured {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
+        .env("LC_ALL", "C.UTF-8")
+        .env("HOME", "/var/lib/serveros")
+        .envs(env.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return Captured::Unstartable(format!("could not start {program}: {e}")),
+    };
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let out_task = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        let mut truncated = false;
+        if let Some(stdout) = stdout {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if kept.len() < max_lines {
+                    kept.push(line);
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+        (kept, truncated)
+    });
+    let err_task = tokio::spawn(async move {
+        let mut tail = std::collections::VecDeque::with_capacity(TAIL_LINES);
+        if let Some(stderr) = stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tail.len() == TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        }
+        tail.into_iter().collect::<Vec<String>>()
+    });
+
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut watching = true;
+
+    let status = loop {
+        let next = tokio::select! {
+            status = child.wait() => Next::Exited(status),
+            _ = &mut deadline => Next::TimedOut,
+            changed = cancel.changed(), if watching => match changed {
+                Ok(()) if *cancel.borrow() => Next::Cancelled,
+                Ok(()) => Next::Continue,
+                Err(_) => {
+                    watching = false;
+                    Next::Continue
+                }
+            },
+        };
+
+        match next {
+            Next::Exited(status) => break status,
+            Next::TimedOut => {
+                kill_group(&mut child).await;
+                return Captured::TimedOut;
+            }
+            Next::Cancelled => {
+                kill_group(&mut child).await;
+                return Captured::Cancelled;
+            }
+            Next::Continue => {}
+        }
+    };
+
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => return Captured::Unstartable(e.to_string()),
+    };
+
+    // Something the command left running could hold the pipes open; don't
+    // wait on it for ever.
+    let grace = Duration::from_secs(10);
+    let (stdout, truncated) = match tokio::time::timeout(grace, out_task).await {
+        Ok(Ok(read)) => read,
+        _ => (Vec::new(), false),
+    };
+    let stderr = match tokio::time::timeout(grace, err_task).await {
+        Ok(Ok(tail)) => tail,
+        _ => Vec::new(),
+    };
+
+    Captured::Exited {
+        code: status.code().unwrap_or(-1),
+        stdout,
+        stderr,
+        truncated,
+    }
+}
+
 async fn kill_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -259,6 +437,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancel_an_earlier_step_saw_stops_the_next_one_starting() {
+        let (progress, _rx) = progress();
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        cancel_tx.send(true).unwrap();
+        // The earlier step consumed the change; this one must still see it.
+        cancel.borrow_and_update();
+        let marker = std::env::temp_dir().join(format!("serveros-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let outcome = run_child(
+            "touch",
+            &[marker.to_str().unwrap()],
+            None,
+            &[],
+            Duration::from_secs(5),
+            &mut cancel,
+            &progress,
+            None,
+        )
+        .await;
+
+        assert!(matches!(outcome, ChildOutcome::Cancelled { .. }));
+        assert!(!marker.exists(), "the command must not have run");
+    }
+
+    #[tokio::test]
     async fn times_out_and_kills_the_child() {
         let (progress, _rx) = progress();
         let (_cancel_tx, mut cancel) = watch::channel(false);
@@ -303,6 +507,75 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ChildOutcome::Cancelled { .. }));
+    }
+
+    #[tokio::test]
+    async fn capture_keeps_all_of_stdout_up_to_the_cap() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+
+        let captured = capture_child(
+            "sh",
+            &["-c", "seq 1 120; echo oops >&2; exit 2"],
+            &[],
+            Duration::from_secs(5),
+            &mut cancel,
+            5000,
+        )
+        .await;
+
+        assert_eq!(captured.code(), Some(2));
+        assert_eq!(captured.stdout().len(), 120, "more than the 40-line tail");
+        assert_eq!(captured.stdout()[0], "1");
+        assert_eq!(captured.stderr(), &["oops".to_string()]);
+
+        let capped = capture_child(
+            "sh",
+            &["-c", "seq 1 120"],
+            &[],
+            Duration::from_secs(5),
+            &mut cancel,
+            100,
+        )
+        .await;
+        assert!(matches!(
+            capped,
+            Captured::Exited {
+                truncated: true,
+                ..
+            }
+        ));
+        assert_eq!(capped.stdout().len(), 100);
+    }
+
+    #[tokio::test]
+    async fn capture_times_out_and_can_be_cancelled() {
+        let (_cancel_tx, mut cancel) = watch::channel(false);
+        let timed_out = capture_child(
+            "sh",
+            &["-c", "sleep 30"],
+            &[],
+            Duration::from_millis(300),
+            &mut cancel,
+            10,
+        )
+        .await;
+        assert_eq!(timed_out, Captured::TimedOut);
+
+        let (cancel_tx, mut cancel) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = cancel_tx.send(true);
+        });
+        let cancelled = capture_child(
+            "sh",
+            &["-c", "sleep 30"],
+            &[],
+            Duration::from_secs(30),
+            &mut cancel,
+            10,
+        )
+        .await;
+        assert_eq!(cancelled, Captured::Cancelled);
     }
 
     #[tokio::test]

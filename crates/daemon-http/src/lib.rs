@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,6 +157,15 @@ impl Client {
         self.request("POST", url, &all, Some(&bytes)).await
     }
 
+    pub async fn post(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Response, HttpError> {
+        self.request("POST", url, headers, Some(body)).await
+    }
+
     pub async fn put(
         &self,
         url: &str,
@@ -195,26 +205,13 @@ impl Client {
                     host: host.clone(),
                     source,
                 })?;
-            let mut last_err = None;
-            let mut tcp = None;
-
-            for addr in addrs {
-                match TcpStream::connect(addr).await {
-                    Ok(stream) => {
-                        tcp = Some(stream);
-                        break;
-                    }
-                    Err(e) => last_err = Some(e),
-                }
-            }
-
-            let tcp = tcp.ok_or_else(|| HttpError::Connect {
-                host: host.clone(),
-                port,
-                source: last_err.unwrap_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses")
-                }),
-            })?;
+            let tcp = connect_any(addrs.collect())
+                .await
+                .map_err(|source| HttpError::Connect {
+                    host: host.clone(),
+                    port,
+                    source,
+                })?;
 
             let server_name =
                 ServerName::try_from(host.clone()).map_err(|_| HttpError::Url(url.into()))?;
@@ -252,7 +249,19 @@ impl Client {
             let mut chunk = [0u8; 16 * 1024];
 
             loop {
-                let n = tls.read(&mut chunk).await?;
+                let n = match tls.read(&mut chunk).await {
+                    Ok(n) => n,
+                    // Some servers (Sentry's ingest among them) close without
+                    // a TLS close_notify. That's fine once the whole response
+                    // is here; anything shorter is still an error.
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof
+                            && response_complete(&raw) =>
+                    {
+                        0
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 if n == 0 {
                     break;
@@ -277,11 +286,89 @@ impl Client {
     }
 }
 
+/// How long one address gets before the next is tried alongside it.
+const NEXT_ATTEMPT_AFTER: Duration = Duration::from_millis(250);
+
+/// Connects to whichever address answers first, IPv6 and IPv4 taken in
+/// turn and each new attempt started 250ms after the last (Happy
+/// Eyeballs, RFC 8305). serveros.com is behind Cloudflare, which has IPv6
+/// addresses; on a machine whose IPv6 looks set up but goes nowhere, one
+/// attempt at a time hung on the first address until the request timed
+/// out, while curl on the same machine was fine.
+async fn connect_any(addrs: Vec<SocketAddr>) -> std::io::Result<TcpStream> {
+    let mut queue = interleave(addrs).into_iter().peekable();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut last_err = None;
+
+    loop {
+        if let Some(addr) = queue.next() {
+            attempts.spawn(TcpStream::connect(addr));
+        }
+        if attempts.is_empty() {
+            return Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses")
+            }));
+        }
+        let more = queue.peek().is_some();
+
+        tokio::select! {
+            Some(done) = attempts.join_next() => match done {
+                // Dropping the set stops the attempts still going.
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(e)) => last_err = Some(e),
+                Err(e) => last_err = Some(std::io::Error::other(e)),
+            },
+            _ = tokio::time::sleep(NEXT_ATTEMPT_AFTER), if more => {}
+        }
+    }
+}
+
+/// The addresses with the families alternating, starting with the one
+/// the resolver put first.
+fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    let first_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut lead, mut other): (Vec<_>, Vec<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_v6);
+    let mut out = Vec::with_capacity(lead.len() + other.len());
+    lead.reverse();
+    other.reverse();
+    while !lead.is_empty() || !other.is_empty() {
+        out.extend(lead.pop());
+        out.extend(other.pop());
+    }
+    out
+}
+
 fn host_of(url: &str) -> String {
     Url::parse(url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| url.into())
+}
+
+/// Whether `raw` holds a whole response: headers, then exactly the body
+/// its Content-Length or chunked encoding promised.
+fn response_complete(raw: &[u8]) -> bool {
+    let mut header_buf = [httparse::EMPTY_HEADER; 64];
+    let mut parsed = httparse::Response::new(&mut header_buf);
+    let Ok(httparse::Status::Complete(header_len)) = parsed.parse(raw) else {
+        return false;
+    };
+    let body = &raw[header_len..];
+
+    for header in parsed.headers.iter() {
+        let value = String::from_utf8_lossy(header.value);
+        if header.name.eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().ok() == Some(body.len());
+        }
+        if header.name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return dechunk(body).is_some();
+        }
+    }
+
+    false
 }
 
 fn parse_response(raw: &[u8], host: &str) -> Result<Response, HttpError> {
@@ -344,6 +431,60 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alternates_address_families() {
+        let a: Vec<SocketAddr> = [
+            "[2606::1]:443",
+            "[2606::2]:443",
+            "1.1.1.1:443",
+            "2.2.2.2:443",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let got: Vec<String> = interleave(a).iter().map(ToString::to_string).collect();
+        assert_eq!(
+            got,
+            [
+                "[2606::1]:443",
+                "1.1.1.1:443",
+                "[2606::2]:443",
+                "2.2.2.2:443"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_never_answers_does_not_hold_up_the_next() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let good = listener.local_addr().unwrap();
+        // TEST-NET-1 and a documentation IPv6 address: nothing answers.
+        let dead: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let blackhole: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let started = std::time::Instant::now();
+        let stream = connect_any(vec![dead, blackhole, good]).await.unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), good);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn knows_when_a_response_is_whole() {
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+        ));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n{}"
+        ));
+        assert!(response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+        ));
+        assert!(!response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}"
+        ));
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\n\r\nbody"));
+        assert!(!response_complete(b"HTTP/1.1 200"));
+    }
 
     #[test]
     fn parses_a_plain_response() {

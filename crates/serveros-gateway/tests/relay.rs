@@ -238,6 +238,14 @@ fn hello() -> Hello {
         supported_majors: vec![1],
         facts: MachineFacts::default(),
         oldest_local_sample_ts: None,
+        log_ip_masking: None,
+        log_skip: None,
+        security_watch: None,
+        discovery: None,
+        logs: None,
+        updates_automatic: None,
+        error_reports: None,
+        pinned_version: None,
     }
 }
 

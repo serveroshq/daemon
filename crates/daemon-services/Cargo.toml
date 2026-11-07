@@ -9,6 +9,7 @@ description = "Managed services: the adoption ledger, and the systemd and Docker
 daemon-core.workspace = true
 daemon-protocol.workspace = true
 daemon-state.workspace = true
+daemon-jobs.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -19,3 +20,4 @@ httparse.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+uuid.workspace = true

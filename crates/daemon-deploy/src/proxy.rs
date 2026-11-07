@@ -9,6 +9,11 @@ pub const CADDYFILE: &str = "/etc/caddy/Caddyfile";
 pub const INCLUDE_DIR: &str = "/etc/caddy/serveros.d";
 const CADDY_IMPORT_LINE: &str = "import /etc/caddy/serveros.d/*.caddy";
 
+/// Where the daemon answers Caddy's on-demand TLS question ("may I get a
+/// certificate for this name?"), on loopback only.
+pub const ASK_LISTEN: &str = "127.0.0.1:47019";
+const ASK_PATH: &str = "/caddy-ask";
+
 const CADDY_INSTALL_SCRIPT: &str = r#"set -eu
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -53,13 +58,48 @@ impl Default for Proxy {
     }
 }
 
+/// A wildcard name, like `*.example.com`: every subdomain one level down.
+pub fn is_wildcard(domain: &str) -> bool {
+    domain.starts_with("*.")
+}
+
+/// Plain names share one site with ordinary automatic HTTPS. Wildcard names
+/// get a site of their own with on-demand TLS: each subdomain gets its own
+/// certificate the first time it's visited, over the usual HTTP challenge,
+/// so no DNS provider is needed. Caddy asks the daemon first (ASK_LISTEN),
+/// which only says yes for subdomains of the wildcards in these files.
 pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
     validate_domains(domains)?;
 
-    Ok(format!(
-        "# Managed by ServerOS. Edits here are overwritten on the next deploy.\n{} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port}\n}}\n",
-        domains.join(", ")
-    ))
+    let (wildcards, plain): (Vec<&String>, Vec<&String>) =
+        domains.iter().partition(|d| is_wildcard(d));
+    let join = |names: &[&String]| {
+        names
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut out =
+        String::from("# Managed by ServerOS. Edits here are overwritten on the next deploy.\n");
+    if !plain.is_empty() {
+        out.push_str(&format!(
+            "{} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port}\n}}\n",
+            join(&plain)
+        ));
+    }
+    if !wildcards.is_empty() {
+        if !plain.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{} {{\n\ttls {{\n\t\ton_demand\n\t}}\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port}\n}}\n",
+            join(&wildcards)
+        ));
+    }
+
+    Ok(out)
 }
 
 pub fn render_nginx(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
@@ -80,10 +120,15 @@ fn validate_domains(domains: &[String]) -> Result<(), Failure> {
     }
 
     for d in domains {
-        if d.is_empty()
-            || !d
+        // `*` only as a whole first label, over a name with a dot in it:
+        // `*.example.com`, never `*`, `*.com` or `a*.example.com`.
+        let rest = d.strip_prefix("*.").unwrap_or(d);
+        if rest.is_empty()
+            || rest.contains('*')
+            || (is_wildcard(d) && !rest.contains('.'))
+            || !rest
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '*' | ':'))
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
         {
             return Err(Failure::new(
                 "proxy",
@@ -224,6 +269,32 @@ impl Proxy {
         let site = self.site_file(service);
         let previous = std::fs::read(&site).ok();
 
+        // Wildcards need Caddy told where to ask before it issues a
+        // certificate, in the Caddyfile's global options.
+        let mut previous_main = None;
+        if self.backend == ProxyBackend::Caddy && domains.iter().any(|d| is_wildcard(d)) {
+            let existing = std::fs::read_to_string(&self.main_config).unwrap_or_default();
+            if let Some(updated) = add_on_demand_ask(&existing) {
+                std::fs::write(&self.main_config, updated).map_err(|e| {
+                    Failure::new(
+                        "proxy",
+                        format!("could not update {}: {e}", self.main_config.display()),
+                    )
+                })?;
+                previous_main = Some(existing);
+                progress
+                    .line(
+                        "Letting Caddy get a certificate for each subdomain as it's first visited"
+                            .to_string(),
+                    )
+                    .await;
+            } else if !has_our_ask(&existing) {
+                progress
+                    .line("The Caddyfile already sets on_demand_tls: subdomain certificates follow its rules, not ServerOS's".to_string())
+                    .await;
+            }
+        }
+
         std::fs::write(&site, &rendered).map_err(|e| {
             Failure::new("proxy", format!("could not write {}: {e}", site.display()))
         })?;
@@ -236,6 +307,9 @@ impl Proxy {
                 None => {
                     let _ = std::fs::remove_file(&site);
                 }
+            }
+            if let Some(main) = previous_main {
+                let _ = std::fs::write(&self.main_config, main);
             }
             return Err(failure);
         }
@@ -409,6 +483,104 @@ fn on_path(program: &str) -> bool {
         .unwrap_or(false)
 }
 
+impl Proxy {
+    /// Caddy's on-demand question: may `host` have a certificate? Only a
+    /// name exactly one label under a wildcard in one of our site files,
+    /// so `shop.example.com` under `*.example.com`, but not the apex,
+    /// `a.b.example.com`, or anything we don't serve.
+    pub fn allows_on_demand(&self, host: &str) -> bool {
+        if self.backend != ProxyBackend::Caddy {
+            return false;
+        }
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some((label, parent)) = host.split_once('.') else {
+            return false;
+        };
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return false;
+        }
+
+        let Ok(entries) = std::fs::read_dir(&self.include_dir) else {
+            return false;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "caddy"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .any(|text| wildcard_parents(&text).iter().any(|p| *p == parent))
+    }
+}
+
+/// The parents of the wildcard site addresses in a site file we wrote:
+/// `example.com` for a `*.example.com {` line.
+fn wildcard_parents(site_file: &str) -> Vec<String> {
+    site_file
+        .lines()
+        .filter(|l| !l.starts_with(char::is_whitespace) && !l.trim_start().starts_with('#'))
+        .filter_map(|l| l.trim_end().strip_suffix('{'))
+        .flat_map(|addresses| {
+            addresses
+                .split(',')
+                .map(str::trim)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|a| a.strip_prefix("*.").map(|p| p.to_ascii_lowercase()))
+        .collect()
+}
+
+fn ask_line() -> String {
+    format!("ask http://{ASK_LISTEN}{ASK_PATH}")
+}
+
+fn has_our_ask(caddyfile: &str) -> bool {
+    caddyfile.contains(&ask_line())
+}
+
+/// Adds `on_demand_tls { ask … }` to the Caddyfile's global options, which
+/// must be its first block: into the block if there is one, or as a new
+/// one at the top. Leaves a Caddyfile that already sets on_demand_tls
+/// alone, since those rules are the operator's.
+fn add_on_demand_ask(existing: &str) -> Option<String> {
+    if existing.contains("on_demand_tls") {
+        return None;
+    }
+    let ours = format!(
+        "\t# Added by ServerOS: the daemon says which subdomains may get a certificate.\n\ton_demand_tls {{\n\t\t{}\n\t}}\n",
+        ask_line()
+    );
+
+    // The global options block is a `{` alone on the first line that isn't
+    // blank or a comment.
+    let mut offset = 0;
+    for line in existing.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            offset += line.len();
+            continue;
+        }
+        if trimmed == "{" {
+            let at = offset + line.len();
+            let mut updated = String::with_capacity(existing.len() + ours.len() + 1);
+            updated.push_str(&existing[..at]);
+            if !line.ends_with('\n') {
+                updated.push('\n');
+            }
+            updated.push_str(&ours);
+            updated.push_str(&existing[at..]);
+            return Some(updated);
+        }
+        break;
+    }
+
+    Some(format!("{{\n{ours}}}\n\n{existing}"))
+}
+
 fn add_caddy_import(existing: &str) -> Option<String> {
     if existing.lines().any(|l| l.trim() == CADDY_IMPORT_LINE) {
         return None;
@@ -472,6 +644,87 @@ mod tests {
         assert!(block.contains("reverse_proxy 127.0.0.1:3000"));
         assert!(render(&["bad{domain".into()], 3000).is_err());
         assert!(render(&[], 3000).is_err());
+    }
+
+    #[test]
+    fn wildcards_get_their_own_on_demand_site() {
+        let block = render(&["acme.io".into(), "*.acme.io".into()], 3000).unwrap();
+
+        let (apex, wild) = block.split_once("*.acme.io {").unwrap();
+        assert!(apex.contains("acme.io {\n\tencode"));
+        assert!(!apex.contains("on_demand"));
+        assert!(wild.contains("tls {\n\t\ton_demand\n\t}"));
+        assert!(wild.contains("reverse_proxy 127.0.0.1:3000"));
+
+        let only = render(&["*.acme.io".into()], 3000).unwrap();
+        assert!(only.contains("*.acme.io {\n\ttls"));
+        assert!(!only.contains("encode zstd gzip\n\treverse_proxy 127.0.0.1:3000\n}\n\n"));
+    }
+
+    #[test]
+    fn a_star_is_only_a_whole_first_label() {
+        for bad in ["*", "*.com", "a*.acme.io", "*.*.acme.io", "acme.*.io", "*."] {
+            assert!(render(&[bad.into()], 3000).is_err(), "{bad}");
+        }
+        assert!(render(&["*.acme.io".into()], 3000).is_ok());
+        assert!(render(&["*.eu.acme.io".into()], 3000).is_ok());
+    }
+
+    #[test]
+    fn the_ask_goes_into_existing_global_options() {
+        let with_globals = "# mine\n{\n\temail ops@acme.io\n}\n\nacme.io {\n}\n";
+        let updated = add_on_demand_ask(with_globals).unwrap();
+
+        assert!(updated.starts_with("# mine\n{\n\t# Added by ServerOS"));
+        assert!(updated.contains(&ask_line()));
+        assert!(updated.contains("\temail ops@acme.io\n}"));
+        assert_eq!(
+            updated.matches('{').count(),
+            with_globals.matches('{').count() + 1
+        );
+        assert!(add_on_demand_ask(&updated).is_none());
+    }
+
+    #[test]
+    fn the_ask_opens_a_global_block_when_there_is_none() {
+        let updated = add_on_demand_ask(&fresh_caddyfile()).unwrap();
+
+        assert!(updated.starts_with("{\n\t# Added by ServerOS"));
+        assert!(updated.contains(CADDY_IMPORT_LINE));
+        assert!(has_our_ask(&updated));
+        assert!(add_on_demand_ask("{\n\ton_demand_tls {\n\t\task http://x\n\t}\n}\n").is_none());
+    }
+
+    #[test]
+    fn caddy_may_only_ask_for_one_label_under_a_wildcard_we_serve() {
+        let dir = std::env::temp_dir().join(format!("serveros-ask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("shop.caddy"),
+            render(&["acme.io".into(), "*.acme.io".into()], 3000).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "*.other.io {\n}\n").unwrap();
+        let proxy = Proxy {
+            backend: ProxyBackend::Caddy,
+            main_config: dir.join("Caddyfile"),
+            include_dir: dir.clone(),
+        };
+
+        assert!(proxy.allows_on_demand("tenant-1.acme.io"));
+        assert!(proxy.allows_on_demand("Tenant-1.ACME.io."));
+        assert!(!proxy.allows_on_demand("acme.io"));
+        assert!(!proxy.allows_on_demand("a.b.acme.io"));
+        assert!(!proxy.allows_on_demand("x.other.io"));
+        assert!(!proxy.allows_on_demand("-x.acme.io"));
+        assert!(!proxy.allows_on_demand("evil.io"));
+        assert!(!Proxy {
+            backend: ProxyBackend::Nginx,
+            ..proxy
+        }
+        .allows_on_demand("tenant-1.acme.io"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

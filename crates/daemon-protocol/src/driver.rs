@@ -23,6 +23,9 @@ pub enum DriverError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Each message is handled and dropped straight away; boxing the command
+// to even out the sizes would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Inbound {
     HelloAck(HelloAck),
     Command { id: Uuid, command: Command },
@@ -31,6 +34,9 @@ pub enum Inbound {
     Gap { from: u64, to: u64 },
 }
 
+// Hello goes once a connection; boxing it to even out the sizes would
+// buy nothing either.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outbound {
     Hello(Hello),

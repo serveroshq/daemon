@@ -1,14 +1,13 @@
 use std::time::Duration;
 
-use daemon_jobs::{run_child, ChildOutcome, Failure, JobContext};
+use daemon_deploy::container::APP_LABEL;
+use daemon_jobs::{Failure, JobContext};
 use daemon_protocol::{AdoptedCapability, DeploySpec, ServiceOrigin};
 use daemon_services::{ManagedService, Registry, RunBy};
 use serde_json::{json, Value};
 use tokio::process::Command;
 
 use super::app::App;
-
-const MAX_EXEC: Duration = Duration::from_secs(300);
 
 pub fn container_of(service: &ManagedService) -> Option<&str> {
     match &service.run_by {
@@ -17,42 +16,7 @@ pub fn container_of(service: &ManagedService) -> Option<&str> {
     }
 }
 
-pub async fn exec(
-    ctx: &JobContext,
-    container: &str,
-    command: &str,
-    timeout_secs: Option<u64>,
-) -> Result<Value, Failure> {
-    let timeout = timeout_secs
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(60))
-        .min(MAX_EXEC);
-    let mut cancel = ctx.cancel.clone();
-
-    ctx.progress.line(format!("$ {command}")).await;
-
-    match run_child(
-        "docker",
-        &["exec", container, "sh", "-c", command],
-        None,
-        &[],
-        timeout,
-        &mut cancel,
-        &ctx.progress,
-        None,
-    )
-    .await
-    {
-        ChildOutcome::Exited { code, .. } => Ok(json!({ "exit_code": code })),
-        ChildOutcome::TimedOut { .. } => Err(Failure::new(
-            "exec",
-            format!("the command was still running after {}s", timeout.as_secs()),
-        )
-        .with_next_step("Run long tasks as their own service, or raise the timeout.")),
-        ChildOutcome::Cancelled { .. } => Err(Failure::new("cancelled", "command cancelled")),
-        ChildOutcome::Unstartable(e) => Err(Failure::new("exec", e)),
-    }
-}
+pub use daemon_services::exec::exec;
 
 pub async fn container_exists(key: &str) -> bool {
     let Some(id) = key.strip_prefix("docker:") else {
@@ -122,6 +86,21 @@ pub async fn remove(
             Ok(json!({ "removed": containers.len(), "volumes_deleted": volumes.len() }))
         }
         RunBy::Docker { container } => {
+            // A release of an app ServerOS deployed keeps its data in the
+            // app's named volumes, which `rm -v` leaves: find them first.
+            let app_volumes = if delete_data {
+                let format = format!("{{{{index .Config.Labels \"{APP_LABEL}\"}}}}");
+                match docker(&["inspect", "--format", &format, container]).await {
+                    Ok(app) if !app.trim().is_empty() => {
+                        let label = format!("label={APP_LABEL}={}", app.trim());
+                        docker_lines(&["volume", "ls", "-q", "--filter", &label]).await
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+
             let mut args = vec!["rm", "-f"];
             if delete_data {
                 args.push("-v");
@@ -131,7 +110,25 @@ pub async fn remove(
             let _ = registry.remove(&service.key);
             progress.line(format!("removed {container}")).await;
 
-            Ok(json!({ "removed": 1, "volumes_deleted": usize::from(delete_data) }))
+            let mut deleted = usize::from(delete_data);
+            for volume in &app_volumes {
+                match docker(&["volume", "rm", volume]).await {
+                    Ok(_) => {
+                        deleted += 1;
+                        progress.line(format!("deleted volume {volume}")).await;
+                    }
+                    Err(failure) => {
+                        progress
+                            .line(format!(
+                                "kept volume {volume}: {} (an older release still uses it)",
+                                failure.message
+                            ))
+                            .await;
+                    }
+                }
+            }
+
+            Ok(json!({ "removed": 1, "volumes_deleted": deleted }))
         }
         _ => Err(Failure::new(
             "remove",
@@ -170,6 +167,44 @@ fn parse_mounts(out: &str) -> (Vec<String>, Vec<String>) {
     }
 
     (volumes, binds)
+}
+
+/// A systemd service: stopped, kept from starting at boot, and its unit
+/// file deleted when it was made on the machine (a package's stays). The
+/// files and data it works with are never touched.
+pub async fn remove_systemd(
+    app: &App,
+    ctx: &JobContext,
+    service: &ManagedService,
+    unit: &str,
+) -> Result<Value, Failure> {
+    let progress = &ctx.progress;
+    let removed = daemon_services::systemd::SystemdAdapter::default()
+        .remove(unit)
+        .await
+        .map_err(|e| {
+            Failure::new("remove", e.to_string())
+                .with_next_step("Stop it instead, or remove it on the machine yourself.")
+        })?;
+    let _ = Registry::new(&app.state).remove(&service.key);
+
+    progress
+        .line(format!("stopped {unit} and turned it off at boot"))
+        .await;
+    for path in &removed.deleted {
+        progress.line(format!("deleted {path}")).await;
+    }
+    if removed.package_owned {
+        progress
+            .line(format!("{unit} came with a package, so its files were left; uninstall the package to remove it completely"))
+            .await;
+    }
+
+    Ok(json!({
+        "removed": 1,
+        "unit_files_deleted": removed.deleted,
+        "package_owned": removed.package_owned,
+    }))
 }
 
 pub async fn remove_adopted(

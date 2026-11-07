@@ -53,8 +53,12 @@ pub struct App {
     pub on_trial: Option<(String, String)>,
     pub started: Instant,
     pub facts: RwLock<MachineFacts>,
+    /// Project networks: WireGuard interfaces and their forwarders.
+    pub networks: daemon_network::Networks,
     pub status: RwLock<ConnectionStatus>,
     pub pending_update: Mutex<Option<(Candidate, bool)>>,
+    /// Wakes discovery early: when the panel turns it on.
+    pub discovery_wake: tokio::sync::Notify,
     stopping: std::sync::atomic::AtomicBool,
     outbound: mpsc::Sender<Outbound>,
     stream_tx: mpsc::Sender<StreamFrame>,
@@ -76,6 +80,16 @@ impl App {
         guard: RollbackGuard,
         on_trial: Option<(String, String)>,
     ) -> Self {
+        // Log lines leave with IPs masked when the machine says so. The
+        // salt is made on first start and stays on the machine.
+        let salt = daemon_core::ipmask::load_salt(&paths.ip_mask_salt()).unwrap_or_default();
+        daemon_core::ipmask::configure(config.logs.mask_ips, salt);
+        // And never at all for the services and lines the skip rules name.
+        let rejected = daemon_core::logskip::configure(&config.logs.skip);
+        if !rejected.is_empty() {
+            tracing::warn!(patterns = ?rejected, "some log skip patterns aren't valid and are ignored");
+        }
+
         let (stream_tx, stream_rx) = mpsc::channel(512);
         let limits = &config.limits;
         let facts = daemon_telemetry::gather_facts();
@@ -105,6 +119,9 @@ impl App {
                 .chain(config.files.extra_roots.iter().cloned())
                 .chain([paths.jobs_dir(), paths.state_dir.join("apps")]),
         ));
+
+        let networks =
+            daemon_network::Networks::new(Arc::clone(&state), paths.state_dir.join("networks"));
 
         Self {
             deployer: Deployer {
@@ -140,8 +157,10 @@ impl App {
             on_trial,
             started: Instant::now(),
             facts: RwLock::new(facts),
+            networks,
             status: RwLock::new(ConnectionStatus::default()),
             pending_update: Mutex::new(None),
+            discovery_wake: tokio::sync::Notify::new(),
             stopping: std::sync::atomic::AtomicBool::new(false),
             outbound,
             stream_tx,

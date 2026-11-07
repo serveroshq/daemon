@@ -9,6 +9,15 @@ pub struct Release {
     pub port: u16,
     pub deployed_at: i64,
     pub status: String,
+    /// False for apps that don't answer HTTP, like chat bots and workers:
+    /// a rollback then checks the container keeps running instead of
+    /// asking it for a page. Releases recorded before this was kept did.
+    #[serde(default = "answers_http")]
+    pub http: bool,
+}
+
+fn answers_http() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -105,9 +114,15 @@ impl<'a> ReleaseLedger<'a> {
     }
 }
 
-pub fn port_for(commit: &str) -> u16 {
-    let hash = commit
+/// The local port a release listens on, from its app's name and commit, so
+/// two apps at the same commit on one machine (production and a staging
+/// copy of it) don't both ask for the same port. Each release keeps the port
+/// it was given, so this only decides new ones.
+pub fn port_for(service: &str, commit: &str) -> u16 {
+    let hash = service
         .bytes()
+        .chain(std::iter::once(b'\n'))
+        .chain(commit.bytes())
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     20_000 + (hash % 10_000) as u16
 }
@@ -121,9 +136,10 @@ mod tests {
             commit: commit.into(),
             image: format!("serveros/app:{commit}"),
             container: format!("serveros-app-{commit}"),
-            port: port_for(commit),
+            port: port_for("app", commit),
             deployed_at: 0,
             status: "live".into(),
+            http: true,
         }
     }
 
@@ -149,7 +165,39 @@ mod tests {
 
     #[test]
     fn ports_are_stable_and_in_range() {
-        assert_eq!(port_for("abc123"), port_for("abc123"));
-        assert!((20_000..30_000).contains(&port_for("deadbeef")));
+        assert_eq!(port_for("shop", "abc123"), port_for("shop", "abc123"));
+        assert_ne!(
+            port_for("shop", "abc123"),
+            port_for("shop-staging", "abc123")
+        );
+        assert!((20_000..30_000).contains(&port_for("shop", "deadbeef")));
+    }
+
+    #[test]
+    fn an_app_and_its_copies_at_one_commit_get_different_ports() {
+        // The names the panel gives an app's copies in other environments.
+        let apps = [
+            "shop",
+            "shop-staging",
+            "shop-staging-2",
+            "shop-preview",
+            "shop-dev",
+            "api",
+            "api-staging",
+            "web",
+            "web-staging",
+        ];
+        for commit in [
+            "0123456789abcdef0123456789abcdef01234567",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "a1b2c3d",
+        ] {
+            let mut ports: Vec<u16> = apps.iter().map(|app| port_for(app, commit)).collect();
+            ports.sort_unstable();
+            ports.dedup();
+            assert_eq!(ports.len(), apps.len(), "a port is shared at {commit}");
+        }
+        // The name and commit don't run together: "ab"+"c" isn't "a"+"bc".
+        assert_ne!(port_for("ab", "c"), port_for("a", "bc"));
     }
 }

@@ -200,8 +200,55 @@ impl Lifecycle for DockerAdapter {
 
         Ok(demux_log_stream(&reply.body)
             .lines()
-            .map(daemon_core::redact::redact)
+            .filter(|line| !daemon_core::logskip::skips_line(Some(container), line))
+            .map(daemon_core::ipmask::outgoing)
             .collect())
+    }
+}
+
+/// What leaves the machine when someone looks at a container's config:
+/// environment variables keep their names but never their values (they're
+/// where passwords and tokens live), and the command line and labels go
+/// through the usual secret redaction.
+pub fn without_secrets(inspect: &mut serde_json::Value) {
+    use daemon_core::redact::{redact, REDACTED};
+
+    if let Some(env) = inspect
+        .pointer_mut("/Config/Env")
+        .and_then(|v| v.as_array_mut())
+    {
+        for entry in env.iter_mut() {
+            if let Some(text) = entry.as_str() {
+                let name = text.split_once('=').map_or(text, |(name, _)| name);
+                *entry = serde_json::Value::String(format!("{name}={REDACTED}"));
+            }
+        }
+    }
+
+    for pointer in ["/Config/Cmd", "/Config/Entrypoint", "/Args"] {
+        if let Some(parts) = inspect.pointer_mut(pointer).and_then(|v| v.as_array_mut()) {
+            for part in parts.iter_mut() {
+                if let Some(text) = part.as_str() {
+                    *part = serde_json::Value::String(redact(text));
+                }
+            }
+        }
+    }
+    if let Some(path) = inspect.get_mut("Path") {
+        if let Some(text) = path.as_str() {
+            *path = serde_json::Value::String(redact(text));
+        }
+    }
+
+    if let Some(labels) = inspect
+        .pointer_mut("/Config/Labels")
+        .and_then(|v| v.as_object_mut())
+    {
+        for value in labels.values_mut() {
+            if let Some(text) = value.as_str() {
+                *value = serde_json::Value::String(redact(text));
+            }
+        }
     }
 }
 
@@ -304,6 +351,116 @@ pub struct Repaired {
 }
 
 impl DockerAdapter {
+    /// A container's `docker inspect`, with secrets taken out first (see
+    /// [`without_secrets`]): read-only, for people looking at its config.
+    pub async fn inspect(&self, container: &str) -> Result<serde_json::Value> {
+        if !valid_container_ref(container) {
+            return Err(ServiceError::Docker(format!(
+                "{container:?} is not a valid container reference"
+            )));
+        }
+        let reply = self
+            .call(
+                "GET",
+                &format!("/containers/{container}/json"),
+                None,
+                &[200],
+                &format!("inspect {container}"),
+            )
+            .await?;
+        let mut value: serde_json::Value = serde_json::from_slice(&reply.body)?;
+        without_secrets(&mut value);
+
+        Ok(value)
+    }
+
+    /// A container's full `docker inspect`, secrets included. Only for work
+    /// done on the machine (a clone needs its original's real environment);
+    /// never send it to the panel, which gets [`DockerAdapter::inspect`].
+    pub async fn inspect_with_secrets(&self, container: &str) -> Result<serde_json::Value> {
+        if !valid_container_ref(container) {
+            return Err(ServiceError::Docker(format!(
+                "{container:?} is not a valid container reference"
+            )));
+        }
+        let reply = self
+            .call(
+                "GET",
+                &format!("/containers/{container}/json"),
+                None,
+                &[200],
+                &format!("inspect {container}"),
+            )
+            .await?;
+
+        Ok(serde_json::from_slice(&reply.body)?)
+    }
+
+    /// Creates a container from a create request, joins any more networks,
+    /// and starts it. Anything that fails after the create removes it again.
+    pub async fn create_and_start(
+        &self,
+        name: &str,
+        body: &serde_json::Value,
+        more_networks: &[String],
+    ) -> Result<String> {
+        if !valid_container_ref(name) {
+            return Err(ServiceError::Docker(format!(
+                "{name:?} is not a valid container name"
+            )));
+        }
+        let created = self
+            .call(
+                "POST",
+                &format!("/containers/create?name={name}"),
+                Some(body),
+                &[201],
+                &format!("create {name}"),
+            )
+            .await?;
+        let id = serde_json::from_slice::<serde_json::Value>(&created.body)?
+            .get("Id")
+            .and_then(|i| i.as_str())
+            .unwrap_or(name)
+            .to_string();
+
+        let started = async {
+            for network in more_networks {
+                self.call(
+                    "POST",
+                    &format!("/networks/{network}/connect"),
+                    Some(&serde_json::json!({ "Container": id })),
+                    &[200],
+                    &format!("connect {name} to {network}"),
+                )
+                .await?;
+            }
+            self.call(
+                "POST",
+                &format!("/containers/{id}/start"),
+                None,
+                &[204, 304],
+                &format!("start {name}"),
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = started {
+            let _ = self
+                .call(
+                    "DELETE",
+                    &format!("/containers/{id}?force=1"),
+                    None,
+                    &[204, 404],
+                    "remove the half-made container",
+                )
+                .await;
+            return Err(e);
+        }
+
+        Ok(id)
+    }
+
     async fn call(
         &self,
         method: &str,
@@ -596,6 +753,48 @@ mod tests {
         assert!(valid_container_ref("abcdef123456"));
         assert!(!valid_container_ref("../../etc"));
         assert!(!valid_container_ref("x y"));
+    }
+
+    #[test]
+    fn inspect_never_sends_env_values() {
+        let mut inspect = serde_json::json!({
+            "Path": "/app/server",
+            "Args": ["--db", "postgres://app:hunter2secret@db/app"],
+            "Config": {
+                "Env": ["DATABASE_URL=postgres://app:hunter2secret@db/app", "DEBUG", "PORT=8080"],
+                "Cmd": ["node", "server.js"],
+                "Labels": {"com.docker.swarm.service.name": "web", "token": "api_key=abcdef1234567890abcdef"}
+            },
+            "NetworkSettings": {"Networks": {"web_net": {"IPAddress": "10.0.1.5"}}}
+        });
+
+        without_secrets(&mut inspect);
+
+        let text = inspect.to_string();
+        assert!(!text.contains("hunter2secret"), "{text}");
+        assert!(!text.contains("8080"), "{text}");
+        assert!(!text.contains("abcdef1234567890abcdef"), "{text}");
+        assert_eq!(
+            inspect.pointer("/Config/Env").unwrap(),
+            &serde_json::json!([
+                "DATABASE_URL=[redacted]",
+                "DEBUG=[redacted]",
+                "PORT=[redacted]"
+            ])
+        );
+        // The rest is left as it is.
+        assert_eq!(
+            inspect
+                .pointer("/Config/Labels/com.docker.swarm.service.name")
+                .unwrap(),
+            "web"
+        );
+        assert_eq!(
+            inspect
+                .pointer("/NetworkSettings/Networks/web_net/IPAddress")
+                .unwrap(),
+            "10.0.1.5"
+        );
     }
 
     #[test]
