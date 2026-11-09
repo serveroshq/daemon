@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security problem
+    url: https://github.com/serveroshq/daemon/security/advisories/new
+    about: Please report security problems privately, never in a public issue.
+  - name: Ask a question
+    url: https://github.com/serveroshq/panel/discussions
+    about: Questions and ideas about ServerOS go in the panel's Discussions.
+  - name: Chat on Discord
+    url: https://discord.gg/serveros
+    about: Talk to the community and the team.
+  - name: Account, billing or ServerOS Cloud
+    url: mailto:support@serveros.com
+    about: For your serveros.com account, email support instead.

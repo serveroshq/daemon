@@ -1,0 +1,9 @@
+# Every change needs a review from a maintainer.
+* @serveroshq/maintainers
+
+# Workflows, repo settings, policies and the license are listed on their own
+# so they stay maintainer-owned even if the default above gets split up later.
+/.github/            @serveroshq/maintainers
+/LICENSE             @serveroshq/maintainers
+/Cargo.toml          @serveroshq/maintainers
+/crates/daemon-capability/ @serveroshq/maintainers

@@ -1,0 +1,56 @@
+name: Bug report
+description: The daemon does something wrong on a machine.
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting this. If it's a security problem, stop here and email security@serveros.com instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Daemon version
+      description: Output of `serverosd --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      placeholder: Ubuntu 24.04, arm64
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: serverosd doctor
+      description: Output of `sudo serverosd doctor`.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: From `journalctl -u serverosd -n 200` and `/var/log/serveros/actions.log` if relevant. Remove tokens, IP addresses and hostnames you don't want public.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I removed secrets and private details from what I pasted.
+          required: true

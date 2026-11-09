@@ -30,7 +30,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "BUSL-1.1"
+license = "AGPL-3.0-only"
 repository = "https://github.com/serveroshq/daemon"
 rust-version = "1.85"
 
