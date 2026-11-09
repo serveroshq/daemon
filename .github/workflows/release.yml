@@ -23,6 +23,9 @@ on:
 permissions:
   contents: read
 
+# No build cache here on purpose: a release must never reuse a cache that a
+# less trusted run could have written into the signed binary.
+
 jobs:
   build:
     name: build (${{ matrix.arch }})
@@ -37,23 +40,28 @@ jobs:
           - arch: arm64
             target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       # aarch64 builds with zig as the C compiler and linker, so bundled C
       # (SQLite) compiles against musl's headers rather than glibc's.
       - if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          use-cache: false
       - if: matrix.target == 'aarch64-unknown-linux-musl'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-zigbuild
       - name: Build
-        run: cargo ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'zigbuild' || 'build' }} --release --target ${{ matrix.target }} -p serverosd
+        run: cargo "$CARGO_COMMAND" --release --target "$TARGET" -p serverosd
         env:
+          CARGO_COMMAND: ${{ matrix.target == 'aarch64-unknown-linux-musl' && 'zigbuild' || 'build' }}
+          TARGET: ${{ matrix.target }}
           SERVEROS_VERSION: ${{ github.ref_name }}
           SERVEROS_COMMIT: ${{ github.sha }}
           SERVEROS_CHANNEL: ${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}
@@ -61,10 +69,14 @@ jobs:
           SERVEROS_RELEASE_PUBKEY: ${{ vars.SERVEROS_RELEASE_PUBKEY }}
           SERVEROS_SENTRY_DSN: ${{ secrets.SERVEROS_SENTRY_DSN }}
       - name: Stage
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+          TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/serverosd dist/serverosd-${{ github.ref_name }}-linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+          cp "target/$TARGET/release/serverosd" "dist/serverosd-$TAG-linux-$ARCH"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: serverosd-${{ matrix.arch }}
           path: dist/*
@@ -80,16 +92,20 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
       - name: Sign and write manifests
         env:
           RELEASE_KEY: ${{ secrets.SERVEROS_RELEASE_KEY }}
+          TAG: ${{ github.ref_name }}
+          CHANNEL: ${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           cargo build --release -p serveros-release
@@ -98,18 +114,18 @@ jobs:
           cd dist
           sha256sum serverosd-* > SHA256SUMS
           for arch in amd64 arm64; do
-            f="serverosd-${{ github.ref_name }}-linux-$arch"
+            f="serverosd-$TAG-linux-$arch"
             ../target/release/serveros-release manifest \
-              --version "${{ github.ref_name }}" \
-              --channel "${{ contains(github.ref_name, 'canary') && 'canary' || 'stable' }}" \
-              --url "https://releases.serveros.com/${{ github.ref_name }}/$f" \
+              --version "$TAG" \
+              --channel "$CHANNEL" \
+              --url "https://releases.serveros.com/$TAG/$f" \
               --file "$f" --key ../release.key \
-              --notes-url "https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" \
+              --notes-url "https://github.com/$REPOSITORY/releases/tag/$TAG" \
               > "manifest-$arch.json"
           done
           rm -f ../release.key
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -121,10 +137,11 @@ jobs:
         env:
           PANEL_URL: ${{ vars.SERVEROS_PANEL_URL }}
           DEPLOY_TOKEN: ${{ secrets.SERVEROS_DEPLOY_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           for f in dist/serverosd-* dist/SHA256SUMS; do
-            curl -fsS -X PUT "$PANEL_URL/api/daemon/releases/${{ github.ref_name }}/$(basename "$f")" \
+            curl -fsS -X PUT "$PANEL_URL/api/daemon/releases/$TAG/$(basename "$f")" \
               -H "Authorization: Bearer $DEPLOY_TOKEN" \
               -H "Content-Type: application/octet-stream" -H "Accept: application/json" \
               --data-binary @"$f"

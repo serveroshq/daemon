@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something the daemon should do.
+labels: ["enhancement", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Got a rough idea rather than a clear request? [Discussions](https://github.com/serveroshq/panel/discussions) is a better place to start.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Tell us what you're trying to do and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: What would you like to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do now instead?
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to build it?
+      options:
+        - "No"
+        - "Yes, once a maintainer agrees on the approach"
+    validations:
+      required: true

@@ -1,0 +1,197 @@
+name: CLA
+
+# Checks that everyone who made commits in a pull request has signed CLA.md,
+# and records signatures people post as a comment. The result is the `cla`
+# commit status, which the main branch ruleset requires.
+#
+# pull_request_target runs with this repo's token, so this workflow must never
+# check out or run code from the pull request. It only reads pull request data
+# through the API and writes to the cla-signatures branch.
+on: # zizmor: ignore[dangerous-triggers]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  cla:
+    name: cla
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # the signature list on the cla-signatures branch
+      pull-requests: write # the bot's comment
+      issues: write # the bot's comment (pull request comments are issue comments)
+      statuses: write # the cla status
+    steps:
+      - name: Check signatures
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const SIGN_TEXT = 'I have read the ServerOS CLA and I agree to its terms';
+            const CLA_URL = 'https://github.com/serveroshq/panel/blob/main/CLA.md';
+            const BRANCH = 'cla-signatures';
+            const FILE = 'signatures.json';
+            const MARKER = '<!-- serveros-cla -->';
+            // Signing in any of these repos counts for all of them. New signatures go to this repo's list.
+            const SIGNATURE_REPOS = ['panel', 'daemon'];
+            // Maintainers, by GitHub user id (ids survive renames): liamdevss, HarryServerOS.
+            const EXEMPT_IDS = new Set([213730082, 310306208]);
+            const { owner, repo } = context.repo;
+
+            const pr = context.eventName === 'pull_request_target'
+              ? context.payload.pull_request
+              : (await github.rest.pulls.get({ owner, repo, pull_number: context.payload.issue.number })).data;
+
+            if (pr.state !== 'open') {
+              core.info('Pull request is closed, nothing to do.');
+              return;
+            }
+
+            async function loadSignatures(fromRepo = repo) {
+              try {
+                const { data } = await github.rest.repos.getContent({ owner, repo: fromRepo, path: FILE, ref: BRANCH });
+                const parsed = JSON.parse(Buffer.from(data.content, 'base64').toString('utf8'));
+                return { sha: data.sha, signatures: parsed.signatures ?? [] };
+              } catch (error) {
+                if (error.status === 404) return { sha: undefined, signatures: [] };
+                throw error;
+              }
+            }
+
+            async function signedElsewhere(id) {
+              for (const other of SIGNATURE_REPOS.filter((r) => r !== repo)) {
+                const { signatures } = await loadSignatures(other);
+                if (signatures.some((s) => s.id === id)) return true;
+              }
+              return false;
+            }
+
+            // Record a signature posted as a comment.
+            if (context.eventName === 'issue_comment') {
+              const comment = context.payload.comment;
+              const user = comment.user;
+              if (comment.body.trim() === SIGN_TEXT && user.type === 'User') {
+                for (let attempt = 1; ; attempt++) {
+                  const { sha, signatures } = await loadSignatures();
+                  if (signatures.some((s) => s.id === user.id)) break;
+                  // Already signed in another ServerOS repo: nothing to record here.
+                  if (await signedElsewhere(user.id)) break;
+                  signatures.push({
+                    id: user.id,
+                    login: user.login,
+                    signed_at: comment.created_at,
+                    pull_request: pr.number,
+                    comment_id: comment.id,
+                    cla_version: '1.0',
+                  });
+                  try {
+                    await github.rest.repos.createOrUpdateFileContents({
+                      owner,
+                      repo,
+                      branch: BRANCH,
+                      path: FILE,
+                      sha,
+                      message: `${user.login} signed the CLA in #${pr.number}`,
+                      content: Buffer.from(JSON.stringify({ signatures }, null, 2) + '\n').toString('base64'),
+                    });
+                    core.info(`Recorded a signature for ${user.login}.`);
+                    break;
+                  } catch (error) {
+                    // Someone else signed at the same moment: reload and try again.
+                    if (error.status !== 409 || attempt >= 5) throw error;
+                  }
+                }
+              } else if (comment.body.trim() !== 'recheck') {
+                core.info('Not a signature or a recheck, nothing to do.');
+                return;
+              }
+            }
+
+            // Work out who still has to sign.
+            const signed = new Set();
+            for (const source of SIGNATURE_REPOS) {
+              const { signatures } = await loadSignatures(source);
+              for (const s of signatures) signed.add(s.id);
+            }
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const unsigned = new Map();
+            const unlinked = new Set();
+            for (const commit of commits) {
+              const author = commit.author;
+              if (!author) {
+                // The commit's email isn't linked to a GitHub account, so we can't tell who made it.
+                unlinked.add(commit.commit.author?.name || 'unknown');
+                continue;
+              }
+              if (author.type === 'Bot' || EXEMPT_IDS.has(author.id) || signed.has(author.id)) continue;
+              unsigned.set(author.id, author.login);
+            }
+
+            const ok = unsigned.size === 0 && unlinked.size === 0;
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha: pr.head.sha,
+              context: 'cla',
+              state: ok ? 'success' : 'failure',
+              target_url: CLA_URL,
+              description: ok ? 'Everyone has signed the CLA' : 'Waiting for the CLA to be signed',
+            });
+
+            // Keep one bot comment up to date.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: pr.number,
+              per_page: 100,
+            });
+            const existing = comments.find((c) => c.user?.login === 'github-actions[bot]' && c.body?.includes(MARKER));
+
+            let body;
+            if (ok) {
+              if (!existing) return;
+              body = `${MARKER}\nEveryone in this pull request has signed the [CLA](${CLA_URL}). Thanks!`;
+            } else {
+              const plain = (name) => name.replace(/[^\p{L}\p{N} ._-]/gu, '');
+              const lines = [
+                MARKER,
+                `Thanks for your pull request! Before we can merge it, everyone who made commits in it needs to sign our [Contributor License Agreement](${CLA_URL}). You keep the copyright in your work.`,
+                '',
+                'To sign, read the CLA and reply on this pull request with exactly:',
+                '',
+                '```',
+                SIGN_TEXT,
+                '```',
+                '',
+                'You only need to do this once, and it covers every ServerOS repo. Comment `recheck` to run this check again.',
+              ];
+              if (unsigned.size) {
+                lines.push('', 'Still to sign:', ...[...unsigned.values()].map((login) => `- @${login}`));
+              }
+              if (unlinked.size) {
+                lines.push(
+                  '',
+                  "Some commits use an email that isn't linked to a GitHub account, so we can't tell who made them. Add the email to your GitHub account, or amend the commits to use one that is:",
+                  ...[...unlinked].map((name) => `- ${plain(name)}`),
+                );
+              }
+              body = lines.join('\n');
+            }
+
+            if (existing) {
+              if (existing.body !== body) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              }
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+            }

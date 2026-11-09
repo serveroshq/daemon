@@ -1,4 +1,23 @@
-# ServerOS daemon
+<p align="center">
+  <a href="https://serveros.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset=".github/assets/logo-dark-mode.svg">
+      <img alt="ServerOS" src=".github/assets/logo-light-mode.svg" width="72">
+    </picture>
+  </a>
+</p>
+
+<h1 align="center">ServerOS daemon</h1>
+
+<p align="center">The small agent that connects your servers to ServerOS.</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: AGPL-3.0" src="https://img.shields.io/github/license/serveroshq/daemon?style=flat-square&color=2563eb"></a>
+  <a href="https://github.com/serveroshq/daemon/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/serveroshq/daemon/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="https://github.com/serveroshq/daemon/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/serveroshq/daemon?include_prereleases&style=flat-square&label=release"></a>
+  <a href="https://github.com/serveroshq/.github/blob/main/CODE_OF_CONDUCT.md"><img alt="Contributor Covenant v2.1 adopted" src="https://img.shields.io/badge/Contributor%20Covenant-v2.1%20adopted-ff69b4?style=flat-square"></a>
+  <a href="https://discord.gg/serveros"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join%20us-5865f2?style=flat-square&logo=discord&logoColor=white"></a>
+</p>
 
 `serverosd` is the one thing ServerOS installs on a machine: a single static
 binary that connects out to the panel, discovers what is already running,
@@ -210,9 +229,23 @@ keeps shipping until no supported daemon speaks it. The panel side needs:
 - `wss://<host>/daemon/control` — the mTLS control channel
 - `GET /api/daemon/releases/latest?channel=&arch=` — the release manifest
 
+## Contributing
+
+Bug reports, fixes and ideas are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md)
+first: the daemon runs as root, so changes to what it's allowed to do get an
+issue and a maintainer's agreement before any code. Security problems go to
+[security@serveros.com](mailto:security@serveros.com), never a public issue.
+
 ## Licence
 
-[Business Source License 1.1](LICENSE). The source is public and you can run
-it on your own servers, but you may not sell it, resell it or offer it to
-others as a hosted or managed service. On 2030-10-05 it becomes Apache-2.0.
-For any other use, contact SERVEROS CLOUD LTD.
+[GNU Affero General Public License v3.0](LICENSE). Copyright © 2026 ServerOS
+Cloud Ltd. You can run it, read it, change it and share it. If you run a
+changed version for other people over a network, you have to offer them the
+source of your changes under the AGPL too.
+
+Releases published before the switch to the AGPL were under the Business
+Source License 1.1; they're available under the AGPL-3.0 as well.
+
+The ServerOS name and logo aren't covered by the licence; see the
+[trademark policy](https://github.com/serveroshq/panel/blob/main/TRADEMARKS.md).
+For a commercial licence, email [liam@serveros.com](mailto:liam@serveros.com).
