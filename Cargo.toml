@@ -79,7 +79,7 @@ rcgen = "0.13"
 x509-parser = "0.16"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # X25519 public keys for WireGuard; already in the tree through ed25519-dalek.
-curve25519-dalek = "4.1"
+curve25519-dalek = "5.0"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
