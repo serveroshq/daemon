@@ -153,9 +153,10 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   never on a command line, in a log or in the job ledger. While the tunnel
   is up, Caddy serves every app domain over plain HTTP on port 80 (the
   tunnel's edge does HTTPS; apps get `X-Forwarded-Proto: https`), marked
-  by `.plain-http` in `serveros.d`; down puts HTTPS back. Point the
-  tunnel's public hostnames (`*.example.com`, say) at
-  `http://localhost:80`. Visitors' addresses arrive in Cloudflare's
+  by `.plain-http` in `serveros.d`; down puts HTTPS back. A failed up
+  leaves the machine as it was. Point the tunnel's routes (published
+  applications, `*.example.com` say) at `http://localhost:80`.
+  Visitors' addresses arrive in Cloudflare's
   `CF-Connecting-IP` header. Gated as `tunnel.write` and refused in
   read-only mode.
 - **Firewall**: ufw rules pass through verbatim. nftables and iptables

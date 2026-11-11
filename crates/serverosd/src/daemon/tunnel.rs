@@ -24,7 +24,7 @@ pub const UNIT: &str = "serveros-tunnel";
 const UNIT_DIR: &str = "/etc/systemd/system";
 const ENV_FILE: &str = "tunnel.env";
 
-const NOT_A_TOKEN: &str = "That isn't a Cloudflare Tunnel token. Copy it from the tunnel's install command in Cloudflare Zero Trust.";
+const NOT_A_TOKEN: &str = "That isn't a Cloudflare Tunnel token. Copy it from the tunnel's install command in Cloudflare (Networking › Tunnels).";
 
 /// Cloudflare's own package repository, as its install docs set it up, so
 /// cloudflared gets updates with the rest of the machine.
@@ -364,7 +364,7 @@ async fn not_running(
     Failure::new("start", message)
         .with_output(output)
         .with_next_step(format!(
-            "Check the token is this tunnel's, from Cloudflare Zero Trust › Networks › Tunnels, and that the machine can reach Cloudflare (outbound port 7844). `journalctl -u {UNIT}` says more."
+            "Check the token is this tunnel's, from Cloudflare › Networking › Tunnels, and that the machine can reach Cloudflare (outbound port 7844). `journalctl -u {UNIT}` says more."
         ))
 }
 
