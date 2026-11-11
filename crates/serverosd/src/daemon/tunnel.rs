@@ -162,8 +162,16 @@ pub async fn apply(
     match action {
         TunnelAction::Up => {
             let token = token.ok_or_else(|| Failure::new("tunnel", NOT_A_TOKEN))?;
-            up(files, token, cancel, progress).await?;
-            proxy.set_plain_http(true, cancel, progress).await?;
+            // A tunnel that was already running, to put back if this one fails.
+            let before = Previous::read(files);
+            let result = match up(files, token, cancel, progress).await {
+                Ok(()) => proxy.set_plain_http(true, cancel, progress).await,
+                Err(failure) => Err(failure),
+            };
+            if let Err(failure) = result {
+                restore(files, before, cancel, progress).await;
+                return Err(failure);
+            }
             Ok(report(proxy, "connected", Some(&token.tunnel_id)))
         }
         TunnelAction::Down => {
@@ -267,6 +275,61 @@ async fn up(
     Ok(())
 }
 
+/// The unit and token file as they were before an `up`, if a tunnel was set up.
+struct Previous {
+    env: String,
+    unit: String,
+}
+
+impl Previous {
+    fn read(files: &Files) -> Option<Self> {
+        Some(Self {
+            env: std::fs::read_to_string(&files.env).ok()?,
+            unit: std::fs::read_to_string(&files.unit).ok()?,
+        })
+    }
+}
+
+/// After a failed `up`, leaves the machine as it was: the earlier tunnel
+/// running again with its own token, or no tunnel at all, so a token that
+/// doesn't work isn't left retrying on the machine.
+async fn restore(
+    files: &Files,
+    before: Option<Previous>,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) {
+    let Some(before) = before else {
+        progress
+            .line(format!("Taking {UNIT} off again, since it didn't work"))
+            .await;
+        let _ = down(files, cancel, progress).await;
+        return;
+    };
+
+    progress
+        .line("Putting the tunnel that was running before back".to_string())
+        .await;
+    if write_atomic(&files.env, &before.env, 0o600).is_err()
+        || write_atomic(&files.unit, &before.unit, 0o644).is_err()
+    {
+        return;
+    }
+    for args in [vec!["daemon-reload"], vec!["restart", UNIT]] {
+        let _ = run_child(
+            "systemctl",
+            &args,
+            None,
+            &[],
+            Duration::from_secs(90),
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+    }
+}
+
 async fn not_running(
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -287,7 +350,18 @@ async fn not_running(
     .await;
     output.extend(journal.tail().iter().cloned());
 
-    Failure::new("start", "the tunnel didn't connect to Cloudflare")
+    // Cloudflare's answer when the tunnel in the token doesn't exist (deleted,
+    // or the token was copied wrong) or its secret is wrong.
+    let refused = output
+        .iter()
+        .any(|l| l.contains("Failed to get tunnel") || l.contains("Unauthorized"));
+    let message = if refused {
+        "Cloudflare didn't accept the token: the tunnel may have been deleted, or the token copied wrong"
+    } else {
+        "the tunnel didn't connect to Cloudflare"
+    };
+
+    Failure::new("start", message)
         .with_output(output)
         .with_next_step(format!(
             "Check the token is this tunnel's, from Cloudflare Zero Trust › Networks › Tunnels, and that the machine can reach Cloudflare (outbound port 7844). `journalctl -u {UNIT}` says more."
