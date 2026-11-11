@@ -282,6 +282,16 @@ mod tests {
     }
 
     #[test]
+    fn tunnels_are_changes_blocked_in_read_only_mode() {
+        let tunnel = Operation::Machine(MachineOp::WriteTunnel);
+
+        assert_eq!(tunnel.verb(), "tunnel.write");
+        assert_eq!(tunnel.target(), "cloudflare");
+        assert!(tunnel.mutates());
+        assert!(checks_for(&tunnel).contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn running_a_command_is_confirmed_and_blocked_in_read_only_mode() {
         let exec = Operation::Service(ServiceOp::Exec {
             service: "docker:abc123def456".into(),

@@ -13,6 +13,7 @@ mod ports;
 mod service_ops;
 mod service_stats;
 mod tls_ask;
+mod tunnel;
 mod workers;
 
 use std::sync::Arc;
