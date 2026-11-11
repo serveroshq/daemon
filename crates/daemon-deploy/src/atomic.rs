@@ -234,12 +234,15 @@ pub(crate) async fn release(
         }
     }
 
-    // A kept release of this commit: switch back to it, no build. The live
-    // one is built again (a release run again by hand means "rebuild").
+    // A kept release of another commit: switch back to it, no build.
+    // Releasing the commit that's already live always builds again, so
+    // a run that means "rebuild" (new dependencies, say) never switches
+    // to an older build of the same commit.
+    let rebuild = previous.as_deref() == Some(spec.commit.as_str());
     let reuse = kept
         .iter()
         .rev()
-        .find(|k| k.commit == spec.commit && k.dir != live && k.dir.is_dir())
+        .find(|k| !rebuild && k.commit == spec.commit && k.dir != live && k.dir.is_dir())
         .map(|k| k.dir.clone());
 
     let (dir, steps, reused) = match reuse {
@@ -745,6 +748,33 @@ mod tests {
         assert_eq!(std::fs::read_link(&app).unwrap(), live_two);
         assert_eq!(read(app.join("built")), "two");
         assert_eq!(reloads.load(Ordering::SeqCst), before + 1);
+
+        // Releasing the live commit again builds it again, every time, and
+        // never switches to an older build of it.
+        let again = go(spec(
+            &app,
+            &upstream,
+            &two,
+            "cp version built && echo first > rebuilt",
+        ))
+        .await
+        .unwrap();
+        assert!(!again.reused);
+        let first = std::fs::read_link(&app).unwrap();
+        assert_ne!(first, live_two);
+        assert_eq!(read(app.join("rebuilt")), "first");
+        let again = go(spec(
+            &app,
+            &upstream,
+            &two,
+            "cp version built && echo second > rebuilt",
+        ))
+        .await
+        .unwrap();
+        assert!(!again.reused);
+        assert_ne!(std::fs::read_link(&app).unwrap(), first);
+        assert_ne!(std::fs::read_link(&app).unwrap(), live_two);
+        assert_eq!(read(app.join("rebuilt")), "second");
 
         // Only two releases are kept, plus what's shared.
         let mut left: Vec<String> = std::fs::read_dir(&releases)
