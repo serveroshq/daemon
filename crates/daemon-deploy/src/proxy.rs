@@ -9,6 +9,13 @@ pub const CADDYFILE: &str = "/etc/caddy/Caddyfile";
 pub const INCLUDE_DIR: &str = "/etc/caddy/serveros.d";
 const CADDY_IMPORT_LINE: &str = "import /etc/caddy/serveros.d/*.caddy";
 
+/// Marks the include dir as behind a tunnel (Cloudflare's, say): the edge
+/// does HTTPS, so sites are served over plain HTTP. A dotfile without the
+/// `.caddy` extension, so the import never picks it up.
+const PLAIN_HTTP_MARKER: &str = ".plain-http";
+
+const MANAGED_HEADER: &str = "# Managed by ServerOS.";
+
 /// Where the daemon answers Caddy's on-demand TLS question ("may I get a
 /// certificate for this name?"), on loopback only.
 pub const ASK_LISTEN: &str = "127.0.0.1:47019";
@@ -68,8 +75,28 @@ pub fn is_wildcard(domain: &str) -> bool {
 /// certificate the first time it's visited, over the usual HTTP challenge,
 /// so no DNS provider is needed. Caddy asks the daemon first (ASK_LISTEN),
 /// which only says yes for subdomains of the wildcards in these files.
-pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
+///
+/// Behind a tunnel (`plain_http`) every name, wildcards too, is one plain
+/// HTTP site: the tunnel's edge has the certificates, and Caddy neither
+/// gets any nor redirects to HTTPS. Apps are told the visitor came over
+/// HTTPS, since that's how the edge was reached.
+pub fn render(domains: &[String], upstream_port: u16, plain_http: bool) -> Result<String, Failure> {
     validate_domains(domains)?;
+
+    let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+
+    if plain_http {
+        let names = domains
+            .iter()
+            .map(|d| format!("http://{d}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str("# Behind a tunnel: plain HTTP here, the tunnel's edge does HTTPS.\n");
+        out.push_str(&format!(
+            "{names} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port} {{\n\t\theader_up X-Forwarded-Proto https\n\t}}\n}}\n"
+        ));
+        return Ok(out);
+    }
 
     let (wildcards, plain): (Vec<&String>, Vec<&String>) =
         domains.iter().partition(|d| is_wildcard(d));
@@ -81,8 +108,6 @@ pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure>
             .join(", ")
     };
 
-    let mut out =
-        String::from("# Managed by ServerOS. Edits here are overwritten on the next deploy.\n");
     if !plain.is_empty() {
         out.push_str(&format!(
             "{} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port}\n}}\n",
@@ -100,6 +125,46 @@ pub fn render(domains: &[String], upstream_port: u16) -> Result<String, Failure>
     }
 
     Ok(out)
+}
+
+/// The domains and upstream port of a Caddy site file we wrote, read back
+/// so it can be written again in the other mode. None for a file that
+/// isn't ours or doesn't look like one of ours.
+fn parse_site(text: &str) -> Option<(Vec<String>, u16)> {
+    if !text.starts_with(MANAGED_HEADER) {
+        return None;
+    }
+
+    let mut domains: Vec<String> = Vec::new();
+    let mut port = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') || trimmed == "}" {
+            continue;
+        }
+        if !line.starts_with(char::is_whitespace) {
+            let addresses = trimmed.strip_suffix('{')?;
+            for address in addresses.split(',') {
+                let name = address.trim();
+                let name = name.strip_prefix("http://").unwrap_or(name);
+                if !name.is_empty() && !domains.iter().any(|d| d == name) {
+                    domains.push(name.to_string());
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("reverse_proxy 127.0.0.1:") {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let found: u16 = digits.parse().ok()?;
+            if port.is_some_and(|p| p != found) {
+                return None;
+            }
+            port = Some(found);
+        }
+    }
+
+    if domains.is_empty() {
+        return None;
+    }
+    Some((domains, port?))
 }
 
 pub fn render_nginx(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
@@ -261,8 +326,9 @@ impl Proxy {
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<PathBuf, Failure> {
+        let plain_http = self.plain_http();
         let rendered = match self.backend {
-            ProxyBackend::Caddy => render(domains, upstream_port)?,
+            ProxyBackend::Caddy => render(domains, upstream_port, plain_http)?,
             ProxyBackend::Nginx => render_nginx(domains, upstream_port)?,
             ProxyBackend::None => return Err(Self::none_configured()),
         };
@@ -272,7 +338,10 @@ impl Proxy {
         // Wildcards need Caddy told where to ask before it issues a
         // certificate, in the Caddyfile's global options.
         let mut previous_main = None;
-        if self.backend == ProxyBackend::Caddy && domains.iter().any(|d| is_wildcard(d)) {
+        if self.backend == ProxyBackend::Caddy
+            && !plain_http
+            && domains.iter().any(|d| is_wildcard(d))
+        {
             let existing = std::fs::read_to_string(&self.main_config).unwrap_or_default();
             if let Some(updated) = add_on_demand_ask(&existing) {
                 std::fs::write(&self.main_config, updated).map_err(|e| {
@@ -317,6 +386,123 @@ impl Proxy {
         self.reload(cancel, progress).await?;
 
         Ok(site)
+    }
+
+    /// Whether sites are served over plain HTTP, for a tunnel in front.
+    pub fn plain_http(&self) -> bool {
+        self.include_dir.join(PLAIN_HTTP_MARKER).exists()
+    }
+
+    /// Switches every site to plain HTTP (a tunnel in front does HTTPS) or
+    /// back to Caddy's own HTTPS, rewriting the site files ServerOS wrote and
+    /// reloading the proxy. If the new config doesn't validate, the files
+    /// and the mode are put back as they were. Nginx sites are plain HTTP
+    /// already, so only the mode is kept there.
+    pub async fn set_plain_http(
+        &self,
+        on: bool,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<(), Failure> {
+        if self.backend == ProxyBackend::None {
+            return Ok(());
+        }
+
+        let was_on = self.plain_http();
+        std::fs::create_dir_all(&self.include_dir).map_err(|e| {
+            Failure::new(
+                "proxy",
+                format!("could not create {}: {e}", self.include_dir.display()),
+            )
+        })?;
+        let marker = self.include_dir.join(PLAIN_HTTP_MARKER);
+        let set_marker = |on: bool| -> std::io::Result<()> {
+            if on {
+                std::fs::write(
+                    &marker,
+                    "Written by ServerOS: a tunnel in front of this machine does HTTPS, so sites here are plain HTTP.\n",
+                )
+            } else {
+                match std::fs::remove_file(&marker) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                }
+            }
+        };
+
+        let rewrites = if self.backend == ProxyBackend::Caddy {
+            self.rerendered(on)
+        } else {
+            Vec::new()
+        };
+
+        set_marker(on).map_err(|e| {
+            Failure::new(
+                "proxy",
+                format!("could not update {}: {e}", marker.display()),
+            )
+        })?;
+        if rewrites.is_empty() {
+            return Ok(());
+        }
+
+        progress
+            .line(if on {
+                format!(
+                    "Serving {} site(s) over plain HTTP for the tunnel",
+                    rewrites.len()
+                )
+            } else {
+                format!("Serving {} site(s) over HTTPS again", rewrites.len())
+            })
+            .await;
+
+        let put_back = |rewrites: &[(PathBuf, String, String)]| {
+            for (path, before, _) in rewrites {
+                let _ = std::fs::write(path, before);
+            }
+            let _ = set_marker(was_on);
+        };
+        for (path, _, after) in &rewrites {
+            if let Err(e) = std::fs::write(path, after) {
+                put_back(&rewrites);
+                return Err(Failure::new(
+                    "proxy",
+                    format!("could not write {}: {e}", path.display()),
+                ));
+            }
+        }
+
+        if let Err(failure) = self.validate(cancel, progress).await {
+            put_back(&rewrites);
+            return Err(failure);
+        }
+
+        self.reload(cancel, progress).await
+    }
+
+    /// Every site file ServerOS wrote, as it reads now and as it would in
+    /// the given mode, for the ones that would change.
+    fn rerendered(&self, plain_http: bool) -> Vec<(PathBuf, String, String)> {
+        let Ok(entries) = std::fs::read_dir(&self.include_dir) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "caddy"))
+            .collect();
+        paths.sort();
+
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let before = std::fs::read_to_string(&path).ok()?;
+                let (domains, port) = parse_site(&before)?;
+                let after = render(&domains, port, plain_http).ok()?;
+                (after != before).then_some((path, before, after))
+            })
+            .collect()
     }
 
     pub async fn unpublish(
@@ -638,17 +824,22 @@ mod tests {
 
     #[test]
     fn caddy_sites_are_rendered_from_validated_domains() {
-        let block = render(&["shop.example".into(), "www.shop.example".into()], 3000).unwrap();
+        let block = render(
+            &["shop.example".into(), "www.shop.example".into()],
+            3000,
+            false,
+        )
+        .unwrap();
 
         assert!(block.contains("shop.example, www.shop.example {"));
         assert!(block.contains("reverse_proxy 127.0.0.1:3000"));
-        assert!(render(&["bad{domain".into()], 3000).is_err());
-        assert!(render(&[], 3000).is_err());
+        assert!(render(&["bad{domain".into()], 3000, false).is_err());
+        assert!(render(&[], 3000, false).is_err());
     }
 
     #[test]
     fn wildcards_get_their_own_on_demand_site() {
-        let block = render(&["acme.io".into(), "*.acme.io".into()], 3000).unwrap();
+        let block = render(&["acme.io".into(), "*.acme.io".into()], 3000, false).unwrap();
 
         let (apex, wild) = block.split_once("*.acme.io {").unwrap();
         assert!(apex.contains("acme.io {\n\tencode"));
@@ -656,7 +847,7 @@ mod tests {
         assert!(wild.contains("tls {\n\t\ton_demand\n\t}"));
         assert!(wild.contains("reverse_proxy 127.0.0.1:3000"));
 
-        let only = render(&["*.acme.io".into()], 3000).unwrap();
+        let only = render(&["*.acme.io".into()], 3000, false).unwrap();
         assert!(only.contains("*.acme.io {\n\ttls"));
         assert!(!only.contains("encode zstd gzip\n\treverse_proxy 127.0.0.1:3000\n}\n\n"));
     }
@@ -664,10 +855,10 @@ mod tests {
     #[test]
     fn a_star_is_only_a_whole_first_label() {
         for bad in ["*", "*.com", "a*.acme.io", "*.*.acme.io", "acme.*.io", "*."] {
-            assert!(render(&[bad.into()], 3000).is_err(), "{bad}");
+            assert!(render(&[bad.into()], 3000, false).is_err(), "{bad}");
         }
-        assert!(render(&["*.acme.io".into()], 3000).is_ok());
-        assert!(render(&["*.eu.acme.io".into()], 3000).is_ok());
+        assert!(render(&["*.acme.io".into()], 3000, false).is_ok());
+        assert!(render(&["*.eu.acme.io".into()], 3000, false).is_ok());
     }
 
     #[test]
@@ -701,7 +892,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("shop.caddy"),
-            render(&["acme.io".into(), "*.acme.io".into()], 3000).unwrap(),
+            render(&["acme.io".into(), "*.acme.io".into()], 3000, false).unwrap(),
         )
         .unwrap();
         std::fs::write(dir.join("notes.txt"), "*.other.io {\n}\n").unwrap();
@@ -723,6 +914,111 @@ mod tests {
             ..proxy
         }
         .allows_on_demand("tenant-1.acme.io"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn behind_a_tunnel_every_name_is_one_plain_http_site() {
+        let block = render(&["acme.io".into(), "*.acme.io".into()], 3000, true).unwrap();
+
+        assert!(block.starts_with(MANAGED_HEADER));
+        assert!(block.contains("http://acme.io, http://*.acme.io {"));
+        assert!(block.contains("reverse_proxy 127.0.0.1:3000 {"));
+        assert!(block.contains("header_up X-Forwarded-Proto https"));
+        assert!(!block.contains("on_demand"));
+        assert_eq!(block.matches(" {\n\tencode").count(), 1);
+        assert!(render(&["bad{domain".into()], 3000, true).is_err());
+    }
+
+    #[test]
+    fn site_files_read_back_in_either_mode() {
+        let domains: Vec<String> = vec!["acme.io".into(), "*.acme.io".into(), "www.acme.io".into()];
+        for plain_http in [false, true] {
+            let text = render(&domains, 4123, plain_http).unwrap();
+            let (read, port) = parse_site(&text).unwrap();
+            assert_eq!(port, 4123);
+            let mut read = read;
+            read.sort();
+            let mut expected = domains.clone();
+            expected.sort();
+            assert_eq!(read, expected, "{text}");
+        }
+
+        assert!(parse_site("shop.example {\n\treverse_proxy 127.0.0.1:3000\n}\n").is_none());
+        assert!(parse_site(&format!("{MANAGED_HEADER}\nshop.example {{\n}}\n")).is_none());
+        assert!(parse_site(&format!(
+            "{MANAGED_HEADER}\na.io {{\n\treverse_proxy 127.0.0.1:1\n}}\nb.io {{\n\treverse_proxy 127.0.0.1:2\n}}\n"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn switching_modes_rewrites_only_our_sites() {
+        let dir = std::env::temp_dir().join(format!("serveros-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = render(&["acme.io".into(), "*.acme.io".into()], 3000, false).unwrap();
+        std::fs::write(dir.join("shop.caddy"), &ours).unwrap();
+        std::fs::write(dir.join("mine.caddy"), "mine.io {\n\trespond hi\n}\n").unwrap();
+        let proxy = Proxy {
+            backend: ProxyBackend::Caddy,
+            main_config: dir.join("Caddyfile"),
+            include_dir: dir.clone(),
+        };
+
+        assert!(!proxy.plain_http());
+        let to_plain = proxy.rerendered(true);
+        assert_eq!(to_plain.len(), 1);
+        assert_eq!(to_plain[0].0, dir.join("shop.caddy"));
+        assert!(to_plain[0].2.contains("http://acme.io, http://*.acme.io {"));
+
+        std::fs::write(dir.join("shop.caddy"), &to_plain[0].2).unwrap();
+        let back = proxy.rerendered(false);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].2, ours);
+        assert!(proxy.rerendered(true).is_empty());
+
+        std::fs::write(dir.join(PLAIN_HTTP_MARKER), "").unwrap();
+        assert!(proxy.plain_http());
+        assert!(!proxy.allows_on_demand("tenant-1.acme.io"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn nginx_and_no_proxy_only_keep_the_mode() {
+        let dir = std::env::temp_dir().join(format!("serveros-plain-nginx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let proxy = Proxy {
+            backend: ProxyBackend::Nginx,
+            main_config: dir.join("nginx.conf"),
+            include_dir: dir.clone(),
+        };
+        let (_tx, mut cancel) = watch::channel(false);
+        let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let progress = Progress::new(uuid::Uuid::new_v4(), state, tx, vec![]);
+
+        proxy
+            .set_plain_http(true, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert!(proxy.plain_http());
+        proxy
+            .set_plain_http(false, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert!(!proxy.plain_http());
+
+        let none = Proxy {
+            backend: ProxyBackend::None,
+            ..proxy
+        };
+        none.set_plain_http(true, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert!(!none.plain_http());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

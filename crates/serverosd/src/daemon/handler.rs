@@ -33,6 +33,14 @@ impl Handler for JobHandler {
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
+            // The token as sent and as used (trimmed), so neither form is
+            // ever logged or kept.
+            Job::Tunnel {
+                token: Some(token), ..
+            } => [token.clone(), token.trim().to_string()]
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -1100,6 +1108,37 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 Some(&format!("{:?}", spec.action).to_lowercase()),
+            );
+            result
+        }
+
+        Job::Tunnel { action, token } => {
+            // Checked before the audit line and before anything changes;
+            // a refusal never repeats the token.
+            let token = match action {
+                daemon_protocol::TunnelAction::Up => {
+                    Some(super::tunnel::check_token(token.as_deref())?)
+                }
+                daemon_protocol::TunnelAction::Down => None,
+            };
+            let grant = authorize(Operation::Machine(MachineOp::WriteTunnel))?;
+            let files = super::tunnel::Files::new(&app.paths.config_dir);
+            let mut cancel = ctx.cancel.clone();
+            let result = super::tunnel::apply(
+                &app.deployer.proxy,
+                &files,
+                action,
+                token.as_ref(),
+                &mut cancel,
+                &ctx.progress,
+            )
+            .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(match action {
+                    daemon_protocol::TunnelAction::Up => "up",
+                    daemon_protocol::TunnelAction::Down => "down",
+                }),
             );
             result
         }

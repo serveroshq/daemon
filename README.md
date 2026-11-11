@@ -145,6 +145,20 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   options and answers Caddy's question on `127.0.0.1:47019`, saying yes
   only for a name one label under a wildcard in its own site files. A
   Caddyfile that already sets `on_demand_tls` is left alone.
+- **Cloudflare Tunnel**: the `tunnel` job (`action: up` with the
+  tunnel's token, or `down`) runs `cloudflared` as the
+  `serveros-tunnel` systemd unit, installed from Cloudflare's package
+  repository (apt, dnf or yum) if it's missing. The token is kept
+  root-only in `/etc/serveros/tunnel.env` and read by the unit, so it's
+  never on a command line, in a log or in the job ledger. While the tunnel
+  is up, Caddy serves every app domain over plain HTTP on port 80 (the
+  tunnel's edge does HTTPS; apps get `X-Forwarded-Proto: https`), marked
+  by `.plain-http` in `serveros.d`; down puts HTTPS back. A failed up
+  leaves the machine as it was. Point the tunnel's routes (published
+  applications, `*.example.com` say) at `http://localhost:80`.
+  Visitors' addresses arrive in Cloudflare's
+  `CF-Connecting-IP` header. Gated as `tunnel.write` and refused in
+  read-only mode.
 - **Firewall**: ufw rules pass through verbatim. nftables and iptables
   take the port form (`22/tcp`, `from 10.0.0.0/8 to any port 5432`);
   nftables rules live in a table ServerOS owns (`inet serveros`).

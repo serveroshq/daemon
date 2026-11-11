@@ -843,6 +843,23 @@ pub enum Job {
     /// as exactly the given state (peers and exposed ports replaced
     /// wholesale), or take it down.
     Network(Box<NetworkSpec>),
+    /// A Cloudflare Tunnel on this machine: up runs cloudflared with the
+    /// tunnel's token (kept root-only, never on a command line) and serves
+    /// the machine's app domains over plain HTTP for the tunnel to carry;
+    /// down takes it away and puts HTTPS back.
+    Tunnel {
+        action: TunnelAction,
+        /// The tunnel token from Cloudflare. Needed for up.
+        #[serde(default)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelAction {
+    Up,
+    Down,
 }
 
 /// One project network as this machine should have it. "up" is declarative

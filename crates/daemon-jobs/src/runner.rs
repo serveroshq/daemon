@@ -387,6 +387,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::DiskUsage { .. } => "disk_usage",
         Job::ServiceClone { .. } => "service_clone",
         Job::Network(_) => "network",
+        Job::Tunnel { .. } => "tunnel",
     }
 }
 
@@ -541,6 +542,17 @@ mod tests {
         }));
         assert!(mutates(&network));
         runner.submit(Uuid::new_v4(), command(network)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
+
+        let tunnel = Job::Tunnel {
+            action: daemon_protocol::TunnelAction::Down,
+            token: None,
+        };
+        assert!(mutates(&tunnel));
+        runner.submit(Uuid::new_v4(), command(tunnel)).await;
         assert_eq!(
             collect_until_terminal(&mut rx).await.last().unwrap().state,
             JobState::Refused
