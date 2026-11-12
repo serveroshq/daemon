@@ -235,9 +235,15 @@ async fn container_strategy(container: &str) -> Result<Option<Strategy>, Failure
         container,
         &image,
         &env,
-        mount_paths(&mounts.join("\n")),
+        existing(mount_paths(&mounts.join("\n"))),
         running,
     ))
+}
+
+/// Mount sources still on disk. A stack deployed before its files were kept
+/// can still point at a deploy folder that's gone, with nothing there to copy.
+fn existing(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.into_iter().filter(|p| p.exists()).collect()
 }
 
 fn mount_paths(inspect: &str) -> Vec<PathBuf> {
@@ -481,6 +487,16 @@ mod tests {
             "workspace/machine/serveros-mc/1700-daily"
         );
         assert_eq!(object_base("", "a b", "1"), "a-b/1");
+    }
+
+    #[test]
+    fn skips_mount_sources_that_are_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("jobs/old/volumes");
+        assert_eq!(
+            existing(vec![dir.path().to_path_buf(), gone]),
+            vec![dir.path().to_path_buf()]
+        );
     }
 
     #[test]
