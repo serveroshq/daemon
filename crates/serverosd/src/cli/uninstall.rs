@@ -49,6 +49,7 @@ pub fn disconnect(paths: Paths, yes: bool) -> anyhow::Result<()> {
         paths.private_key(),
         paths.client_cert(),
         paths.pinned_ca(),
+        paths.panel_ca(),
         paths.config_file(),
     ] {
         let _ = std::fs::remove_file(file);

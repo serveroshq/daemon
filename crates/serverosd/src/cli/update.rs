@@ -1,5 +1,5 @@
 use daemon_core::{BuildInfo, Config, Paths};
-use daemon_http::{Client, Trust};
+use daemon_http::Client;
 use daemon_selfupdate::{decide, install, Candidate, Decision, Policy};
 
 use super::{require_root, runtime};
@@ -16,7 +16,10 @@ pub fn run(paths: Paths, to: Option<String>, check_only: bool) -> anyhow::Result
         config.updates.channel,
         std::env::consts::ARCH
     );
-    let client = Client::new(Trust::WebPki, format!("serverosd/{current} (update-check)"));
+    let client = Client::new(
+        daemon_identity::panel_trust(&paths)?,
+        format!("serverosd/{current} (update-check)"),
+    );
     let response = rt.block_on(client.get(&url))?;
 
     if response.status != 200 {
