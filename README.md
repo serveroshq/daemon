@@ -43,6 +43,11 @@ The script downloads the binary, verifies its checksum, and runs
 daemon dials the panel over TLS 1.3 on 443 with a certificate issued at
 enrolment, and reconnects on its own.
 
+A self-hosted panel on its own certificate (a home network with no public
+domain) gives a longer command. It checks the panel's CA against the
+SHA-256 in the command first, then `serverosd enrol --panel-ca` trusts only
+that CA for the panel and keeps it in `/etc/serveros/panel-ca.crt`.
+
 ```
 serverosd status        what the daemon is doing
 serverosd inventory     a read-only scan of what is running here

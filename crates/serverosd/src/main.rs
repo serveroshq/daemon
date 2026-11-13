@@ -27,6 +27,10 @@ enum Command {
         token: String,
         #[arg(long, default_value = daemon_core::links::DEFAULT_PANEL_URL)]
         panel: String,
+        /// The CA behind the panel's own HTTPS certificate, when it isn't a
+        /// public one: the only one trusted for the panel, kept for later.
+        #[arg(long)]
+        panel_ca: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
     },
@@ -89,8 +93,9 @@ fn main() {
         Command::Enrol {
             token,
             panel,
+            panel_ca,
             dry_run,
-        } => cli::enrol::run(paths, &token, &panel, dry_run),
+        } => cli::enrol::run(paths, &token, &panel, panel_ca.as_deref(), dry_run),
         Command::Status { json } => cli::status::run(paths, json),
         Command::Inventory { json } => cli::inventory::run(json),
         Command::Doctor => cli::doctor::run(paths),

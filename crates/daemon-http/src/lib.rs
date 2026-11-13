@@ -76,6 +76,13 @@ impl Trust {
                 .map_err(|e| HttpError::Malformed(format!("pinned CA: {e}")))?;
         }
 
+        // An empty store would fail every handshake with a confusing error.
+        if store.is_empty() {
+            return Err(HttpError::Malformed(
+                "pinned CA: no certificate in it".into(),
+            ));
+        }
+
         Ok(Trust::Pinned(Arc::new(store)))
     }
 

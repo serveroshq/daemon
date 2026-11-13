@@ -1,3 +1,4 @@
+use daemon_core::Paths;
 use daemon_http::{Client, HttpError, Trust};
 use daemon_protocol::MachineFacts;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,10 @@ use crate::keys::{Identity, KeyMaterial};
 pub enum EnrolError {
     #[error("{0}")]
     Network(#[from] HttpError),
+    #[error("{0}. If the panel is on its own certificate (like on a home network), copy the full install command from the panel again: it checks that certificate first")]
+    Untrusted(HttpError),
+    #[error("{0}. The panel's certificate isn't signed by the CA this machine was given (--panel-ca); copy the install command from the panel again")]
+    NotPinnedCa(HttpError),
     #[error(
         "the enrolment token has expired; create a new one in the panel (tokens last 15 minutes)"
     )]
@@ -59,8 +64,20 @@ struct ErrorBody {
     code: String,
 }
 
+/// How calls straight to the panel (not the gateway) check its certificate:
+/// against the CA pinned at enrolment when there is one, else the public
+/// web PKI.
+pub fn panel_trust(paths: &Paths) -> Result<Trust, HttpError> {
+    match std::fs::read(paths.panel_ca()) {
+        Ok(pem) => Trust::pinned_pem(&pem),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Trust::WebPki),
+        Err(e) => Err(e.into()),
+    }
+}
+
 pub async fn enrol(
     panel_url: &str,
+    trust: Trust,
     token: &str,
     key: &KeyMaterial,
     hostname: &str,
@@ -68,7 +85,8 @@ pub async fn enrol(
     facts: &MachineFacts,
 ) -> Result<(EnrolResponse, Identity), EnrolError> {
     let csr = key.certificate_request("pending", hostname)?;
-    let client = Client::new(Trust::WebPki, format!("serverosd/{daemon_version} (enrol)"));
+    let pinned = matches!(trust, Trust::Pinned(_));
+    let client = Client::new(trust, format!("serverosd/{daemon_version} (enrol)"));
     let request = EnrolRequest {
         token,
         csr: &csr,
@@ -82,7 +100,12 @@ pub async fn enrol(
             &format!("{}/api/daemon/enrol", panel_url.trim_end_matches('/')),
             &request,
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            HttpError::Tls { .. } if pinned => EnrolError::NotPinnedCa(e),
+            HttpError::Tls { .. } => EnrolError::Untrusted(e),
+            e => EnrolError::Network(e),
+        })?;
 
     match response.status {
         200 | 201 => {}

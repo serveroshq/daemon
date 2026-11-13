@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use daemon_core::{BuildInfo, Config, Paths};
+use daemon_http::Trust;
 use daemon_identity::{enrol, Identity, KeyMaterial};
 use daemon_uninstall::{Artifact, Manifest};
 
@@ -16,8 +17,26 @@ pub fn unit_file(binary: &Path) -> String {
     )
 }
 
-pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Result<()> {
+pub fn run(
+    paths: Paths,
+    token: &str,
+    panel: &str,
+    panel_ca: Option<&Path>,
+    dry_run: bool,
+) -> anyhow::Result<()> {
     require_root("enrolment")?;
+
+    // Read first, so a wrong file stops here with nothing changed.
+    let pinned = panel_ca
+        .map(|path| -> anyhow::Result<(Vec<u8>, Trust)> {
+            let pem = std::fs::read(path).map_err(|e| {
+                anyhow::anyhow!("could not read the panel's CA at {}: {e}", path.display())
+            })?;
+            let trust = Trust::pinned_pem(&pem)
+                .map_err(|_| anyhow::anyhow!("{} isn't a CA certificate (PEM)", path.display()))?;
+            Ok((pem, trust))
+        })
+        .transpose()?;
 
     println!("ServerOS daemon {} enrolment", BuildInfo::current().version);
     println!();
@@ -28,6 +47,9 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
         paths.config_dir.display()
     );
     println!("  3. ask {panel} for a certificate using your one-time token");
+    if let Some(path) = panel_ca {
+        println!("     (trusting only the panel CA in {})", path.display());
+    }
     println!("  4. install and start {UNIT_NAME}");
     println!("  5. run a first read-only scan of what is running here");
     println!();
@@ -79,8 +101,12 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
     println!("  generated keypair");
 
     let rt = runtime()?;
+    let trust = pinned
+        .as_ref()
+        .map_or(Trust::WebPki, |(_, trust)| trust.clone());
     let (answer, identity) = rt.block_on(enrol(
         panel,
+        trust,
         token,
         &key,
         &facts.hostname,
@@ -88,6 +114,16 @@ pub fn run(paths: Paths, token: &str, panel: &str, dry_run: bool) -> anyhow::Res
         &facts,
     ))?;
     identity.save(&paths)?;
+    // Later calls straight to the panel (the release feed) trust it too.
+    match &pinned {
+        Some((pem, _)) => {
+            std::fs::write(paths.panel_ca(), pem)?;
+            println!("  pinned the panel's CA in {}", paths.panel_ca().display());
+        }
+        None => {
+            let _ = std::fs::remove_file(paths.panel_ca());
+        }
+    }
 
     let host = answer.panel_host.clone().unwrap_or_else(|| {
         panel

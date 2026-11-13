@@ -395,7 +395,7 @@ async fn update_checks(app: Arc<App>) {
 
 async fn check_once(app: &App, url: &str) -> anyhow::Result<Option<daemon_selfupdate::Candidate>> {
     let client = daemon_http::Client::new(
-        daemon_http::Trust::WebPki,
+        daemon_identity::panel_trust(&app.paths)?,
         format!("serverosd/{} (update-check)", app.build.version),
     );
     let response = client.get(url).await?;

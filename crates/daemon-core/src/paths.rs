@@ -56,6 +56,12 @@ impl Paths {
         self.config_dir.join("ca.crt")
     }
 
+    /// The CA behind the panel's own HTTPS certificate, pinned at enrolment
+    /// (`enrol --panel-ca`) when it isn't a publicly trusted one.
+    pub fn panel_ca(&self) -> PathBuf {
+        self.config_dir.join("panel-ca.crt")
+    }
+
     pub fn state_db(&self) -> PathBuf {
         self.state_dir.join("state.db")
     }
