@@ -767,6 +767,15 @@ pub enum Job {
         packages: Vec<String>,
         hold: bool,
     },
+    /// Restart the services still running files an update replaced, so the
+    /// update takes effect without a reboot. Only units the daemon finds
+    /// stale when the job runs are restarted; `systemd` re-executes PID 1
+    /// in place when it is.
+    RestartStale {
+        units: Vec<String>,
+        #[serde(default)]
+        systemd: bool,
+    },
     Reboot,
     FirewallRule {
         action: FirewallAction,
@@ -1286,6 +1295,15 @@ mod tests {
             serde_json::from_value::<Job>(raw).unwrap(),
             Job::PackageAdd {
                 packages: vec!["git".into(), "unzip".into()],
+            }
+        );
+
+        let raw = serde_json::json!({"type": "restart_stale", "units": ["nginx.service"]});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::RestartStale {
+                units: vec!["nginx.service".into()],
+                systemd: false,
             }
         );
 

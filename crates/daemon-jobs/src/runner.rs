@@ -372,6 +372,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::PackageInstallVersions { .. } => "package_install_versions",
         Job::PackageAdd { .. } => "package_add",
         Job::PackageHold { .. } => "package_hold",
+        Job::RestartStale { .. } => "restart_stale",
         Job::Reboot => "reboot",
         Job::FirewallRule { .. } => "firewall_rule",
         Job::SshKey { .. } => "ssh_key",
