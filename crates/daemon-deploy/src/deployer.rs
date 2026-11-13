@@ -37,6 +37,13 @@ impl Deployer {
         self.paths.state_dir.join("apps")
     }
 
+    /// Where a compose stack runs from. Compose resolves the stack's relative
+    /// paths (config files it bind-mounts) to this folder, and Docker reads
+    /// them again on every restart, so it has to outlive the job's workspace.
+    fn compose_dir(&self, service: &str) -> PathBuf {
+        self.apps_dir().join(git::sanitise(service)).join("compose")
+    }
+
     fn keys_dir(&self) -> PathBuf {
         self.paths.state_dir.join("keys")
     }
@@ -179,8 +186,10 @@ impl Deployer {
         if let Some(compose) = &spec.compose_file {
             progress.phase("build", Some(40)).await;
             let project = format!("serveros-{}", git::sanitise(service));
+            let dir = self.compose_dir(service);
+            replace_dir(workspace, &dir)?;
             container::compose_up(
-                workspace,
+                &dir,
                 compose,
                 &project,
                 env_file.as_deref(),
@@ -468,6 +477,18 @@ fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Re
 const MAX_JOB_FILES: usize = 64;
 const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 
+/// Moves a job's workspace to `dir`, replacing what an earlier deploy left there.
+fn replace_dir(workspace: &Path, dir: &Path) -> Result<(), Failure> {
+    let fail = |e: std::io::Error| {
+        Failure::new("prepare", format!("could not keep the deploy's files: {e}"))
+    };
+    if dir.exists() {
+        std::fs::remove_dir_all(dir).map_err(fail)?;
+    }
+    std::fs::create_dir_all(dir.parent().unwrap()).map_err(fail)?;
+    std::fs::rename(workspace, dir).map_err(fail)
+}
+
 fn write_files(
     workspace: &Path,
     files: &std::collections::BTreeMap<String, String>,
@@ -588,6 +609,32 @@ mod tests {
             Some("serveros-shop-bbbbbbbbbbbb")
         );
         assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
+    }
+
+    #[test]
+    fn compose_files_outlive_the_job_and_replace_the_last_deploy() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("apps/shop/compose");
+        let first = root.path().join("jobs/1");
+        std::fs::create_dir_all(first.join("conf")).unwrap();
+        std::fs::write(first.join("conf/app.yml"), "one").unwrap();
+        std::fs::write(first.join("old.txt"), "gone next time").unwrap();
+        replace_dir(&first, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("conf/app.yml")).unwrap(),
+            "one"
+        );
+        assert!(!first.exists());
+
+        let second = root.path().join("jobs/2");
+        std::fs::create_dir_all(second.join("conf")).unwrap();
+        std::fs::write(second.join("conf/app.yml"), "two").unwrap();
+        replace_dir(&second, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("conf/app.yml")).unwrap(),
+            "two"
+        );
+        assert!(!dir.join("old.txt").exists());
     }
 
     #[test]
