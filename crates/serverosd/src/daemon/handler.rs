@@ -15,7 +15,7 @@ use daemon_streams::LogTail;
 use serde_json::{json, Value};
 
 use super::app::App;
-use super::{machine, packages, ports};
+use super::{machine, packages, ports, restarts};
 
 pub struct JobHandler {
     pub app: Arc<App>,
@@ -1059,6 +1059,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                     .ok()
                     .map(|r| format!("{} held", r.held.len()))
                     .as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::RestartStale { units, systemd } => {
+            let grant = authorize(Operation::Machine(MachineOp::RestartStaleServices {
+                units: units.clone(),
+            }))?;
+            let result = restarts::restart_stale(&ctx, &units, systemd).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(format!("{} services", units.len())).as_deref(),
             );
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
         }
