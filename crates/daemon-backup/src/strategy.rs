@@ -143,7 +143,9 @@ enum DatabaseImage {
 }
 
 /// Which database an image runs, by its name: postgres, postgis/postgis,
-/// timescale/timescaledb, mysql, mariadb, percona…
+/// timescale/timescaledb, mysql, mariadb, percona… Exact names, so tools
+/// named after a database (postgrest, supabase/postgres-meta,
+/// postgres-exporter, mysqld-exporter) aren't dumped as one.
 fn database_image(image: &str) -> Option<DatabaseImage> {
     let name = image
         .rsplit('/')
@@ -153,18 +155,14 @@ fn database_image(image: &str) -> Option<DatabaseImage> {
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if name.starts_with("postgres")
-        || name.starts_with("postgis")
-        || name.starts_with("timescaledb")
-    {
-        Some(DatabaseImage::Postgres)
-    } else if name.starts_with("mysql")
-        || name.starts_with("mariadb")
-        || name.starts_with("percona")
-    {
-        Some(DatabaseImage::Mysql)
-    } else {
-        None
+    match name.as_str() {
+        "postgres" | "postgresql" | "postgis" | "pgvector" | "timescaledb" | "timescaledb-ha" => {
+            Some(DatabaseImage::Postgres)
+        }
+        "mysql" | "mysql-server" | "mariadb" | "percona" | "percona-server" => {
+            Some(DatabaseImage::Mysql)
+        }
+        _ => None,
     }
 }
 
@@ -296,6 +294,26 @@ mod tests {
         assert_eq!(
             Strategy::for_container("web-1", "nginx", &[], vec![], true),
             None
+        );
+        // Tools named after a database are not one.
+        for image in [
+            "postgrest/postgrest:v14.18",
+            "supabase/postgres-meta:v0.100.0",
+            "prometheuscommunity/postgres-exporter",
+            "prom/mysqld-exporter",
+        ] {
+            assert_eq!(
+                Strategy::for_container("tool-1", image, &[], vec![], true),
+                None,
+                "{image}"
+            );
+        }
+        assert_eq!(
+            Strategy::for_container("db-1", "supabase/postgres:17.6.1.136", &[], vec![], true),
+            Some(Strategy::PostgresContainer {
+                container: "db-1".into(),
+                user: "postgres".into()
+            })
         );
         // A stopped database can't dump, but its files are consistent.
         assert_eq!(
