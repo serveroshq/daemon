@@ -11,6 +11,7 @@ mod machine;
 mod network;
 mod packages;
 mod ports;
+mod restarts;
 mod service_ops;
 mod service_stats;
 mod tls_ask;

@@ -18,6 +18,7 @@ pub enum MachineOp {
     ApplyPackageUpdates { security_only: bool },
     HoldPackages { hold: bool, packages: Vec<String> },
     AddPackages { packages: Vec<String> },
+    RestartStaleServices { units: Vec<String> },
     Reboot,
     ReadFirewall,
     WriteFirewall { rule: String },
@@ -86,6 +87,8 @@ impl Operation {
                 MachineOp::HoldPackages { .. } => "packages.hold",
                 // Installing what isn't there yet, from the machine's own repositories.
                 MachineOp::AddPackages { .. } => "packages.add",
+                // Restarting what still runs files an update replaced.
+                MachineOp::RestartStaleServices { .. } => "packages.restart",
                 MachineOp::Reboot => "machine.reboot",
                 MachineOp::ReadFirewall => "firewall.read",
                 MachineOp::WriteFirewall { .. } => "firewall.write",
@@ -152,6 +155,7 @@ impl Operation {
                     packages.join(",")
                 ),
                 MachineOp::AddPackages { packages } => packages.join(","),
+                MachineOp::RestartStaleServices { units } => units.join(","),
                 MachineOp::WriteFirewall { rule } => rule.clone(),
                 MachineOp::ManageSshKeys { user } => user.clone(),
                 MachineOp::WriteNetwork { network } => network.clone(),
@@ -211,6 +215,7 @@ impl Operation {
                 MachineOp::ApplyPackageUpdates { .. }
                     | MachineOp::HoldPackages { .. }
                     | MachineOp::AddPackages { .. }
+                    | MachineOp::RestartStaleServices { .. }
                     | MachineOp::Reboot
                     | MachineOp::WriteFirewall { .. }
                     | MachineOp::ManageSshKeys { .. }
@@ -235,6 +240,7 @@ impl Operation {
             Operation::Machine(MachineOp::ApplyPackageUpdates { .. })
                 | Operation::Machine(MachineOp::HoldPackages { .. })
                 | Operation::Machine(MachineOp::AddPackages { .. })
+                | Operation::Machine(MachineOp::RestartStaleServices { .. })
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })

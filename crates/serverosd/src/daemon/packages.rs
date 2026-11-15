@@ -8,6 +8,8 @@ use daemon_protocol::PackageVersion;
 use serde::Serialize;
 use tokio::sync::watch;
 
+use super::restarts::{self, Restarts};
+
 /// How many lines of a listing (upgradable packages, holds) are read. The
 /// live log keeps 40; a machine a year behind can have a few thousand.
 const MAX_LISTED: usize = 5000;
@@ -30,6 +32,10 @@ pub struct PackageReport {
     /// After an install, the version of each named package now installed,
     /// so the panel can check the target was reached. Empty for checks.
     pub installed: Vec<PackageVersion>,
+    /// Which services still run files an update replaced, and what really
+    /// needs a reboot. `reboot_required` stays the system's own answer
+    /// (which says yes for a new libc or dbus) for panels that predate this.
+    pub restarts: Restarts,
 }
 
 /// What `package_hold` leaves: every package held afterwards.
@@ -303,7 +309,15 @@ pub async fn package_updates(
         held: held(manager, &mut cancel).await,
         os: os_release(),
         installed: Vec::new(),
+        restarts: stale().await,
     })
+}
+
+/// The restart scan reads every process's maps, so off the async threads.
+async fn stale() -> Restarts {
+    tokio::task::spawn_blocking(restarts::scan)
+        .await
+        .unwrap_or_default()
 }
 
 const MAX_INSTALL_PACKAGES: usize = 500;
@@ -420,6 +434,7 @@ pub async fn install_packages(
         held: held(manager, &mut cancel).await,
         os: os_release(),
         installed: installed_versions(manager, packages, &mut cancel).await,
+        restarts: stale().await,
     })
 }
 
@@ -620,6 +635,7 @@ pub async fn add_packages(ctx: &JobContext, packages: &[String]) -> Result<Packa
         held: held(manager, &mut cancel).await,
         os: os_release(),
         installed,
+        restarts: stale().await,
     })
 }
 
@@ -914,6 +930,7 @@ pub async fn install_versions(
         held: held(manager, &mut cancel).await,
         os: os_release(),
         installed: installed_matching(manager, packages, &mut cancel).await,
+        restarts: stale().await,
     })
 }
 
@@ -1125,7 +1142,7 @@ fn compare_evr(a: &str, b: &str) -> Ordering {
 /// rpm's `rpmvercmp`: runs of digits compare as numbers, runs of letters as
 /// strings, digits beat letters, `~` sorts before anything (even the end)
 /// and `^` after the end but before anything else.
-fn rpmvercmp(a: &str, b: &str) -> Ordering {
+pub(super) fn rpmvercmp(a: &str, b: &str) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }

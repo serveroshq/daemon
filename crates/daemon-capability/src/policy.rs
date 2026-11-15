@@ -245,6 +245,20 @@ mod tests {
     }
 
     #[test]
+    fn restarting_stale_services_is_a_confirmed_change() {
+        let restart = Operation::Machine(MachineOp::RestartStaleServices {
+            units: vec!["nginx.service".into(), "cron.service".into()],
+        });
+        let checks = checks_for(&restart);
+
+        assert_eq!(restart.verb(), "packages.restart");
+        assert_eq!(restart.target(), "nginx.service,cron.service");
+        assert!(restart.mutates());
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
     fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
         let remove = Operation::Service(ServiceOp::Remove {
             service: "docker:abc123def456".into(),
