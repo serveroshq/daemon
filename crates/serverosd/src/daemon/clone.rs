@@ -293,6 +293,7 @@ pub async fn clone(
                 &name,
                 std::slice::from_ref(domain),
                 host_port,
+                None,
                 &mut cancel,
                 &ctx.progress,
             )

@@ -427,10 +427,19 @@ fn jitter(max: u64) -> u64 {
 
 /// nginx and Apache don't keep trying for a certificate the way Caddy and
 /// Traefik do, so a site deployed before its domain pointed here would
-/// stay on plain HTTP. Try again for those every 15 minutes.
+/// stay on plain HTTP. Try again for those every 15 minutes. At start-up,
+/// first rewrite site files an update changed, like the challenge folder
+/// moving out of /var/lib/serveros.
 async fn certificates(app: Arc<App>) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let refreshed = app.deployer.proxy().refresh_sites().await;
+    if refreshed > 0 {
+        info!(
+            sites = refreshed,
+            "rewrote site files this version writes differently"
+        );
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
-    tick.tick().await;
     loop {
         tick.tick().await;
         let done = app.deployer.proxy().retry_certificates().await;

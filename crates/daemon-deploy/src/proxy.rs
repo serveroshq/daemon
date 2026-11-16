@@ -77,7 +77,9 @@ const TRAEFIK_OTHER_CONFIGS: [&str; 2] = ["/etc/traefik/traefik.yml", "/etc/trae
 
 /// Where certbot answers Let's Encrypt's HTTP challenge for nginx and
 /// Apache sites, and where their certificates end up.
-pub const ACME_WEBROOT: &str = "/var/lib/serveros/acme";
+/// Outside /var/lib/serveros, which only root may enter: nginx and Apache
+/// run as www-data and have to read the challenge files.
+pub const ACME_WEBROOT: &str = "/var/lib/serveros-acme";
 pub const LETSENCRYPT_LIVE: &str = "/etc/letsencrypt/live";
 
 /// A line in every site file we write, so any proxy can read the site back
@@ -194,6 +196,9 @@ pub struct Proxy {
 pub struct Site {
     pub domains: Vec<String>,
     pub port: u16,
+    /// False for a site served over plain HTTP by choice: no certificate,
+    /// no redirect.
+    pub https: bool,
 }
 
 fn meta_line(domains: &[String], upstream_port: u16) -> String {
@@ -207,9 +212,12 @@ fn parse_meta(text: &str) -> Option<Site> {
     let rest = text.lines().find_map(|l| l.strip_prefix(SITE_META))?;
     let mut port = None;
     let mut domains = Vec::new();
+    let mut https = true;
     for part in rest.split_whitespace() {
         if let Some(p) = part.strip_prefix("port=") {
             port = p.parse().ok();
+        } else if part == "https=off" {
+            https = false;
         } else if let Some(d) = part.strip_prefix("domains=") {
             domains = d
                 .split(',')
@@ -221,6 +229,7 @@ fn parse_meta(text: &str) -> Option<Site> {
     (!domains.is_empty()).then_some(Site {
         domains,
         port: port?,
+        https,
     })
 }
 
@@ -245,6 +254,7 @@ fn parse_nginx_legacy(text: &str) -> Option<Site> {
     (!domains.is_empty()).then_some(Site {
         domains,
         port: port?,
+        https: true,
     })
 }
 
@@ -254,7 +264,11 @@ fn read_site(backend: ProxyBackend, text: &str) -> Option<Site> {
         return None;
     }
     parse_meta(text).or_else(|| match backend {
-        ProxyBackend::Caddy => parse_site(text).map(|(domains, port)| Site { domains, port }),
+        ProxyBackend::Caddy => parse_site(text).map(|(domains, port)| Site {
+            domains,
+            port,
+            https: true,
+        }),
         ProxyBackend::Nginx => parse_nginx_legacy(text),
         _ => None,
     })
@@ -379,7 +393,7 @@ fn nginx_proxy(upstream_port: u16, proto: &str) -> String {
     )
 }
 
-const NGINX_ACME: &str = "    location ^~ /.well-known/acme-challenge/ {\n        root /var/lib/serveros/acme;\n        default_type text/plain;\n    }\n";
+const NGINX_ACME: &str = "    location ^~ /.well-known/acme-challenge/ {\n        root /var/lib/serveros-acme;\n        default_type text/plain;\n    }\n";
 
 /// nginx server blocks for one app. Plain names answer on port 80 for
 /// Let's Encrypt's challenge and, once `tls` (the certificate's folder)
@@ -456,7 +470,7 @@ fn apache_proxy(upstream_port: u16, proto: &str) -> String {
     )
 }
 
-const APACHE_ACME: &str = "    Alias /.well-known/acme-challenge/ /var/lib/serveros/acme/.well-known/acme-challenge/\n    <Directory /var/lib/serveros/acme>\n        Require all granted\n    </Directory>\n    ProxyPass /.well-known/acme-challenge/ !\n";
+const APACHE_ACME: &str = "    Alias /.well-known/acme-challenge/ /var/lib/serveros-acme/.well-known/acme-challenge/\n    <Directory /var/lib/serveros-acme>\n        Require all granted\n    </Directory>\n    ProxyPass /.well-known/acme-challenge/ !\n";
 
 /// The first name a virtual host answers to and the rest. A host with only
 /// wildcards gets a name no one visits, since ServerName can't be one.
@@ -604,6 +618,68 @@ pub fn render_traefik(
     Ok(out)
 }
 
+/// A site served over plain HTTP because its owner chose that (say, a
+/// proxy or CDN in front does HTTPS): no certificate, no redirect, and the
+/// app is told the visitor's real scheme.
+pub fn render_http_only(
+    backend: ProxyBackend,
+    stem: &str,
+    domains: &[String],
+    upstream_port: u16,
+) -> Result<String, Failure> {
+    validate_domains(domains)?;
+
+    let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+    out.push_str(&format!(
+        "{SITE_META} port={upstream_port} domains={} https=off\n",
+        domains.join(",")
+    ));
+    out.push_str("# Plain HTTP by choice: HTTPS is off for this site.\n");
+    let all: Vec<&String> = domains.iter().collect();
+
+    match backend {
+        ProxyBackend::Caddy => {
+            let names = domains
+                .iter()
+                .map(|d| format!("http://{d}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!(
+                "{names} {{\n\tencode zstd gzip\n\treverse_proxy 127.0.0.1:{upstream_port}\n}}\n"
+            ));
+        }
+        ProxyBackend::Nginx => {
+            out.push_str(&format!(
+                "server {{\n    listen 80;\n    listen [::]:80;\n    server_name {};\n    client_max_body_size 100m;\n\n{}}}\n",
+                domains.join(" "),
+                nginx_proxy(upstream_port, "$scheme")
+            ));
+        }
+        ProxyBackend::Apache => {
+            out.push_str(&format!(
+                "<VirtualHost *:80>\n{}{}</VirtualHost>\n",
+                apache_names(stem, &all),
+                apache_proxy(upstream_port, "http")
+            ));
+        }
+        ProxyBackend::Traefik => {
+            let id = format!("serveros-{stem}");
+            out.push_str(&format!(
+                "[http.routers.{id}]\n  rule = '{rule}'\n  entryPoints = [\"web\"]\n  service = \"{id}\"\n\n[http.services.{id}.loadBalancer]\n  [[http.services.{id}.loadBalancer.servers]]\n    url = \"http://127.0.0.1:{upstream_port}\"\n",
+                rule = traefik_rule(&all),
+            ));
+        }
+        ProxyBackend::None => {
+            return Err(Failure::new(
+                "proxy",
+                "no reverse proxy is configured on this machine",
+            ));
+        }
+    }
+
+    Ok(out)
+}
+
 fn validate_domains(domains: &[String]) -> Result<(), Failure> {
     if domains.is_empty() {
         return Err(
@@ -709,6 +785,9 @@ impl Proxy {
 
     /// The site file for one app, as this proxy writes it now.
     fn render_site(&self, stem: &str, site: &Site, plain_http: bool) -> Result<String, Failure> {
+        if !site.https && !plain_http {
+            return render_http_only(self.backend, stem, &site.domains, site.port);
+        }
         let tls = (!plain_http && self.has_cert(stem)).then(|| self.cert_dir(stem));
         match self.backend {
             ProxyBackend::Caddy => render(&site.domains, site.port, plain_http),
@@ -874,7 +953,9 @@ impl Proxy {
             }
         }
         if self.uses_certbot() {
+            use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::create_dir_all(ACME_WEBROOT);
+            let _ = std::fs::set_permissions(ACME_WEBROOT, std::fs::Permissions::from_mode(0o755));
         }
 
         if self.backend == ProxyBackend::Traefik {
@@ -950,11 +1031,15 @@ impl Proxy {
         Ok(true)
     }
 
+    /// Writes (or rewrites) one app's site and reloads the proxy. `https`
+    /// None keeps what the site had (a rollback, a clone), and HTTPS for a
+    /// new one.
     pub async fn publish(
         &self,
         service: &str,
         domains: &[String],
         upstream_port: u16,
+        https: Option<bool>,
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<PathBuf, Failure> {
@@ -963,9 +1048,16 @@ impl Proxy {
         }
         let plain_http = self.plain_http();
         let stem = crate::git::sanitise(service);
+        let https = https.unwrap_or_else(|| {
+            std::fs::read_to_string(self.site_file(service))
+                .ok()
+                .and_then(|text| read_site(self.backend, &text))
+                .is_none_or(|site| site.https)
+        });
         let site = Site {
             domains: domains.to_vec(),
             port: upstream_port,
+            https,
         };
         let rendered = self.render_site(&stem, &site, plain_http)?;
         let path = self.site_file(service);
@@ -976,6 +1068,7 @@ impl Proxy {
         let mut previous_main = None;
         if self.backend == ProxyBackend::Caddy
             && !plain_http
+            && https
             && domains.iter().any(|d| is_wildcard(d))
         {
             let existing = std::fs::read_to_string(&self.main_config).unwrap_or_default();
@@ -1001,6 +1094,7 @@ impl Proxy {
         }
         if self.backend != ProxyBackend::Caddy
             && !plain_http
+            && https
             && domains.iter().any(|d| is_wildcard(d))
         {
             progress
@@ -1032,7 +1126,15 @@ impl Proxy {
 
         self.reload(cancel, progress).await?;
 
-        if self.uses_certbot() && !plain_http {
+        if !https && !plain_http {
+            progress
+                .line(format!(
+                    "HTTPS is off for {}: it's served over plain HTTP",
+                    domains.join(", ")
+                ))
+                .await;
+        }
+        if self.uses_certbot() && !plain_http && https {
             self.certify(&stem, &site, &path, cancel, progress).await;
         }
 
@@ -1177,6 +1279,34 @@ impl Proxy {
         Ok(true)
     }
 
+    /// Rewrites the site files ServerOS wrote that this daemon would now
+    /// write differently (after an update changed how sites look), and
+    /// reloads the proxy. Puts them back if the proxy won't take them.
+    /// Returns how many changed.
+    pub async fn refresh_sites(&self) -> usize {
+        if self.backend == ProxyBackend::None {
+            return 0;
+        }
+        let rewrites = self.rerendered(self.plain_http());
+        if rewrites.is_empty() {
+            return 0;
+        }
+        if self.uses_certbot() {
+            let _ = self.ensure_import();
+        }
+        for (path, _, after) in &rewrites {
+            let _ = std::fs::write(path, after);
+        }
+        if !quiet(self.validate_command()).await || !quiet(self.reload_command()).await {
+            for (path, before, _) in &rewrites {
+                let _ = std::fs::write(path, before);
+            }
+            let _ = quiet(self.reload_command()).await;
+            return 0;
+        }
+        rewrites.len()
+    }
+
     /// Tries again for nginx and Apache sites still without a certificate,
     /// usually because the domain wasn't pointing here at deploy. Returns
     /// how many sites went over to HTTPS.
@@ -1187,7 +1317,7 @@ impl Proxy {
         let mut done = 0;
         for (stem, site) in self.our_sites() {
             let (_, plain) = split_wildcards(&site.domains);
-            if plain.is_empty() || self.has_cert(&stem) {
+            if !site.https || plain.is_empty() || self.has_cert(&stem) {
                 continue;
             }
             let args = self.certbot_args(&stem, &plain);
@@ -1368,7 +1498,7 @@ impl Proxy {
                 .map_err(|e| Failure::new("proxy", format!("could not mark {} as behind a tunnel: {e}", next.include_dir.display())))?;
             }
             for (stem, site) in &sites {
-                next.publish(stem, &site.domains, site.port, cancel, progress).await?;
+                next.publish(stem, &site.domains, site.port, Some(site.https), cancel, progress).await?;
             }
             if sites.is_empty() {
                 next.validate(cancel, progress).await?;
@@ -2188,7 +2318,8 @@ mod tests {
                 site,
                 Site {
                     domains: domains.clone(),
-                    port: 4123
+                    port: 4123,
+                    https: true
                 },
                 "{text}"
             );
@@ -2210,7 +2341,8 @@ mod tests {
             read_site(ProxyBackend::Nginx, old),
             Some(Site {
                 domains: vec!["shop.example".into(), "www.shop.example".into()],
-                port: 3000
+                port: 3000,
+                https: true
             })
         );
     }
@@ -2320,7 +2452,7 @@ mod tests {
         let refs: Vec<&String> = names.iter().collect();
 
         let args = nginx.certbot_args("shop", &refs).join(" ");
-        assert!(args.starts_with("certonly --webroot -w /var/lib/serveros/acme --cert-name serveros-shop -d acme.io -d www.acme.io"));
+        assert!(args.starts_with("certonly --webroot -w /var/lib/serveros-acme --cert-name serveros-shop -d acme.io -d www.acme.io"));
         assert!(args.contains("--non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring --expand"));
         assert!(args.ends_with("--deploy-hook systemctl reload nginx"));
 
@@ -2362,7 +2494,8 @@ mod tests {
                 "shop".to_string(),
                 Site {
                     domains: vec!["acme.io".into()],
-                    port: 3000
+                    port: 3000,
+                    https: true
                 }
             )]
         );
@@ -2504,5 +2637,80 @@ mod tests {
         assert!(TRAEFIK_INSTALL_SCRIPT.contains("sha256sum -c -"));
         assert!(TRAEFIK_INSTALL_SCRIPT.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
         assert!(TRAEFIK_INSTALL_SCRIPT.contains("--configFile=/etc/traefik/traefik.toml"));
+    }
+
+    #[test]
+    fn the_challenge_folder_is_outside_the_private_state_folder() {
+        assert!(!ACME_WEBROOT.starts_with("/var/lib/serveros/"));
+        assert!(NGINX_ACME.contains(&format!("root {ACME_WEBROOT};")));
+        assert!(APACHE_ACME.contains(&format!("<Directory {ACME_WEBROOT}>")));
+    }
+
+    #[test]
+    fn a_site_with_https_off_is_plain_http_on_every_proxy_and_reads_back() {
+        let domains: Vec<String> = vec!["acme.io".into(), "*.acme.io".into()];
+        for backend in [
+            ProxyBackend::Caddy,
+            ProxyBackend::Nginx,
+            ProxyBackend::Apache,
+            ProxyBackend::Traefik,
+        ] {
+            let text = render_http_only(backend, "shop", &domains, 3000).unwrap();
+            let site = read_site(backend, &text).unwrap_or_else(|| panic!("{text}"));
+            assert!(!site.https, "{text}");
+            assert_eq!(site.port, 3000);
+            assert_eq!(site.domains, domains);
+            for secure in [
+                "443",
+                "certResolver",
+                "SSLEngine",
+                "return 301",
+                "redirectScheme",
+                "on_demand",
+            ] {
+                assert!(!text.contains(secure), "{backend:?} has {secure}: {text}");
+            }
+        }
+
+        let caddy = render_http_only(ProxyBackend::Caddy, "shop", &domains, 3000).unwrap();
+        assert!(caddy.contains("http://acme.io, http://*.acme.io {"));
+        assert!(wildcard_parents(&caddy).is_empty());
+    }
+
+    #[test]
+    fn https_on_is_the_default_for_site_files_that_dont_say() {
+        let text = render(&["acme.io".into()], 3000, false).unwrap();
+        assert!(read_site(ProxyBackend::Caddy, &text).unwrap().https);
+        assert!(!text.contains("https=off"));
+    }
+
+    #[test]
+    fn a_proxy_writes_https_off_sites_as_plain_http_even_with_a_certificate() {
+        let dir = temp_dir("https-off");
+        let nginx = proxy_in(ProxyBackend::Nginx, &dir);
+        std::fs::create_dir_all(nginx.cert_dir("shop")).unwrap();
+        std::fs::write(nginx.cert_dir("shop").join("fullchain.pem"), "").unwrap();
+        let site = Site {
+            domains: vec!["acme.io".into()],
+            port: 3000,
+            https: false,
+        };
+
+        let text = nginx.render_site("shop", &site, false).unwrap();
+        assert!(text.contains("https=off"));
+        assert!(!text.contains("listen 443"));
+        let on = nginx
+            .render_site(
+                "shop",
+                &Site {
+                    https: true,
+                    ..site
+                },
+                false,
+            )
+            .unwrap();
+        assert!(on.contains("listen 443 ssl;"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1015,6 +1015,11 @@ pub struct DeploySpec {
     /// Missing means keep the current one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// Whether the domains are served over HTTPS (a certificate, and HTTP
+    /// redirected to it). Missing keeps what the app had, HTTPS for a new
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

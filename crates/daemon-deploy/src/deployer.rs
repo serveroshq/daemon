@@ -221,7 +221,7 @@ impl Deployer {
                 proxy.ensure_installed(cancel, progress).await?;
                 proxy.ensure_import()?;
                 proxy
-                    .publish(service, &spec.domains, port, cancel, progress)
+                    .publish(service, &spec.domains, port, spec.https, cancel, progress)
                     .await?;
             }
 
@@ -312,7 +312,14 @@ impl Deployer {
             proxy.ensure_installed(cancel, progress).await?;
             proxy.ensure_import()?;
             proxy
-                .publish(service, &spec.domains, host_port, cancel, progress)
+                .publish(
+                    service,
+                    &spec.domains,
+                    host_port,
+                    spec.https,
+                    cancel,
+                    progress,
+                )
                 .await?;
         }
 
@@ -448,7 +455,7 @@ impl Deployer {
         if !domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
             self.proxy()
-                .publish(service, domains, release.port, &mut cancel, progress)
+                .publish(service, domains, release.port, None, &mut cancel, progress)
                 .await?;
         }
 
