@@ -47,6 +47,11 @@ pub struct Hello {
     /// those leave it out.
     #[serde(default, deserialize_with = "present")]
     pub pinned_version: Option<Option<String>>,
+    /// The reverse proxy that serves this machine's app domains: caddy,
+    /// nginx, apache, traefik or none. Missing from daemons that can't
+    /// switch proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 /// What the panel decides for a machine: each one present is applied and
@@ -1004,6 +1009,12 @@ pub struct DeploySpec {
     /// installation token), sent fresh with each deploy and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_token: Option<RepoToken>,
+    /// The reverse proxy the machine should serve its domains with
+    /// (caddy, nginx, apache or traefik). When it isn't the one in use,
+    /// the deploy moves every site on the machine over to it first.
+    /// Missing means keep the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -288,7 +288,7 @@ pub async fn clone(
         let host_port = request.port.unwrap_or_default();
         if let Err(e) = app
             .deployer
-            .proxy
+            .proxy()
             .publish(
                 &name,
                 std::slice::from_ref(domain),

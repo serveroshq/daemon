@@ -195,6 +195,38 @@ async fn restore_one(
 
 /// What a deploy replaces: the live release's container, or every container
 /// of a Compose app. Nothing on a first deploy.
+/// Moves the machine to the proxy a deploy asked for, if it isn't the one
+/// in use, and keeps the choice in daemon.toml so it holds after a restart.
+async fn switch_proxy(app: &App, name: &str, ctx: &JobContext) -> Result<(), Failure> {
+    let wanted = daemon_core::config::ProxyBackend::from_name(name)
+        .filter(|b| daemon_core::config::ProxyBackend::CHOOSABLE.contains(b))
+        .ok_or_else(|| {
+            Failure::new(
+                "proxy",
+                format!("{name:?} isn't a reverse proxy ServerOS can use"),
+            )
+            .with_next_step("Pick Caddy, nginx, Apache or Traefik.")
+        })?;
+    let current = app.deployer.proxy();
+    if current.backend == wanted {
+        return Ok(());
+    }
+
+    ctx.progress.phase("proxy", Some(5)).await;
+    let mut cancel = ctx.cancel.clone();
+    let next = current
+        .switch_to(wanted, &mut cancel, &ctx.progress)
+        .await?;
+    app.deployer.set_proxy(next);
+
+    let mut config = app.config.write().unwrap();
+    config.integrations.proxy = wanted;
+    if let Err(e) = config.save(&app.paths.config_file()) {
+        tracing::warn!(error = %e, "couldn't save the proxy choice; it holds until the daemon restarts");
+    }
+    Ok(())
+}
+
 fn deploy_targets(app: &App, spec: &daemon_protocol::DeploySpec) -> Vec<ManagedService> {
     let Some(current) = daemon_deploy::ReleaseLedger::new(&app.state).current(&spec.service) else {
         return Vec::new();
@@ -697,6 +729,13 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 }
             }
 
+            if let Some(name) = spec.proxy.as_deref() {
+                if let Err(failure) = switch_proxy(&app, name, &ctx).await {
+                    grant.finish(&Err(failure.clone()), None);
+                    return Err(failure);
+                }
+            }
+
             let result = app.deployer.deploy(&ctx, &spec).await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
@@ -728,25 +767,29 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                     name: result.container.clone(),
                 },
             );
+            let proxy = app.deployer.proxy();
             if !spec.domains.is_empty() {
                 let _ = daemon_uninstall::Manifest::record(
                     &manifest,
                     daemon_uninstall::Artifact::File {
-                        path: app.deployer.proxy.site_file(&spec.service),
+                        path: proxy.site_file(&spec.service),
                     },
                 );
-                let _ = daemon_uninstall::Manifest::record(
-                    &manifest,
-                    daemon_uninstall::Artifact::LineInFile {
-                        path: app.deployer.proxy.main_config.clone(),
-                        line: "import /etc/caddy/serveros.d/*.caddy".into(),
-                    },
-                );
+                if let Some(line) = proxy.include_line() {
+                    let _ = daemon_uninstall::Manifest::record(
+                        &manifest,
+                        daemon_uninstall::Artifact::LineInFile {
+                            path: proxy.main_config.clone(),
+                            line: line.into(),
+                        },
+                    );
+                }
             }
 
             let mut value = serde_json::to_value(result).unwrap_or(Value::Null);
             if let Value::Object(fields) = &mut value {
                 fields.insert("pre_deploy_snapshots".into(), Value::Array(snapshots));
+                fields.insert("proxy".into(), Value::String(proxy.backend.name().into()));
             }
             Ok(value)
         }
@@ -1156,7 +1199,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let files = super::tunnel::Files::new(&app.paths.config_dir);
             let mut cancel = ctx.cancel.clone();
             let result = super::tunnel::apply(
-                &app.deployer.proxy,
+                &app.deployer.proxy(),
                 &files,
                 action,
                 token.as_ref(),

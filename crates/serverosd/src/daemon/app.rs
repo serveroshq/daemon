@@ -127,7 +127,7 @@ impl App {
             deployer: Deployer {
                 paths: paths.clone(),
                 state: Arc::clone(&state),
-                proxy: Proxy::for_backend(config.integrations.proxy),
+                proxy: std::sync::RwLock::new(Proxy::for_backend(config.integrations.proxy)),
                 build_limits: BuildLimits {
                     cpu_percent: limits.build_cpu_percent,
                     memory_mb: limits.build_memory_mb,

@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine;
-use daemon_core::config::ProxyBackend;
 use daemon_deploy::proxy::Proxy;
 use daemon_jobs::{run_child, Failure, Progress};
 use daemon_protocol::TunnelAction;
@@ -187,11 +186,7 @@ fn report(proxy: &Proxy, state: &str, tunnel_id: Option<&str>) -> Value {
         "tunnel": {
             "state": state,
             "tunnel_id": tunnel_id,
-            "proxy": match proxy.backend {
-                ProxyBackend::Caddy => "caddy",
-                ProxyBackend::Nginx => "nginx",
-                ProxyBackend::None => "none",
-            },
+            "proxy": proxy.backend.name(),
             "plain_http": proxy.plain_http(),
         }
     })

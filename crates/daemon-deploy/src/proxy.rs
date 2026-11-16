@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use daemon_core::config::ProxyBackend;
@@ -52,11 +52,212 @@ fn fresh_caddyfile() -> String {
 pub const NGINX_CONF: &str = "/etc/nginx/nginx.conf";
 pub const NGINX_INCLUDE_DIR: &str = "/etc/nginx/serveros.d";
 const NGINX_INCLUDE_LINE: &str = "include /etc/nginx/serveros.d/*.conf;";
+/// Settings every nginx site of ours shares. Sorts before any site file,
+/// since nginx wants a variable defined before a server block uses it.
+const NGINX_SHARED_FILE: &str = "00-serveros.conf";
+const NGINX_SHARED: &str = "# Written by ServerOS: settings the sites in serveros.d share.\nmap $http_upgrade $serveros_connection_upgrade {\n    default upgrade;\n    ''      close;\n}\n";
 
+pub const APACHE_CONF: &str = "/etc/apache2/apache2.conf";
+pub const APACHE_INCLUDE_DIR: &str = "/etc/apache2/serveros.d";
+const APACHE_INCLUDE_LINE: &str = "IncludeOptional /etc/apache2/serveros.d/*.conf";
+const APACHE_MODULES: [&str; 6] = [
+    "proxy",
+    "proxy_http",
+    "proxy_wstunnel",
+    "headers",
+    "rewrite",
+    "ssl",
+];
+
+pub const TRAEFIK_CONF: &str = "/etc/traefik/traefik.toml";
+pub const TRAEFIK_INCLUDE_DIR: &str = "/etc/traefik/serveros.d";
+/// The certificate resolver Traefik sites of ours ask for certificates.
+const TRAEFIK_RESOLVER: &str = "serveros";
+const TRAEFIK_OTHER_CONFIGS: [&str; 2] = ["/etc/traefik/traefik.yml", "/etc/traefik/traefik.yaml"];
+
+/// Where certbot answers Let's Encrypt's HTTP challenge for nginx and
+/// Apache sites, and where their certificates end up.
+pub const ACME_WEBROOT: &str = "/var/lib/serveros/acme";
+pub const LETSENCRYPT_LIVE: &str = "/etc/letsencrypt/live";
+
+/// A line in every site file we write, so any proxy can read the site back
+/// (to move it to another proxy, or switch it to plain HTTP).
+const SITE_META: &str = "# ServerOS site:";
+
+const NGINX_INSTALL_SCRIPT: &str = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "automatic nginx install needs apt (Debian or Ubuntu)" >&2
+  exit 3
+fi
+apt-get update -q
+apt-get install -y -q nginx certbot
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+fi
+systemctl enable --now nginx
+"#;
+
+const APACHE_INSTALL_SCRIPT: &str = r#"set -eu
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v apt-get >/dev/null 2>&1; then
+  echo "automatic Apache install needs apt (Debian or Ubuntu)" >&2
+  exit 3
+fi
+apt-get update -q
+apt-get install -y -q apache2 certbot
+a2enmod -q proxy proxy_http proxy_wstunnel headers rewrite ssl
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+fi
+systemctl enable --now apache2
+systemctl reload apache2
+"#;
+
+/// Traefik isn't in Debian's or Ubuntu's archives: the latest v3 release
+/// from GitHub, checked against its published checksums, run as its own
+/// user with only the right to bind ports 80 and 443. Started once
+/// ServerOS has written its config.
+const TRAEFIK_INSTALL_SCRIPT: &str = r#"set -eu
+case "$(uname -m)" in
+  x86_64) arch=amd64 ;;
+  aarch64|arm64) arch=arm64 ;;
+  *) echo "there's no Traefik build for $(uname -m)" >&2; exit 3 ;;
+esac
+latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/traefik/traefik/releases/latest)
+tag=${latest##*/}
+case "$tag" in
+  v3.*) ;;
+  *) echo "unexpected Traefik release: $tag" >&2; exit 3 ;;
+esac
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+file="traefik_${tag}_linux_${arch}.tar.gz"
+base="https://github.com/traefik/traefik/releases/download/$tag"
+curl -fsSL "$base/$file" -o "$tmp/$file"
+curl -fsSL "$base/traefik_${tag}_checksums.txt" -o "$tmp/checksums.txt"
+(cd "$tmp" && grep " $file\$" checksums.txt | sha256sum -c -)
+tar -xzf "$tmp/$file" -C "$tmp" traefik
+install -m 0755 "$tmp/traefik" /usr/local/bin/traefik
+id traefik >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin traefik
+install -d -o traefik -g traefik -m 0750 /var/lib/traefik
+install -d -m 0755 /etc/traefik /etc/traefik/serveros.d
+cat > /etc/systemd/system/traefik.service <<'UNIT'
+[Unit]
+Description=Traefik (installed by ServerOS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=traefik
+Group=traefik
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ExecStart=/usr/local/bin/traefik --configFile=/etc/traefik/traefik.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+fi
+"#;
+
+fn fresh_traefik_config() -> String {
+    format!(
+        "# Installed by ServerOS. Per-service sites live in serveros.d; Traefik\n# gets and renews their certificates on its own.\n[entryPoints.web]\n  address = \":80\"\n\n[entryPoints.websecure]\n  address = \":443\"\n\n[certificatesResolvers.{TRAEFIK_RESOLVER}.acme]\n  storage = \"/var/lib/traefik/acme.json\"\n  [certificatesResolvers.{TRAEFIK_RESOLVER}.acme.httpChallenge]\n    entryPoint = \"web\"\n\n[providers.file]\n  directory = \"{TRAEFIK_INCLUDE_DIR}\"\n  watch = true\n"
+    )
+}
+
+#[derive(Debug, Clone)]
 pub struct Proxy {
     pub backend: ProxyBackend,
     pub main_config: PathBuf,
     pub include_dir: PathBuf,
+    /// Where certbot keeps the certificates for nginx and Apache sites.
+    pub cert_root: PathBuf,
+}
+
+/// One app's site: the names it answers to and the port on the machine it
+/// sends them to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Site {
+    pub domains: Vec<String>,
+    pub port: u16,
+}
+
+fn meta_line(domains: &[String], upstream_port: u16) -> String {
+    format!(
+        "{SITE_META} port={upstream_port} domains={}\n",
+        domains.join(",")
+    )
+}
+
+fn parse_meta(text: &str) -> Option<Site> {
+    let rest = text.lines().find_map(|l| l.strip_prefix(SITE_META))?;
+    let mut port = None;
+    let mut domains = Vec::new();
+    for part in rest.split_whitespace() {
+        if let Some(p) = part.strip_prefix("port=") {
+            port = p.parse().ok();
+        } else if let Some(d) = part.strip_prefix("domains=") {
+            domains = d
+                .split(',')
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+    }
+    (!domains.is_empty()).then_some(Site {
+        domains,
+        port: port?,
+    })
+}
+
+/// An nginx site written before site files said what they were: its
+/// server_name and proxy_pass.
+fn parse_nginx_legacy(text: &str) -> Option<Site> {
+    let mut domains: Vec<String> = Vec::new();
+    let mut port = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(names) = line.strip_prefix("server_name ") {
+            for name in names.trim_end_matches(';').split_whitespace() {
+                if !domains.iter().any(|d| d == name) {
+                    domains.push(name.to_string());
+                }
+            }
+        } else if let Some(rest) = line.strip_prefix("proxy_pass http://127.0.0.1:") {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            port = digits.parse().ok();
+        }
+    }
+    (!domains.is_empty()).then_some(Site {
+        domains,
+        port: port?,
+    })
+}
+
+/// A site file we wrote, read back. None for anyone else's file.
+fn read_site(backend: ProxyBackend, text: &str) -> Option<Site> {
+    if !text.starts_with(MANAGED_HEADER) {
+        return None;
+    }
+    parse_meta(text).or_else(|| match backend {
+        ProxyBackend::Caddy => parse_site(text).map(|(domains, port)| Site { domains, port }),
+        ProxyBackend::Nginx => parse_nginx_legacy(text),
+        _ => None,
+    })
+}
+
+fn split_wildcards(domains: &[String]) -> (Vec<&String>, Vec<&String>) {
+    domains.iter().partition(|d| is_wildcard(d))
 }
 
 impl Default for Proxy {
@@ -84,6 +285,7 @@ pub fn render(domains: &[String], upstream_port: u16, plain_http: bool) -> Resul
     validate_domains(domains)?;
 
     let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+    out.push_str(&meta_line(domains, upstream_port));
 
     if plain_http {
         let names = domains
@@ -167,13 +369,235 @@ fn parse_site(text: &str) -> Option<(Vec<String>, u16)> {
     Some((domains, port?))
 }
 
-pub fn render_nginx(domains: &[String], upstream_port: u16) -> Result<String, Failure> {
+fn nginx_proxy(upstream_port: u16, proto: &str) -> String {
+    format!(
+        "    location / {{\n        proxy_pass http://127.0.0.1:{upstream_port};\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $serveros_connection_upgrade;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto {proto};\n        proxy_read_timeout 300s;\n    }}\n"
+    )
+}
+
+const NGINX_ACME: &str = "    location ^~ /.well-known/acme-challenge/ {\n        root /var/lib/serveros/acme;\n        default_type text/plain;\n    }\n";
+
+/// nginx server blocks for one app. Plain names answer on port 80 for
+/// Let's Encrypt's challenge and, once `tls` (the certificate's folder)
+/// exists, redirect to the HTTPS block. Wildcard names get a plain HTTP
+/// block of their own: certbot's HTTP challenge can't get a certificate
+/// for every subdomain. Behind a tunnel everything is plain HTTP.
+pub fn render_nginx(
+    domains: &[String],
+    upstream_port: u16,
+    tls: Option<&Path>,
+    plain_http: bool,
+) -> Result<String, Failure> {
     validate_domains(domains)?;
 
-    Ok(format!(
-        "# Managed by ServerOS. Edits here are overwritten on the next deploy.\nserver {{\n    listen 80;\n    listen [::]:80;\n    server_name {};\n\n    location / {{\n        proxy_pass http://127.0.0.1:{upstream_port};\n        proxy_http_version 1.1;\n        proxy_set_header Host $host;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }}\n}}\n",
-        domains.join(" ")
-    ))
+    let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+    out.push_str(&meta_line(domains, upstream_port));
+    let listen = "    listen 80;\n    listen [::]:80;\n";
+
+    if plain_http {
+        out.push_str("# Behind a tunnel: plain HTTP here, the tunnel's edge does HTTPS.\n");
+        out.push_str(&format!(
+            "server {{\n{listen}    server_name {};\n    client_max_body_size 100m;\n\n{}}}\n",
+            domains.join(" "),
+            nginx_proxy(upstream_port, "https")
+        ));
+        return Ok(out);
+    }
+
+    let (wildcards, plain) = split_wildcards(domains);
+    let names = |list: &[&String]| {
+        list.iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    if !plain.is_empty() {
+        match tls {
+            Some(dir) => {
+                out.push_str(&format!(
+                    "server {{\n{listen}    server_name {names};\n\n{NGINX_ACME}    location / {{\n        return 301 https://$host$request_uri;\n    }}\n}}\n\nserver {{\n    listen 443 ssl;\n    listen [::]:443 ssl;\n    server_name {names};\n    ssl_certificate {cert};\n    ssl_certificate_key {key};\n    client_max_body_size 100m;\n\n{proxy}}}\n",
+                    names = names(&plain),
+                    cert = dir.join("fullchain.pem").display(),
+                    key = dir.join("privkey.pem").display(),
+                    proxy = nginx_proxy(upstream_port, "$scheme"),
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "server {{\n{listen}    server_name {};\n    client_max_body_size 100m;\n\n{NGINX_ACME}{}}}\n",
+                    names(&plain),
+                    nginx_proxy(upstream_port, "$scheme")
+                ));
+            }
+        }
+    }
+    if !wildcards.is_empty() {
+        if !plain.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "# Wildcard subdomains: plain HTTP, certificates for them need Caddy.\nserver {{\n{listen}    server_name {};\n    client_max_body_size 100m;\n\n{}}}\n",
+            names(&wildcards),
+            nginx_proxy(upstream_port, "$scheme")
+        ));
+    }
+
+    Ok(out)
+}
+
+fn apache_proxy(upstream_port: u16, proto: &str) -> String {
+    format!(
+        "    ProxyPreserveHost On\n    ProxyRequests Off\n    RequestHeader set X-Forwarded-Proto \"{proto}\"\n    ProxyPass / http://127.0.0.1:{upstream_port}/ upgrade=websocket\n    ProxyPassReverse / http://127.0.0.1:{upstream_port}/\n"
+    )
+}
+
+const APACHE_ACME: &str = "    Alias /.well-known/acme-challenge/ /var/lib/serveros/acme/.well-known/acme-challenge/\n    <Directory /var/lib/serveros/acme>\n        Require all granted\n    </Directory>\n    ProxyPass /.well-known/acme-challenge/ !\n";
+
+/// The first name a virtual host answers to and the rest. A host with only
+/// wildcards gets a name no one visits, since ServerName can't be one.
+fn apache_names(stem: &str, names: &[&String]) -> String {
+    let (first, rest) = match names.iter().position(|n| !is_wildcard(n)) {
+        Some(at) => (
+            names[at].to_string(),
+            names
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != at)
+                .map(|(_, n)| n.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        None => (
+            format!("{stem}.serveros.invalid"),
+            names.iter().map(|n| n.as_str()).collect(),
+        ),
+    };
+    let mut out = format!("    ServerName {first}\n");
+    if !rest.is_empty() {
+        out.push_str(&format!("    ServerAlias {}\n", rest.join(" ")));
+    }
+    out
+}
+
+/// Apache virtual hosts for one app, laid out like the nginx ones.
+pub fn render_apache(
+    stem: &str,
+    domains: &[String],
+    upstream_port: u16,
+    tls: Option<&Path>,
+    plain_http: bool,
+) -> Result<String, Failure> {
+    validate_domains(domains)?;
+
+    let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+    out.push_str(&meta_line(domains, upstream_port));
+    let all: Vec<&String> = domains.iter().collect();
+
+    if plain_http {
+        out.push_str("# Behind a tunnel: plain HTTP here, the tunnel's edge does HTTPS.\n");
+        out.push_str(&format!(
+            "<VirtualHost *:80>\n{}{}</VirtualHost>\n",
+            apache_names(stem, &all),
+            apache_proxy(upstream_port, "https")
+        ));
+        return Ok(out);
+    }
+
+    let (wildcards, plain) = split_wildcards(domains);
+    if !plain.is_empty() {
+        let names = apache_names(stem, &plain);
+        match tls {
+            Some(dir) => {
+                out.push_str(&format!(
+                    "<VirtualHost *:80>\n{names}{APACHE_ACME}    RewriteEngine On\n    RewriteCond %{{REQUEST_URI}} !^/\\.well-known/acme-challenge/\n    RewriteRule ^ https://%{{HTTP_HOST}}%{{REQUEST_URI}} [R=301,L]\n</VirtualHost>\n\n<VirtualHost *:443>\n{names}    SSLEngine on\n    SSLCertificateFile {cert}\n    SSLCertificateKeyFile {key}\n{proxy}</VirtualHost>\n",
+                    cert = dir.join("fullchain.pem").display(),
+                    key = dir.join("privkey.pem").display(),
+                    proxy = apache_proxy(upstream_port, "https"),
+                ));
+            }
+            None => {
+                out.push_str(&format!(
+                    "<VirtualHost *:80>\n{names}{APACHE_ACME}{}</VirtualHost>\n",
+                    apache_proxy(upstream_port, "http")
+                ));
+            }
+        }
+    }
+    if !wildcards.is_empty() {
+        if !plain.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "# Wildcard subdomains: plain HTTP, certificates for them need Caddy.\n<VirtualHost *:80>\n{}{}</VirtualHost>\n",
+            apache_names(&format!("{stem}-wildcard"), &wildcards),
+            apache_proxy(upstream_port, "http")
+        ));
+    }
+
+    Ok(out)
+}
+
+fn traefik_rule(names: &[&String]) -> String {
+    names
+        .iter()
+        .map(|n| match n.strip_prefix("*.") {
+            Some(parent) => format!(
+                "HostRegexp(`^[a-z0-9-]+\\.{}$`)",
+                parent.replace('.', "\\.")
+            ),
+            None => format!("Host(`{n}`)"),
+        })
+        .collect::<Vec<_>>()
+        .join(" || ")
+}
+
+/// A Traefik dynamic config (TOML) for one app. Traefik gets and renews
+/// certificates for the plain names itself, through the `serveros`
+/// resolver, and redirects HTTP to HTTPS. Wildcards are plain HTTP, like
+/// with nginx and Apache. Rules are TOML literal strings, so a regex's
+/// backslashes stay as they are.
+pub fn render_traefik(
+    stem: &str,
+    domains: &[String],
+    upstream_port: u16,
+    plain_http: bool,
+) -> Result<String, Failure> {
+    validate_domains(domains)?;
+
+    let id = format!("serveros-{stem}");
+    let mut out = format!("{MANAGED_HEADER} Edits here are overwritten on the next deploy.\n");
+    out.push_str(&meta_line(domains, upstream_port));
+    let all: Vec<&String> = domains.iter().collect();
+
+    if plain_http {
+        out.push_str(&format!(
+            "# Behind a tunnel: plain HTTP here, the tunnel's edge does HTTPS.\n[http.routers.{id}]\n  rule = '{rule}'\n  entryPoints = [\"web\"]\n  middlewares = [\"{id}-forwarded\"]\n  service = \"{id}\"\n\n[http.middlewares.{id}-forwarded.headers.customRequestHeaders]\n  X-Forwarded-Proto = \"https\"\n",
+            rule = traefik_rule(&all),
+        ));
+    } else {
+        let (wildcards, plain) = split_wildcards(domains);
+        if !plain.is_empty() {
+            out.push_str(&format!(
+                "[http.routers.{id}]\n  rule = '{rule}'\n  entryPoints = [\"websecure\"]\n  service = \"{id}\"\n  [http.routers.{id}.tls]\n    certResolver = \"{TRAEFIK_RESOLVER}\"\n\n[http.routers.{id}-http]\n  rule = '{rule}'\n  entryPoints = [\"web\"]\n  middlewares = [\"{id}-https\"]\n  service = \"{id}\"\n\n[http.middlewares.{id}-https.redirectScheme]\n  scheme = \"https\"\n  permanent = true\n",
+                rule = traefik_rule(&plain),
+            ));
+        }
+        if !wildcards.is_empty() {
+            if !plain.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "# Wildcard subdomains: plain HTTP, certificates for them need Caddy.\n[http.routers.{id}-wildcard]\n  rule = '{rule}'\n  entryPoints = [\"web\"]\n  service = \"{id}\"\n",
+                rule = traefik_rule(&wildcards),
+            ));
+        }
+    }
+
+    out.push_str(&format!(
+        "\n[http.services.{id}.loadBalancer]\n  [[http.services.{id}.loadBalancer.servers]]\n    url = \"http://127.0.0.1:{upstream_port}\"\n"
+    ));
+
+    Ok(out)
 }
 
 fn validate_domains(domains: &[String]) -> Result<(), Failure> {
@@ -207,33 +631,116 @@ fn validate_domains(domains: &[String]) -> Result<(), Failure> {
 
 impl Proxy {
     pub fn for_backend(backend: ProxyBackend) -> Self {
-        match backend {
-            ProxyBackend::Caddy | ProxyBackend::None => Self {
-                backend,
-                main_config: CADDYFILE.into(),
-                include_dir: INCLUDE_DIR.into(),
-            },
-            ProxyBackend::Nginx => Self {
-                backend,
-                main_config: NGINX_CONF.into(),
-                include_dir: NGINX_INCLUDE_DIR.into(),
-            },
+        let (main_config, include_dir) = match backend {
+            ProxyBackend::Caddy | ProxyBackend::None => (CADDYFILE, INCLUDE_DIR),
+            ProxyBackend::Nginx => (NGINX_CONF, NGINX_INCLUDE_DIR),
+            ProxyBackend::Apache => (APACHE_CONF, APACHE_INCLUDE_DIR),
+            ProxyBackend::Traefik => (TRAEFIK_CONF, TRAEFIK_INCLUDE_DIR),
+        };
+        Self {
+            backend,
+            main_config: main_config.into(),
+            include_dir: include_dir.into(),
+            cert_root: LETSENCRYPT_LIVE.into(),
+        }
+    }
+
+    fn extension(&self) -> &'static str {
+        match self.backend {
+            ProxyBackend::Nginx | ProxyBackend::Apache => "conf",
+            ProxyBackend::Traefik => "toml",
+            _ => "caddy",
         }
     }
 
     pub fn site_file(&self, service: &str) -> PathBuf {
-        let extension = match self.backend {
-            ProxyBackend::Nginx => "conf",
-            _ => "caddy",
-        };
+        self.include_dir.join(format!(
+            "{}.{}",
+            crate::git::sanitise(service),
+            self.extension()
+        ))
+    }
 
-        self.include_dir
-            .join(format!("{}.{extension}", crate::git::sanitise(service)))
+    /// The systemd unit the proxy runs as.
+    pub fn unit(&self) -> Option<&'static str> {
+        match self.backend {
+            ProxyBackend::Caddy => Some("caddy"),
+            ProxyBackend::Nginx => Some("nginx"),
+            ProxyBackend::Apache => Some("apache2"),
+            ProxyBackend::Traefik => Some("traefik"),
+            ProxyBackend::None => None,
+        }
+    }
+
+    /// The line ServerOS adds to the proxy's own config so it reads our
+    /// sites, for the uninstaller to take out again. Traefik's config is
+    /// ours whole, or the operator's.
+    pub fn include_line(&self) -> Option<&'static str> {
+        match self.backend {
+            ProxyBackend::Caddy => Some(CADDY_IMPORT_LINE),
+            ProxyBackend::Nginx => Some(NGINX_INCLUDE_LINE),
+            ProxyBackend::Apache => Some(APACHE_INCLUDE_LINE),
+            _ => None,
+        }
+    }
+
+    /// nginx and Apache get their certificates from certbot; Caddy and
+    /// Traefik get their own.
+    fn uses_certbot(&self) -> bool {
+        matches!(self.backend, ProxyBackend::Nginx | ProxyBackend::Apache)
+    }
+
+    fn cert_dir(&self, stem: &str) -> PathBuf {
+        self.cert_root.join(format!("serveros-{stem}"))
+    }
+
+    fn has_cert(&self, stem: &str) -> bool {
+        self.cert_dir(stem).join("fullchain.pem").exists()
     }
 
     fn none_configured() -> Failure {
         Failure::new("proxy", "no reverse proxy is configured on this machine")
-            .with_next_step("Set `[integrations] proxy = \"caddy\"` or `\"nginx\"` in daemon.toml, or publish the port yourself.")
+            .with_next_step("Pick a reverse proxy when you deploy, or publish the port yourself.")
+    }
+
+    /// The site file for one app, as this proxy writes it now.
+    fn render_site(&self, stem: &str, site: &Site, plain_http: bool) -> Result<String, Failure> {
+        let tls = (!plain_http && self.has_cert(stem)).then(|| self.cert_dir(stem));
+        match self.backend {
+            ProxyBackend::Caddy => render(&site.domains, site.port, plain_http),
+            ProxyBackend::Nginx => {
+                render_nginx(&site.domains, site.port, tls.as_deref(), plain_http)
+            }
+            ProxyBackend::Apache => {
+                render_apache(stem, &site.domains, site.port, tls.as_deref(), plain_http)
+            }
+            ProxyBackend::Traefik => render_traefik(stem, &site.domains, site.port, plain_http),
+            ProxyBackend::None => Err(Self::none_configured()),
+        }
+    }
+
+    /// Every site ServerOS wrote for this proxy, by file stem (the
+    /// service's name as it goes in a file name).
+    pub fn our_sites(&self) -> Vec<(String, Site)> {
+        let Ok(entries) = std::fs::read_dir(&self.include_dir) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == self.extension()))
+            .collect();
+        paths.sort();
+
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                let site = read_site(self.backend, &text)?;
+                let stem = path.file_stem()?.to_string_lossy().into_owned();
+                Some((stem, site))
+            })
+            .collect()
     }
 
     pub async fn ensure_installed(
@@ -241,24 +748,39 @@ impl Proxy {
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<bool, Failure> {
-        // A caddy binary without its systemd unit (copied in by hand, or
-        // left by another tool) can't be started or reloaded: install the
-        // package, which brings the unit.
-        if self.backend != ProxyBackend::Caddy || (on_path("caddy") && unit_exists("caddy").await) {
+        let (program, script, next_step) = match self.backend {
+            ProxyBackend::Caddy => ("caddy", CADDY_INSTALL_SCRIPT, "Install Caddy yourself (caddyserver.com/docs/install), then deploy again."),
+            ProxyBackend::Nginx => ("nginx", NGINX_INSTALL_SCRIPT, "Install nginx and certbot yourself (`apt install nginx certbot`), then deploy again."),
+            ProxyBackend::Apache => ("apache2", APACHE_INSTALL_SCRIPT, "Install Apache and certbot yourself (`apt install apache2 certbot`), then deploy again."),
+            ProxyBackend::Traefik => ("traefik", TRAEFIK_INSTALL_SCRIPT, "Install Traefik yourself (doc.traefik.io/traefik/getting-started/install-traefik), with a systemd unit called traefik, then deploy again."),
+            ProxyBackend::None => return Ok(false),
+        };
+        let unit = self.unit().unwrap_or(program);
+        let label = self.backend.label();
+
+        // A binary without its systemd unit (copied in by hand, or left by
+        // another tool) can't be started or reloaded: install the package,
+        // which brings the unit.
+        if on_path(program) && unit_exists(unit).await {
+            if self.backend == ProxyBackend::Apache {
+                self.enable_apache_modules(cancel, progress).await?;
+            }
             return Ok(false);
         }
 
         progress
-            .line(if on_path("caddy") {
-                "Caddy is here but has no systemd service: installing its package for automatic HTTPS".to_string()
-            } else {
+            .line(if on_path(program) {
+                format!("{label} is here but has no systemd service: installing its package")
+            } else if self.backend == ProxyBackend::Caddy {
                 "Caddy is not installed: installing it for automatic HTTPS".to_string()
+            } else {
+                format!("{label} is not installed: installing it")
             })
             .await;
 
         let outcome = run_child(
             "sh",
-            &["-c", CADDY_INSTALL_SCRIPT],
+            &["-c", script],
             None,
             &[],
             Duration::from_secs(600),
@@ -269,21 +791,59 @@ impl Proxy {
         .await;
 
         if !outcome.success() {
-            return Err(Failure::new("proxy", "could not install Caddy")
+            return Err(Failure::new("proxy", format!("could not install {label}"))
                 .with_output(outcome.tail().to_vec())
-                .with_next_step(
-                    "Install Caddy yourself (caddyserver.com/docs/install), then deploy again.",
-                ));
+                .with_next_step(next_step));
         }
 
-        std::fs::write(&self.main_config, fresh_caddyfile()).map_err(|e| {
-            Failure::new(
-                "proxy",
-                format!("could not write {}: {e}", self.main_config.display()),
-            )
-        })?;
+        let fresh = match self.backend {
+            ProxyBackend::Caddy => Some(fresh_caddyfile()),
+            ProxyBackend::Traefik if !self.main_config.exists() => Some(fresh_traefik_config()),
+            _ => None,
+        };
+        if let Some(fresh) = fresh {
+            std::fs::write(&self.main_config, fresh).map_err(|e| {
+                Failure::new(
+                    "proxy",
+                    format!("could not write {}: {e}", self.main_config.display()),
+                )
+            })?;
+        }
 
         Ok(true)
+    }
+
+    async fn enable_apache_modules(
+        &self,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<(), Failure> {
+        let mut args = vec!["-q"];
+        args.extend(APACHE_MODULES);
+        let outcome = run_child(
+            "a2enmod",
+            &args,
+            None,
+            &[],
+            Duration::from_secs(60),
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+        if outcome.success() {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                "proxy",
+                "could not turn on the Apache modules a reverse proxy needs",
+            )
+            .with_output(outcome.tail().to_vec())
+            .with_next_step(format!(
+                "Run `a2enmod {}` on the machine, then deploy again.",
+                APACHE_MODULES.join(" ")
+            )))
+        }
     }
 
     pub fn ensure_import(&self) -> Result<bool, Failure> {
@@ -298,9 +858,41 @@ impl Proxy {
             )
         })?;
 
+        if self.backend == ProxyBackend::Nginx {
+            let shared = self.include_dir.join(NGINX_SHARED_FILE);
+            if std::fs::read_to_string(&shared).ok().as_deref() != Some(NGINX_SHARED) {
+                std::fs::write(&shared, NGINX_SHARED).map_err(|e| {
+                    Failure::new(
+                        "proxy",
+                        format!("could not write {}: {e}", shared.display()),
+                    )
+                })?;
+            }
+        }
+        if self.uses_certbot() {
+            let _ = std::fs::create_dir_all(ACME_WEBROOT);
+        }
+
+        if self.backend == ProxyBackend::Traefik {
+            return self.ensure_traefik_provider();
+        }
+
         let existing = std::fs::read_to_string(&self.main_config).unwrap_or_default();
         let updated = match self.backend {
-            ProxyBackend::Nginx => add_nginx_include(&existing),
+            ProxyBackend::Nginx => {
+                if existing.lines().any(|l| l.trim() == NGINX_INCLUDE_LINE) {
+                    None
+                } else {
+                    Some(add_nginx_include(&existing).ok_or_else(|| {
+                        Failure::new(
+                            "proxy",
+                            format!("couldn't find the http block in {}", self.main_config.display()),
+                        )
+                        .with_next_step(format!("Add `{NGINX_INCLUDE_LINE}` inside the http block yourself, then deploy again."))
+                    })?)
+                }
+            }
+            ProxyBackend::Apache => add_apache_include(&existing),
             _ => add_caddy_import(&existing),
         };
 
@@ -318,6 +910,42 @@ impl Proxy {
         Ok(true)
     }
 
+    /// Traefik reads our sites through a file provider on serveros.d. A
+    /// Traefik ServerOS installed has that from the start; one set up by
+    /// hand has to have it added, since Traefik allows only one file
+    /// provider and its config isn't ours to rewrite.
+    fn ensure_traefik_provider(&self) -> Result<bool, Failure> {
+        let dir = self.include_dir.to_string_lossy();
+        let others: Vec<PathBuf> = TRAEFIK_OTHER_CONFIGS
+            .iter()
+            .map(PathBuf::from)
+            .filter(|p| p.exists() && self.main_config == Path::new(TRAEFIK_CONF))
+            .collect();
+        for config in std::iter::once(&self.main_config).chain(others.iter()) {
+            let Ok(text) = std::fs::read_to_string(config) else {
+                continue;
+            };
+            if text.contains(dir.as_ref()) {
+                return Ok(false);
+            }
+            return Err(Failure::new(
+                "proxy",
+                format!("Traefik's config ({}) doesn't read ServerOS's sites", config.display()),
+            )
+            .with_next_step(format!(
+                "Point its file provider at {dir} (with watch on) and add a Let's Encrypt certificate resolver called {TRAEFIK_RESOLVER} on the web entry point, then deploy again. Or remove the config so ServerOS can write its own."
+            )));
+        }
+
+        std::fs::write(&self.main_config, fresh_traefik_config()).map_err(|e| {
+            Failure::new(
+                "proxy",
+                format!("could not write {}: {e}", self.main_config.display()),
+            )
+        })?;
+        Ok(true)
+    }
+
     pub async fn publish(
         &self,
         service: &str,
@@ -326,14 +954,18 @@ impl Proxy {
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<PathBuf, Failure> {
+        if self.backend == ProxyBackend::None {
+            return Err(Self::none_configured());
+        }
         let plain_http = self.plain_http();
-        let rendered = match self.backend {
-            ProxyBackend::Caddy => render(domains, upstream_port, plain_http)?,
-            ProxyBackend::Nginx => render_nginx(domains, upstream_port)?,
-            ProxyBackend::None => return Err(Self::none_configured()),
+        let stem = crate::git::sanitise(service);
+        let site = Site {
+            domains: domains.to_vec(),
+            port: upstream_port,
         };
-        let site = self.site_file(service);
-        let previous = std::fs::read(&site).ok();
+        let rendered = self.render_site(&stem, &site, plain_http)?;
+        let path = self.site_file(service);
+        let previous = std::fs::read(&path).ok();
 
         // Wildcards need Caddy told where to ask before it issues a
         // certificate, in the Caddyfile's global options.
@@ -363,18 +995,29 @@ impl Proxy {
                     .await;
             }
         }
+        if self.backend != ProxyBackend::Caddy
+            && !plain_http
+            && domains.iter().any(|d| is_wildcard(d))
+        {
+            progress
+                .line(format!(
+                    "Wildcard subdomains are served over plain HTTP with {}: a certificate for every subdomain needs Caddy",
+                    self.backend.label()
+                ))
+                .await;
+        }
 
-        std::fs::write(&site, &rendered).map_err(|e| {
-            Failure::new("proxy", format!("could not write {}: {e}", site.display()))
+        std::fs::write(&path, &rendered).map_err(|e| {
+            Failure::new("proxy", format!("could not write {}: {e}", path.display()))
         })?;
 
         if let Err(failure) = self.validate(cancel, progress).await {
             match previous {
                 Some(bytes) => {
-                    let _ = std::fs::write(&site, bytes);
+                    let _ = std::fs::write(&path, bytes);
                 }
                 None => {
-                    let _ = std::fs::remove_file(&site);
+                    let _ = std::fs::remove_file(&path);
                 }
             }
             if let Some(main) = previous_main {
@@ -385,7 +1028,178 @@ impl Proxy {
 
         self.reload(cancel, progress).await?;
 
-        Ok(site)
+        if self.uses_certbot() && !plain_http {
+            self.certify(&stem, &site, &path, cancel, progress).await;
+        }
+
+        Ok(path)
+    }
+
+    /// Gets (or renews early, or widens) the certificate for an nginx or
+    /// Apache site's plain names, then switches the site to HTTPS. Never
+    /// fails the deploy: until the domain points here the site stays on
+    /// plain HTTP, and the daemon tries again every so often.
+    async fn certify(
+        &self,
+        stem: &str,
+        site: &Site,
+        path: &Path,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) {
+        let (_, plain) = split_wildcards(&site.domains);
+        if plain.is_empty() {
+            return;
+        }
+        let label = self.backend.label();
+
+        if !on_path("certbot") {
+            progress
+                .line("certbot is not installed: installing it for HTTPS".to_string())
+                .await;
+            let outcome = run_child(
+                "sh",
+                &["-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -q && apt-get install -y -q certbot"],
+                None,
+                &[],
+                Duration::from_secs(600),
+                cancel,
+                progress,
+                None,
+            )
+            .await;
+            if !outcome.success() {
+                progress
+                    .line(format!("Couldn't install certbot, so {} is on plain HTTP. Install it (`apt install certbot`) and deploy again for HTTPS.", plain.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")))
+                    .await;
+                return;
+            }
+        }
+
+        let args = self.certbot_args(stem, &plain);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let outcome = run_child(
+            "certbot",
+            &args,
+            None,
+            &[],
+            Duration::from_secs(180),
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+        if !outcome.success() {
+            progress
+                .line(format!(
+                    "{label} couldn't get a certificate for {} yet, usually because the domain doesn't point at this machine. It's on plain HTTP for now, and ServerOS tries again every 15 minutes.",
+                    plain.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
+                ))
+                .await;
+            return;
+        }
+
+        match self.switch_site_to_https(stem, site, path).await {
+            Ok(true) => {
+                progress
+                    .line(format!(
+                        "HTTPS is on for {}",
+                        plain
+                            .iter()
+                            .map(|d| d.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .await;
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                progress
+                    .line(format!("Got a certificate, but {label} wouldn't take the HTTPS config ({reason}), so the site stays on plain HTTP"))
+                    .await;
+            }
+        }
+    }
+
+    fn certbot_args(&self, stem: &str, names: &[&String]) -> Vec<String> {
+        let reload = format!("systemctl reload {}", self.unit().unwrap_or_default());
+        let mut args: Vec<String> = ["certonly", "--webroot", "-w", ACME_WEBROOT, "--cert-name"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        args.push(format!("serveros-{stem}"));
+        for name in names {
+            args.push("-d".into());
+            args.push(name.to_string());
+        }
+        args.extend(
+            [
+                "--non-interactive",
+                "--agree-tos",
+                "--register-unsafely-without-email",
+                "--keep-until-expiring",
+                "--expand",
+                "--deploy-hook",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        args.push(reload);
+        args
+    }
+
+    /// Rewrites a site now that its certificate exists, keeping the old
+    /// file if the proxy won't load the new one. False when nothing
+    /// changed.
+    async fn switch_site_to_https(
+        &self,
+        stem: &str,
+        site: &Site,
+        path: &Path,
+    ) -> Result<bool, String> {
+        let before = std::fs::read_to_string(path).unwrap_or_default();
+        let after = self
+            .render_site(stem, site, false)
+            .map_err(|f| f.to_string())?;
+        if after == before {
+            return Ok(false);
+        }
+        std::fs::write(path, &after).map_err(|e| e.to_string())?;
+        if !quiet(self.validate_command()).await || !quiet(self.reload_command()).await {
+            let _ = std::fs::write(path, &before);
+            let _ = quiet(self.reload_command()).await;
+            return Err("the config didn't validate".into());
+        }
+        Ok(true)
+    }
+
+    /// Tries again for nginx and Apache sites still without a certificate,
+    /// usually because the domain wasn't pointing here at deploy. Returns
+    /// how many sites went over to HTTPS.
+    pub async fn retry_certificates(&self) -> usize {
+        if !self.uses_certbot() || self.plain_http() || !on_path("certbot") {
+            return 0;
+        }
+        let mut done = 0;
+        for (stem, site) in self.our_sites() {
+            let (_, plain) = split_wildcards(&site.domains);
+            if plain.is_empty() || self.has_cert(&stem) {
+                continue;
+            }
+            let args = self.certbot_args(&stem, &plain);
+            let mut command = tokio::process::Command::new("certbot");
+            command.args(&args);
+            if !quiet((command, Duration::from_secs(180))).await {
+                continue;
+            }
+            let path = self
+                .include_dir
+                .join(format!("{stem}.{}", self.extension()));
+            if let Ok(true) = self.switch_site_to_https(&stem, &site, &path).await {
+                done += 1;
+            }
+        }
+        done
     }
 
     /// Whether sites are served over plain HTTP, for a tunnel in front.
@@ -394,10 +1208,9 @@ impl Proxy {
     }
 
     /// Switches every site to plain HTTP (a tunnel in front does HTTPS) or
-    /// back to Caddy's own HTTPS, rewriting the site files ServerOS wrote and
-    /// reloading the proxy. If the new config doesn't validate, the files
-    /// and the mode are put back as they were. Nginx sites are plain HTTP
-    /// already, so only the mode is kept there.
+    /// back to the proxy's own HTTPS, rewriting the site files ServerOS
+    /// wrote and reloading the proxy. If the new config doesn't validate,
+    /// the files and the mode are put back as they were.
     pub async fn set_plain_http(
         &self,
         on: bool,
@@ -430,11 +1243,7 @@ impl Proxy {
             }
         };
 
-        let rewrites = if self.backend == ProxyBackend::Caddy {
-            self.rerendered(on)
-        } else {
-            Vec::new()
-        };
+        let rewrites = self.rerendered(on);
 
         set_marker(on).map_err(|e| {
             Failure::new(
@@ -484,25 +1293,127 @@ impl Proxy {
     /// Every site file ServerOS wrote, as it reads now and as it would in
     /// the given mode, for the ones that would change.
     fn rerendered(&self, plain_http: bool) -> Vec<(PathBuf, String, String)> {
-        let Ok(entries) = std::fs::read_dir(&self.include_dir) else {
-            return Vec::new();
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "caddy"))
-            .collect();
-        paths.sort();
-
-        paths
+        self.our_sites()
             .into_iter()
-            .filter_map(|path| {
+            .filter_map(|(stem, site)| {
+                let path = self
+                    .include_dir
+                    .join(format!("{stem}.{}", self.extension()));
                 let before = std::fs::read_to_string(&path).ok()?;
-                let (domains, port) = parse_site(&before)?;
-                let after = render(&domains, port, plain_http).ok()?;
+                let after = self.render_site(&stem, &site, plain_http).ok()?;
                 (after != before).then_some((path, before, after))
             })
             .collect()
+    }
+
+    /// Moves every site ServerOS serves on this machine to another proxy:
+    /// stops this one (only one can have ports 80 and 443), installs the
+    /// other if it needs to, writes each site for it and starts it. If
+    /// anything fails on the way, this proxy is put back as it was.
+    /// Returns the proxy now in use.
+    pub async fn switch_to(
+        &self,
+        to: ProxyBackend,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<Proxy, Failure> {
+        if to == self.backend {
+            return Ok(self.clone());
+        }
+        if to == ProxyBackend::None {
+            return Err(Self::none_configured());
+        }
+        let next = Proxy {
+            backend: to,
+            cert_root: self.cert_root.clone(),
+            ..Proxy::for_backend(to)
+        };
+        let sites = self.our_sites();
+        let from = self.backend.label();
+        let label = to.label();
+        progress
+            .line(format!(
+                "Moving {} site(s) from {from} to {label}",
+                sites.len()
+            ))
+            .await;
+
+        let old_running = match self.unit() {
+            Some(unit) => unit_active(unit).await,
+            None => false,
+        };
+        let next_running = match next.unit() {
+            Some(unit) => unit_active(unit).await,
+            None => false,
+        };
+        if old_running {
+            progress
+                .line(format!("Stopping {from} so {label} can have ports 80 and 443. Anything else {from} served goes offline with it."))
+                .await;
+            let _ = systemctl(&["stop", self.unit().unwrap_or_default()], cancel, progress).await;
+        }
+
+        let moved = async {
+            next.ensure_installed(cancel, progress).await?;
+            next.ensure_import()?;
+            if self.plain_http() {
+                std::fs::write(
+                    next.include_dir.join(PLAIN_HTTP_MARKER),
+                    "Written by ServerOS: a tunnel in front of this machine does HTTPS, so sites here are plain HTTP.\n",
+                )
+                .map_err(|e| Failure::new("proxy", format!("could not mark {} as behind a tunnel: {e}", next.include_dir.display())))?;
+            }
+            for (stem, site) in &sites {
+                next.publish(stem, &site.domains, site.port, cancel, progress).await?;
+            }
+            if sites.is_empty() {
+                next.validate(cancel, progress).await?;
+                next.reload(cancel, progress).await?;
+            }
+            Ok::<(), Failure>(())
+        }
+        .await;
+
+        if let Err(failure) = moved {
+            progress.line(format!("Putting {from} back")).await;
+            for (stem, _) in &sites {
+                let _ = std::fs::remove_file(next.site_file(stem));
+            }
+            if !next_running {
+                if let Some(unit) = next.unit() {
+                    let _ = systemctl(&["stop", unit], cancel, progress).await;
+                }
+            }
+            if old_running {
+                let _ = systemctl(
+                    &["start", self.unit().unwrap_or_default()],
+                    cancel,
+                    progress,
+                )
+                .await;
+            }
+            return Err(failure.with_next_step(format!(
+                "{from} is still serving this machine's sites. Fix what stopped {label}, then deploy with it again."
+            )));
+        }
+
+        for (stem, _) in &sites {
+            let _ = std::fs::remove_file(
+                self.include_dir
+                    .join(format!("{stem}.{}", self.extension())),
+            );
+        }
+        let _ = std::fs::remove_file(self.include_dir.join(PLAIN_HTTP_MARKER));
+        if let Some(unit) = self.unit() {
+            if unit_exists(unit).await {
+                let _ = systemctl(&["disable", unit], cancel, progress).await;
+            }
+        }
+        progress
+            .line(format!("{label} now serves this machine's sites"))
+            .await;
+
+        Ok(next)
     }
 
     pub async fn unpublish(
@@ -526,6 +1437,54 @@ impl Proxy {
         Ok(())
     }
 
+    fn validate_command(&self) -> (tokio::process::Command, Duration) {
+        let main = self.main_config.to_string_lossy().into_owned();
+        let mut command = match self.backend {
+            ProxyBackend::Nginx => {
+                let mut c = tokio::process::Command::new("nginx");
+                c.args(["-t", "-c", &main]);
+                c
+            }
+            ProxyBackend::Apache => {
+                let mut c = tokio::process::Command::new("apache2ctl");
+                c.arg("configtest");
+                c
+            }
+            ProxyBackend::Traefik => tokio::process::Command::new("true"),
+            _ => {
+                let mut c = tokio::process::Command::new("caddy");
+                c.args(["validate", "--config", &main, "--adapter", "caddyfile"]);
+                c
+            }
+        };
+        command.kill_on_drop(true);
+        (command, Duration::from_secs(30))
+    }
+
+    fn reload_command(&self) -> (tokio::process::Command, Duration) {
+        let main = self.main_config.to_string_lossy().into_owned();
+        let mut command = match self.backend {
+            ProxyBackend::Nginx => {
+                let mut c = tokio::process::Command::new("nginx");
+                c.args(["-s", "reload", "-c", &main]);
+                c
+            }
+            ProxyBackend::Apache => {
+                let mut c = tokio::process::Command::new("systemctl");
+                c.args(["reload", "apache2"]);
+                c
+            }
+            ProxyBackend::Traefik => tokio::process::Command::new("true"),
+            _ => {
+                let mut c = tokio::process::Command::new("caddy");
+                c.args(["reload", "--config", &main, "--adapter", "caddyfile"]);
+                c
+            }
+        };
+        command.kill_on_drop(true);
+        (command, Duration::from_secs(60))
+    }
+
     async fn validate(
         &self,
         cancel: &mut watch::Receiver<bool>,
@@ -534,7 +1493,11 @@ impl Proxy {
         let main = self.main_config.to_string_lossy().into_owned();
         let (program, args): (&str, Vec<&str>) = match self.backend {
             ProxyBackend::Nginx => ("nginx", vec!["-t", "-c", &main]),
-            _ => (
+            ProxyBackend::Apache => ("apache2ctl", vec!["configtest"]),
+            // Traefik has no way to check a config without running it; it
+            // logs a bad file and keeps serving the rest.
+            ProxyBackend::Traefik | ProxyBackend::None => return Ok(()),
+            ProxyBackend::Caddy => (
                 "caddy",
                 vec!["validate", "--config", &main, "--adapter", "caddyfile"],
             ),
@@ -568,13 +1531,17 @@ impl Proxy {
         cancel: &mut watch::Receiver<bool>,
         progress: &Progress,
     ) -> Result<(), Failure> {
+        let Some(unit) = self.unit() else {
+            return Ok(());
+        };
         let main = self.main_config.to_string_lossy().into_owned();
-        let (program, args, unit): (&str, Vec<&str>, &str) = match self.backend {
-            ProxyBackend::Nginx => ("nginx", vec!["-s", "reload", "-c", &main], "nginx"),
+        let (program, args): (&str, Vec<&str>) = match self.backend {
+            ProxyBackend::Nginx => ("nginx", vec!["-s", "reload", "-c", &main]),
+            ProxyBackend::Apache => ("systemctl", vec!["reload", "apache2"]),
+            ProxyBackend::Traefik => ("systemctl", vec!["is-active", "--quiet", "traefik"]),
             _ => (
                 "caddy",
                 vec!["reload", "--config", &main, "--adapter", "caddyfile"],
-                "caddy",
             ),
         };
 
@@ -584,18 +1551,8 @@ impl Proxy {
             progress
                 .line(format!("{unit} is not running: starting it"))
                 .await;
-            let started = run_child(
-                "systemctl",
-                &["enable", "--now", unit],
-                None,
-                &[],
-                Duration::from_secs(60),
-                cancel,
-                progress,
-                None,
-            )
-            .await;
-            if started.success() && unit_active(unit).await {
+            let started = systemctl(&["enable", "--now", unit], cancel, progress).await;
+            if started && unit_active(unit).await {
                 return Ok(());
             }
 
@@ -634,10 +1591,40 @@ impl Proxy {
         if outcome.success() {
             Ok(())
         } else {
-            Err(Failure::new("proxy", format!("{program} reload failed"))
-                .with_output(outcome.tail().to_vec())
-                .with_next_step(format!("Check `systemctl status {unit}` on the machine.")))
+            Err(
+                Failure::new("proxy", format!("{} reload failed", self.backend.label()))
+                    .with_output(outcome.tail().to_vec())
+                    .with_next_step(format!("Check `systemctl status {unit}` on the machine.")),
+            )
         }
+    }
+}
+
+async fn systemctl(args: &[&str], cancel: &mut watch::Receiver<bool>, progress: &Progress) -> bool {
+    run_child(
+        "systemctl",
+        args,
+        None,
+        &[],
+        Duration::from_secs(60),
+        cancel,
+        progress,
+        None,
+    )
+    .await
+    .success()
+}
+
+/// Runs a command with nothing watching it (a background retry), true
+/// when it finished in time and succeeded.
+async fn quiet((mut command, limit): (tokio::process::Command, Duration)) -> bool {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match tokio::time::timeout(limit, command.status()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => false,
     }
 }
 
@@ -783,6 +1770,22 @@ fn add_caddy_import(existing: &str) -> Option<String> {
     Some(updated)
 }
 
+fn add_apache_include(existing: &str) -> Option<String> {
+    if existing.lines().any(|l| l.trim() == APACHE_INCLUDE_LINE) {
+        return None;
+    }
+
+    let mut updated = existing.to_string();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("\n# Added by ServerOS: per-service sites live in serveros.d.\n");
+    updated.push_str(APACHE_INCLUDE_LINE);
+    updated.push('\n');
+
+    Some(updated)
+}
+
 fn add_nginx_include(existing: &str) -> Option<String> {
     if existing.lines().any(|l| l.trim() == NGINX_INCLUDE_LINE) {
         return None;
@@ -900,6 +1903,7 @@ mod tests {
             backend: ProxyBackend::Caddy,
             main_config: dir.join("Caddyfile"),
             include_dir: dir.clone(),
+            cert_root: dir.join("live"),
         };
 
         assert!(proxy.allows_on_demand("tenant-1.acme.io"));
@@ -965,6 +1969,7 @@ mod tests {
             backend: ProxyBackend::Caddy,
             main_config: dir.join("Caddyfile"),
             include_dir: dir.clone(),
+            cert_root: dir.join("live"),
         };
 
         assert!(!proxy.plain_http());
@@ -994,6 +1999,7 @@ mod tests {
             backend: ProxyBackend::Nginx,
             main_config: dir.join("nginx.conf"),
             include_dir: dir.clone(),
+            cert_root: dir.join("live"),
         };
         let (_tx, mut cancel) = watch::channel(false);
         let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
@@ -1025,11 +2031,11 @@ mod tests {
 
     #[test]
     fn nginx_sites_are_server_blocks() {
-        let block = render_nginx(&["shop.example".into()], 3000).unwrap();
+        let block = render_nginx(&["shop.example".into()], 3000, None, false).unwrap();
 
         assert!(block.contains("server_name shop.example;"));
         assert!(block.contains("proxy_pass http://127.0.0.1:3000;"));
-        assert!(render_nginx(&["a;b".into()], 3000).is_err());
+        assert!(render_nginx(&["a;b".into()], 3000, None, false).is_err());
     }
 
     #[test]
@@ -1069,5 +2075,381 @@ mod tests {
         assert!(updated.ends_with("}\n"));
         assert!(add_nginx_include(&updated).is_none());
         assert!(add_nginx_include("events {}\n").is_none());
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("serveros-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn proxy_in(backend: ProxyBackend, dir: &Path) -> Proxy {
+        Proxy {
+            backend,
+            main_config: dir.join("main.conf"),
+            include_dir: dir.join("serveros.d"),
+            cert_root: dir.join("live"),
+        }
+    }
+
+    #[test]
+    fn every_proxy_reads_its_own_sites_back() {
+        let domains: Vec<String> = vec!["acme.io".into(), "www.acme.io".into(), "*.acme.io".into()];
+        let tls = PathBuf::from("/etc/letsencrypt/live/serveros-shop");
+        let texts = [
+            (ProxyBackend::Caddy, render(&domains, 4123, false).unwrap()),
+            (ProxyBackend::Caddy, render(&domains, 4123, true).unwrap()),
+            (
+                ProxyBackend::Nginx,
+                render_nginx(&domains, 4123, None, false).unwrap(),
+            ),
+            (
+                ProxyBackend::Nginx,
+                render_nginx(&domains, 4123, Some(&tls), false).unwrap(),
+            ),
+            (
+                ProxyBackend::Nginx,
+                render_nginx(&domains, 4123, None, true).unwrap(),
+            ),
+            (
+                ProxyBackend::Apache,
+                render_apache("shop", &domains, 4123, Some(&tls), false).unwrap(),
+            ),
+            (
+                ProxyBackend::Apache,
+                render_apache("shop", &domains, 4123, None, true).unwrap(),
+            ),
+            (
+                ProxyBackend::Traefik,
+                render_traefik("shop", &domains, 4123, false).unwrap(),
+            ),
+            (
+                ProxyBackend::Traefik,
+                render_traefik("shop", &domains, 4123, true).unwrap(),
+            ),
+        ];
+        for (backend, text) in texts {
+            let site = read_site(backend, &text).unwrap_or_else(|| panic!("{text}"));
+            assert_eq!(
+                site,
+                Site {
+                    domains: domains.clone(),
+                    port: 4123
+                },
+                "{text}"
+            );
+        }
+
+        assert!(read_site(
+            ProxyBackend::Nginx,
+            "server {\n    server_name mine.io;\n}\n"
+        )
+        .is_none());
+        assert!(read_site(ProxyBackend::Nginx, NGINX_SHARED).is_none());
+    }
+
+    #[test]
+    fn nginx_sites_written_before_the_site_line_still_read_back() {
+        let old = "# Managed by ServerOS. Edits here are overwritten on the next deploy.\nserver {\n    listen 80;\n    listen [::]:80;\n    server_name shop.example www.shop.example;\n\n    location / {\n        proxy_pass http://127.0.0.1:3000;\n    }\n}\n";
+
+        assert_eq!(
+            read_site(ProxyBackend::Nginx, old),
+            Some(Site {
+                domains: vec!["shop.example".into(), "www.shop.example".into()],
+                port: 3000
+            })
+        );
+    }
+
+    #[test]
+    fn nginx_answers_the_challenge_and_redirects_once_it_has_a_certificate() {
+        let tls = PathBuf::from("/etc/letsencrypt/live/serveros-shop");
+        let before = render_nginx(&["shop.example".into()], 3000, None, false).unwrap();
+        let after = render_nginx(&["shop.example".into()], 3000, Some(&tls), false).unwrap();
+
+        assert!(before.contains("location ^~ /.well-known/acme-challenge/"));
+        assert!(before.contains("proxy_pass http://127.0.0.1:3000;"));
+        assert!(!before.contains("443"));
+        assert!(before.contains("$serveros_connection_upgrade"));
+
+        assert!(after.contains("location ^~ /.well-known/acme-challenge/"));
+        assert!(after.contains("return 301 https://$host$request_uri;"));
+        assert!(after.contains("listen 443 ssl;"));
+        assert!(
+            after.contains("ssl_certificate /etc/letsencrypt/live/serveros-shop/fullchain.pem;")
+        );
+        assert!(
+            after.contains("ssl_certificate_key /etc/letsencrypt/live/serveros-shop/privkey.pem;")
+        );
+        assert_eq!(after.matches("proxy_pass").count(), 1);
+    }
+
+    #[test]
+    fn wildcards_stay_plain_http_on_nginx_apache_and_traefik() {
+        let tls = PathBuf::from("/live/serveros-shop");
+        let domains: Vec<String> = vec!["acme.io".into(), "*.acme.io".into()];
+
+        let nginx = render_nginx(&domains, 3000, Some(&tls), false).unwrap();
+        let (secure, wild) = nginx.split_once("# Wildcard subdomains").unwrap();
+        assert!(secure.contains("server_name acme.io;"));
+        assert!(wild.contains("server_name *.acme.io;"));
+        assert!(!wild.contains("443"));
+        assert!(!wild.contains("return 301"));
+
+        let apache = render_apache("shop", &domains, 3000, Some(&tls), false).unwrap();
+        let (secure, wild) = apache.split_once("# Wildcard subdomains").unwrap();
+        assert!(secure.contains("ServerName acme.io\n"));
+        assert!(!secure.contains("ServerAlias *.acme.io"));
+        assert!(
+            wild.contains("ServerName shop-wildcard.serveros.invalid\n    ServerAlias *.acme.io\n")
+        );
+        assert!(!wild.contains("SSLEngine"));
+
+        let traefik = render_traefik("shop", &domains, 3000, false).unwrap();
+        assert!(traefik.contains("rule = 'Host(`acme.io`)'"));
+        assert!(traefik.contains("[http.routers.serveros-shop-wildcard]\n  rule = 'HostRegexp(`^[a-z0-9-]+\\.acme\\.io$`)'\n  entryPoints = [\"web\"]"));
+    }
+
+    #[test]
+    fn apache_redirects_to_https_and_proxies_websockets() {
+        let tls = PathBuf::from("/live/serveros-shop");
+        let site = render_apache(
+            "shop",
+            &["shop.example".into(), "www.shop.example".into()],
+            3000,
+            Some(&tls),
+            false,
+        )
+        .unwrap();
+
+        assert!(site.contains(
+            "<VirtualHost *:80>\n    ServerName shop.example\n    ServerAlias www.shop.example\n"
+        ));
+        assert!(site.contains("ProxyPass /.well-known/acme-challenge/ !"));
+        assert!(site.contains("RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=301,L]"));
+        assert!(site.contains("<VirtualHost *:443>"));
+        assert!(site.contains("SSLCertificateFile /live/serveros-shop/fullchain.pem"));
+        assert!(site.contains("ProxyPass / http://127.0.0.1:3000/ upgrade=websocket"));
+        assert!(site.contains("RequestHeader set X-Forwarded-Proto \"https\""));
+        assert!(render_apache("shop", &["a b".into()], 3000, None, false).is_err());
+    }
+
+    #[test]
+    fn traefik_sites_get_certificates_from_the_serveros_resolver() {
+        let site = render_traefik(
+            "shop",
+            &["shop.example".into(), "www.shop.example".into()],
+            3000,
+            false,
+        )
+        .unwrap();
+
+        assert!(site.contains("rule = 'Host(`shop.example`) || Host(`www.shop.example`)'"));
+        assert!(site.contains("[http.routers.serveros-shop.tls]\n    certResolver = \"serveros\""));
+        assert!(site.contains("[http.middlewares.serveros-shop-https.redirectScheme]"));
+        assert!(site.contains("url = \"http://127.0.0.1:3000\""));
+
+        let tunnel = render_traefik("shop", &["shop.example".into()], 3000, true).unwrap();
+        assert!(!tunnel.contains("certResolver"));
+        assert!(tunnel.contains("X-Forwarded-Proto = \"https\""));
+        assert!(fresh_traefik_config().contains(&format!("directory = \"{TRAEFIK_INCLUDE_DIR}\"")));
+        assert!(
+            fresh_traefik_config().contains("[certificatesResolvers.serveros.acme.httpChallenge]")
+        );
+    }
+
+    #[test]
+    fn certbot_asks_for_the_plain_names_and_reloads_the_proxy_on_renewal() {
+        let dir = temp_dir("certbot-args");
+        let nginx = proxy_in(ProxyBackend::Nginx, &dir);
+        let names: Vec<String> = vec!["acme.io".into(), "www.acme.io".into()];
+        let refs: Vec<&String> = names.iter().collect();
+
+        let args = nginx.certbot_args("shop", &refs).join(" ");
+        assert!(args.starts_with("certonly --webroot -w /var/lib/serveros/acme --cert-name serveros-shop -d acme.io -d www.acme.io"));
+        assert!(args.contains("--non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring --expand"));
+        assert!(args.ends_with("--deploy-hook systemctl reload nginx"));
+
+        let apache = proxy_in(ProxyBackend::Apache, &dir);
+        assert!(apache
+            .certbot_args("shop", &refs)
+            .join(" ")
+            .ends_with("systemctl reload apache2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn our_sites_are_only_the_ones_we_wrote_in_this_proxys_format() {
+        let dir = temp_dir("our-sites");
+        let nginx = proxy_in(ProxyBackend::Nginx, &dir);
+        nginx.ensure_import().unwrap_err();
+        std::fs::create_dir_all(&nginx.include_dir).unwrap();
+        std::fs::write(
+            nginx.include_dir.join("shop.conf"),
+            render_nginx(&["acme.io".into()], 3000, None, false).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            nginx.include_dir.join("mine.conf"),
+            "server { server_name mine.io; }\n",
+        )
+        .unwrap();
+        std::fs::write(nginx.include_dir.join(NGINX_SHARED_FILE), NGINX_SHARED).unwrap();
+        std::fs::write(
+            nginx.include_dir.join("old.caddy"),
+            render(&["old.io".into()], 1, false).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            nginx.our_sites(),
+            vec![(
+                "shop".to_string(),
+                Site {
+                    domains: vec!["acme.io".into()],
+                    port: 3000
+                }
+            )]
+        );
+
+        std::fs::create_dir_all(nginx.cert_dir("shop")).unwrap();
+        std::fs::write(nginx.cert_dir("shop").join("fullchain.pem"), "").unwrap();
+        let rewrites = nginx.rerendered(false);
+        assert_eq!(rewrites.len(), 1);
+        assert!(rewrites[0].2.contains("listen 443 ssl;"));
+        assert!(nginx.rerendered(true)[0]
+            .2
+            .contains("X-Forwarded-Proto https;"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nginx_gets_its_shared_settings_and_include_once() {
+        let dir = temp_dir("nginx-import");
+        let nginx = proxy_in(ProxyBackend::Nginx, &dir);
+        std::fs::write(
+            &nginx.main_config,
+            "events {\n}\n\nhttp {\n    sendfile on;\n}\n",
+        )
+        .unwrap();
+
+        assert!(nginx.ensure_import().unwrap());
+        assert!(!nginx.ensure_import().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(nginx.include_dir.join(NGINX_SHARED_FILE)).unwrap(),
+            NGINX_SHARED
+        );
+        assert_eq!(
+            std::fs::read_to_string(&nginx.main_config)
+                .unwrap()
+                .matches(NGINX_INCLUDE_LINE)
+                .count(),
+            1
+        );
+
+        std::fs::write(&nginx.main_config, "events {}\n").unwrap();
+        assert!(nginx.ensure_import().is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apache_reads_our_sites_through_one_include() {
+        let first = add_apache_include(
+            "ServerRoot \"/etc/apache2\"\nIncludeOptional sites-enabled/*.conf\n",
+        )
+        .unwrap();
+
+        assert!(first.ends_with(&format!("{APACHE_INCLUDE_LINE}\n")));
+        assert!(first.contains("IncludeOptional sites-enabled/*.conf"));
+        assert!(add_apache_include(&first).is_none());
+    }
+
+    #[test]
+    fn traefik_config_is_written_once_and_someone_elses_is_left_alone() {
+        let dir = temp_dir("traefik-import");
+        let ours = Proxy {
+            main_config: dir.join("traefik.toml"),
+            include_dir: PathBuf::from(TRAEFIK_INCLUDE_DIR),
+            ..proxy_in(ProxyBackend::Traefik, &dir)
+        };
+        let config = ours.main_config.clone();
+
+        assert!(ours.ensure_traefik_provider().unwrap());
+        assert!(!ours.ensure_traefik_provider().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            fresh_traefik_config()
+        );
+
+        std::fs::write(&config, "[providers.docker]\n").unwrap();
+        let refused = ours.ensure_traefik_provider().unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("doesn't read ServerOS's sites"),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "[providers.docker]\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_proxy_has_its_own_files_and_service() {
+        for (backend, file, unit) in [
+            (
+                ProxyBackend::Caddy,
+                "/etc/caddy/serveros.d/shop.caddy",
+                "caddy",
+            ),
+            (
+                ProxyBackend::Nginx,
+                "/etc/nginx/serveros.d/shop.conf",
+                "nginx",
+            ),
+            (
+                ProxyBackend::Apache,
+                "/etc/apache2/serveros.d/shop.conf",
+                "apache2",
+            ),
+            (
+                ProxyBackend::Traefik,
+                "/etc/traefik/serveros.d/shop.toml",
+                "traefik",
+            ),
+        ] {
+            let proxy = Proxy::for_backend(backend);
+            assert_eq!(proxy.site_file("shop"), PathBuf::from(file));
+            assert_eq!(proxy.unit(), Some(unit));
+        }
+        assert_eq!(Proxy::for_backend(ProxyBackend::None).unit(), None);
+        assert!(Proxy::for_backend(ProxyBackend::Traefik)
+            .include_line()
+            .is_none());
+    }
+
+    #[test]
+    fn installing_each_proxy_opens_the_ports_its_certificates_need() {
+        for script in [
+            NGINX_INSTALL_SCRIPT,
+            APACHE_INSTALL_SCRIPT,
+            TRAEFIK_INSTALL_SCRIPT,
+        ] {
+            assert!(script.contains("ufw allow 80/tcp"));
+            assert!(script.contains("ufw allow 443/tcp"));
+        }
+        assert!(NGINX_INSTALL_SCRIPT.contains("apt-get install -y -q nginx certbot"));
+        assert!(APACHE_INSTALL_SCRIPT
+            .contains("a2enmod -q proxy proxy_http proxy_wstunnel headers rewrite ssl"));
+        assert!(TRAEFIK_INSTALL_SCRIPT.contains("sha256sum -c -"));
+        assert!(TRAEFIK_INSTALL_SCRIPT.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+        assert!(TRAEFIK_INSTALL_SCRIPT.contains("--configFile=/etc/traefik/traefik.toml"));
     }
 }

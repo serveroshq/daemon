@@ -163,7 +163,48 @@ pub enum ProxyBackend {
     #[default]
     Caddy,
     Nginx,
+    Apache,
+    Traefik,
     None,
+}
+
+impl ProxyBackend {
+    /// The proxies the panel can pick for a machine.
+    pub const CHOOSABLE: [ProxyBackend; 4] =
+        [Self::Caddy, Self::Nginx, Self::Apache, Self::Traefik];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Caddy => "caddy",
+            Self::Nginx => "nginx",
+            Self::Apache => "apache",
+            Self::Traefik => "traefik",
+            Self::None => "none",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::Caddy,
+            Self::Nginx,
+            Self::Apache,
+            Self::Traefik,
+            Self::None,
+        ]
+        .into_iter()
+        .find(|b| b.name() == name)
+    }
+
+    /// How people write it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Caddy => "Caddy",
+            Self::Nginx => "nginx",
+            Self::Apache => "Apache",
+            Self::Traefik => "Traefik",
+            Self::None => "no proxy",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -532,5 +573,27 @@ mod tests {
 
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn every_proxy_round_trips_by_name() {
+        for backend in [
+            ProxyBackend::Caddy,
+            ProxyBackend::Nginx,
+            ProxyBackend::Apache,
+            ProxyBackend::Traefik,
+            ProxyBackend::None,
+        ] {
+            assert_eq!(ProxyBackend::from_name(backend.name()), Some(backend));
+            let mut config = Config::new("api.serveros.com", "mch_1");
+            config.integrations.proxy = backend;
+            let text = toml::to_string(&config).unwrap();
+            assert!(
+                text.contains(&format!("proxy = \"{}\"", backend.name())),
+                "{text}"
+            );
+        }
+        assert_eq!(ProxyBackend::from_name("lighttpd"), None);
+        assert!(!ProxyBackend::CHOOSABLE.contains(&ProxyBackend::None));
     }
 }
