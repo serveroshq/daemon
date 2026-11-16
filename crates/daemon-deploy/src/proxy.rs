@@ -84,6 +84,10 @@ pub const LETSENCRYPT_LIVE: &str = "/etc/letsencrypt/live";
 /// (to move it to another proxy, or switch it to plain HTTP).
 const SITE_META: &str = "# ServerOS site:";
 
+/// How long a proxy has to stay up after a switch before the old one is
+/// let go.
+const SETTLE: Duration = Duration::from_secs(4);
+
 const NGINX_INSTALL_SCRIPT: &str = r#"set -eu
 export DEBIAN_FRONTEND=noninteractive
 if ! command -v apt-get >/dev/null 2>&1; then
@@ -1370,7 +1374,7 @@ impl Proxy {
                 next.validate(cancel, progress).await?;
                 next.reload(cancel, progress).await?;
             }
-            Ok::<(), Failure>(())
+            next.settled(cancel, progress).await
         }
         .await;
 
@@ -1381,7 +1385,7 @@ impl Proxy {
             }
             if !next_running {
                 if let Some(unit) = next.unit() {
-                    let _ = systemctl(&["stop", unit], cancel, progress).await;
+                    let _ = systemctl(&["disable", "--now", unit], cancel, progress).await;
                 }
             }
             if old_running {
@@ -1414,6 +1418,55 @@ impl Proxy {
             .await;
 
         Ok(next)
+    }
+
+    /// A proxy can start and then fall over a moment later: another
+    /// program has port 443, or a site file it only reads once running is
+    /// wrong. Before the old proxy is let go, wait a few seconds and check
+    /// this one is still running and answering on port 80.
+    async fn settled(
+        &self,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<(), Failure> {
+        let Some(unit) = self.unit() else {
+            return Ok(());
+        };
+        tokio::time::sleep(SETTLE).await;
+        let running = unit_active(unit).await;
+        let answering = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::TcpStream::connect("127.0.0.1:80"),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok());
+        if running && answering {
+            return Ok(());
+        }
+
+        let journal = run_child(
+            "journalctl",
+            &["-u", unit, "-n", "20", "--no-pager"],
+            None,
+            &[],
+            Duration::from_secs(15),
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+        Err(Failure::new(
+            "proxy",
+            if running {
+                format!("{} started but isn't answering on port 80", self.backend.label())
+            } else {
+                format!("{} started but stopped again", self.backend.label())
+            },
+        )
+        .with_output(journal.tail().to_vec())
+        .with_next_step(format!(
+            "Something else may be using port 80 or 443 (`ss -ltnp` shows what), or its config has an error. `journalctl -u {unit}` says which."
+        )))
     }
 
     pub async fn unpublish(
