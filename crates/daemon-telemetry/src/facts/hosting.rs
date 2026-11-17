@@ -1,13 +1,15 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use daemon_protocol::HostingFacts;
 use serde_json::Value;
 
 const METADATA: &str = "169.254.169.254:80";
 const TIMEOUT: Duration = Duration::from_millis(150);
-const MAX_RESPONSE: u64 = 16 * 1024;
+const MAX_RESPONSE: usize = 16 * 1024;
+/// However slowly a reply trickles in, one request never takes longer than this.
+const DEADLINE: Duration = Duration::from_secs(1);
 
 pub(super) fn detect() -> HostingFacts {
     if std::path::Path::new("/.dockerenv").exists()
@@ -174,7 +176,15 @@ fn safe_component(value: &str) -> Option<String> {
 }
 
 fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Option<String> {
-    let address: SocketAddr = METADATA.parse().ok()?;
+    request_to(METADATA.parse().ok()?, method, path, headers)
+}
+
+fn request_to(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> Option<String> {
     let mut stream = TcpStream::connect_timeout(&address, TIMEOUT).ok()?;
     stream.set_read_timeout(Some(TIMEOUT)).ok()?;
     stream.set_write_timeout(Some(TIMEOUT)).ok()?;
@@ -186,25 +196,89 @@ fn request(method: &str, path: &str, headers: &[(&str, &str)]) -> Option<String>
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).ok()?;
+    parse_response(&read_response(&mut stream)?)
+}
+
+/// Reads one HTTP response, stopping as soon as it's complete. Some metadata
+/// services (Hetzner's) send the whole reply but keep the connection open
+/// despite `Connection: close`, so waiting for the server to hang up would
+/// only ever end in a read timeout and lose the answer.
+fn read_response(stream: &mut impl Read) -> Option<Vec<u8>> {
+    let started = Instant::now();
     let mut bytes = Vec::new();
-    stream.take(MAX_RESPONSE + 1).read_to_end(&mut bytes).ok()?;
-    if bytes.len() as u64 > MAX_RESPONSE {
+    let mut buffer = [0u8; 2048];
+    loop {
+        if response_complete(&bytes) {
+            return Some(bytes);
+        }
+        if bytes.len() > MAX_RESPONSE || started.elapsed() > DEADLINE {
+            return None;
+        }
+        match stream.read(&mut buffer) {
+            Ok(0) => return Some(bytes),
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Whether a response has all arrived, going by its Content-Length or its
+/// last chunk. A response with neither ends when the server closes.
+fn response_complete(bytes: &[u8]) -> bool {
+    let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&bytes[..end]);
+    let body = &bytes[end + 4..];
+    match body_framing(&head) {
+        Framing::Length(length) => body.len() >= length,
+        Framing::Chunked => std::str::from_utf8(body)
+            .ok()
+            .and_then(decode_chunked)
+            .is_some(),
+        Framing::UntilClose => false,
+    }
+}
+
+enum Framing {
+    Length(usize),
+    Chunked,
+    UntilClose,
+}
+
+fn body_framing(head: &str) -> Framing {
+    let mut length = None;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim().to_ascii_lowercase(), value.trim());
+        if name == "transfer-encoding" && value.to_ascii_lowercase().contains("chunked") {
+            return Framing::Chunked;
+        }
+        if name == "content-length" {
+            length = value.parse().ok();
+        }
+    }
+    length.map_or(Framing::UntilClose, Framing::Length)
+}
+
+fn parse_response(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_RESPONSE {
         return None;
     }
-    let response = String::from_utf8(bytes).ok()?;
+    let response = std::str::from_utf8(bytes).ok()?;
     let (head, body) = response.split_once("\r\n\r\n")?;
-    if !head.lines().next()?.starts_with("HTTP/1.1 200 ")
-        && !head.lines().next()?.starts_with("HTTP/1.0 200 ")
-    {
+    let status = head.lines().next()?;
+    if !status.starts_with("HTTP/1.1 200 ") && !status.starts_with("HTTP/1.0 200 ") {
         return None;
     }
-    if head.lines().any(|line| {
-        line.to_ascii_lowercase()
-            .starts_with("transfer-encoding: chunked")
-    }) {
-        return decode_chunked(body);
+    match body_framing(head) {
+        Framing::Chunked => decode_chunked(body),
+        Framing::Length(length) => body.get(..length).map(str::to_owned),
+        Framing::UntilClose => Some(body.to_owned()),
     }
-    Some(body.to_owned())
 }
 
 fn decode_chunked(mut body: &str) -> Option<String> {
@@ -246,6 +320,71 @@ mod tests {
                 .instance_type
                 .as_deref(),
             Some("g6-standard-1")
+        );
+    }
+
+    /// A metadata service like Hetzner's: answers at once, then keeps the
+    /// connection open well past our read timeout.
+    fn lingering_server(reply: &'static [u8]) -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request);
+            socket.write_all(reply).unwrap();
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        address
+    }
+
+    #[test]
+    fn reads_a_reply_from_a_server_that_does_not_hang_up() {
+        let started = Instant::now();
+        let zone = request_to(
+            lingering_server(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nfsn1-dc14"),
+            "GET",
+            "/hetzner/v1/metadata/availability-zone",
+            &[],
+        );
+        assert_eq!(zone.as_deref(), Some("fsn1-dc14"));
+        assert!(
+            started.elapsed() < TIMEOUT,
+            "it waited for the server to hang up"
+        );
+
+        let region = request_to(
+            lingering_server(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\neu\r\n8\r\n-central\r\n0\r\n\r\n"),
+            "GET",
+            "/hetzner/v1/metadata/region",
+            &[],
+        );
+        assert_eq!(region.as_deref(), Some("eu-central"));
+    }
+
+    #[test]
+    fn a_reply_cut_short_or_without_an_end_is_not_used() {
+        let short = request_to(
+            lingering_server(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nfsn1"),
+            "GET",
+            "/",
+            &[],
+        );
+        assert_eq!(short, None);
+        let unframed = request_to(
+            lingering_server(b"HTTP/1.1 200 OK\r\n\r\nfsn1-dc14"),
+            "GET",
+            "/",
+            &[],
+        );
+        assert_eq!(unframed, None);
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnbg1extra"),
+            Some("nbg1".into())
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
+            None
         );
     }
 
