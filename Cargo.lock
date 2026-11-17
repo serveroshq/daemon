@@ -673,12 +673,14 @@ dependencies = [
  "daemon-protocol",
  "daemon-state",
  "libc",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "time",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
