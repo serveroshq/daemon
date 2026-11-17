@@ -45,7 +45,7 @@ pub fn serve(app: Arc<App>) {
 
                 let allowed = matches!(read, Ok(Ok(_)))
                     && domain_asked(&line)
-                        .is_some_and(|domain| app.deployer.proxy.allows_on_demand(&domain));
+                        .is_some_and(|domain| app.deployer.proxy().allows_on_demand(&domain));
 
                 let status = if allowed { "200 OK" } else { "403 Forbidden" };
                 let _ = write

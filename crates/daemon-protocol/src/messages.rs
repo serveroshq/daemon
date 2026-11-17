@@ -47,6 +47,11 @@ pub struct Hello {
     /// those leave it out.
     #[serde(default, deserialize_with = "present")]
     pub pinned_version: Option<Option<String>>,
+    /// The reverse proxy that serves this machine's app domains: caddy,
+    /// nginx, apache, traefik or none. Missing from daemons that can't
+    /// switch proxies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 /// What the panel decides for a machine: each one present is applied and
@@ -792,6 +797,26 @@ pub enum Job {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
     },
+    /// A query against a database the machine runs itself (PostgreSQL,
+    /// MySQL or MariaDB as a systemd unit), for the panel's Database tab.
+    /// The daemon runs the client with fixed arguments, and the query only
+    /// reaches it as a setting, so this can't run anything else on the host.
+    /// Containers use `service_exec` instead.
+    DatabaseQuery {
+        service: String,
+        /// `postgres` or `mysql`: checked against what the service is.
+        engine: String,
+        #[serde(default)]
+        database: Option<String>,
+        sql: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        /// Print how many rows the query changed after its output.
+        #[serde(default)]
+        count: bool,
+        /// 32 hex characters marking each section of the output.
+        nonce: String,
+    },
     ServiceRepair {
         service: String,
     },
@@ -984,6 +1009,17 @@ pub struct DeploySpec {
     /// installation token), sent fresh with each deploy and never stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_token: Option<RepoToken>,
+    /// The reverse proxy the machine should serve its domains with
+    /// (caddy, nginx, apache or traefik). When it isn't the one in use,
+    /// the deploy moves every site on the machine over to it first.
+    /// Missing means keep the current one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Whether the domains are served over HTTPS (a certificate, and HTTP
+    /// redirected to it). Missing keeps what the app had, HTTPS for a new
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

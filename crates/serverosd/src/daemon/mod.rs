@@ -2,6 +2,7 @@ mod app;
 mod backup_ops;
 mod clone;
 mod control;
+mod database;
 mod disk_usage;
 mod handler;
 mod local;

@@ -86,6 +86,7 @@ fn hello(app: &App) -> Hello {
         // reports off locally: the panel shows the policy it set.
         error_reports: Some(config.error_reports.enabled),
         pinned_version: Some(config.updates.pinned_version.clone()),
+        proxy: Some(config.integrations.proxy.name().to_string()),
     }
 }
 

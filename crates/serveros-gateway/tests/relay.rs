@@ -246,6 +246,7 @@ fn hello() -> Hello {
         updates_automatic: None,
         error_reports: None,
         pinned_version: None,
+        proxy: None,
     }
 }
 

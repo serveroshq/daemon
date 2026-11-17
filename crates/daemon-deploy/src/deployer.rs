@@ -28,11 +28,22 @@ pub struct DeployResult {
 pub struct Deployer {
     pub paths: Paths,
     pub state: Arc<State>,
-    pub proxy: Proxy,
+    /// The machine's reverse proxy. Behind a lock because a deploy can
+    /// move the machine to another one.
+    pub proxy: std::sync::RwLock<Proxy>,
     pub build_limits: BuildLimits,
 }
 
 impl Deployer {
+    /// The reverse proxy in use now.
+    pub fn proxy(&self) -> Proxy {
+        self.proxy.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_proxy(&self, proxy: Proxy) {
+        *self.proxy.write().unwrap_or_else(|e| e.into_inner()) = proxy;
+    }
+
     fn apps_dir(&self) -> PathBuf {
         self.paths.state_dir.join("apps")
     }
@@ -206,10 +217,11 @@ impl Deployer {
             }
             if let (Some(port), false) = (host_port, spec.domains.is_empty()) {
                 progress.phase("proxy", Some(80)).await;
-                self.proxy.ensure_installed(cancel, progress).await?;
-                self.proxy.ensure_import()?;
-                self.proxy
-                    .publish(service, &spec.domains, port, cancel, progress)
+                let proxy = self.proxy();
+                proxy.ensure_installed(cancel, progress).await?;
+                proxy.ensure_import()?;
+                proxy
+                    .publish(service, &spec.domains, port, spec.https, cancel, progress)
                     .await?;
             }
 
@@ -296,10 +308,18 @@ impl Deployer {
 
         if !spec.domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
-            self.proxy.ensure_installed(cancel, progress).await?;
-            self.proxy.ensure_import()?;
-            self.proxy
-                .publish(service, &spec.domains, host_port, cancel, progress)
+            let proxy = self.proxy();
+            proxy.ensure_installed(cancel, progress).await?;
+            proxy.ensure_import()?;
+            proxy
+                .publish(
+                    service,
+                    &spec.domains,
+                    host_port,
+                    spec.https,
+                    cancel,
+                    progress,
+                )
                 .await?;
         }
 
@@ -434,8 +454,8 @@ impl Deployer {
 
         if !domains.is_empty() {
             progress.phase("proxy", Some(80)).await;
-            self.proxy
-                .publish(service, domains, release.port, &mut cancel, progress)
+            self.proxy()
+                .publish(service, domains, release.port, None, &mut cancel, progress)
                 .await?;
         }
 
@@ -643,7 +663,7 @@ mod tests {
         let deployer = Deployer {
             paths: Paths::under(dir.path()),
             state: Arc::new(State::in_memory().unwrap()),
-            proxy: Proxy::default(),
+            proxy: std::sync::RwLock::new(Proxy::default()),
             build_limits: BuildLimits {
                 cpu_percent: 100,
                 memory_mb: 512,

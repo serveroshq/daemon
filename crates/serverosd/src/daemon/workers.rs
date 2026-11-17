@@ -31,6 +31,7 @@ pub fn spawn_all(app: Arc<App>) {
     tokio::spawn(self_health(Arc::clone(&app)));
     tokio::spawn(updates(Arc::clone(&app)));
     tokio::spawn(update_checks(Arc::clone(&app)));
+    tokio::spawn(certificates(Arc::clone(&app)));
     tokio::spawn(housekeeping(app));
 }
 
@@ -422,6 +423,33 @@ fn jitter(max: u64) -> u64 {
         .map(|d| d.subsec_nanos() as u64)
         .unwrap_or(0);
     nanos % max
+}
+
+/// nginx and Apache don't keep trying for a certificate the way Caddy and
+/// Traefik do, so a site deployed before its domain pointed here would
+/// stay on plain HTTP. Try again for those every 15 minutes. At start-up,
+/// first rewrite site files an update changed, like the challenge folder
+/// moving out of /var/lib/serveros.
+async fn certificates(app: Arc<App>) {
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let refreshed = app.deployer.proxy().refresh_sites().await;
+    if refreshed > 0 {
+        info!(
+            sites = refreshed,
+            "rewrote site files this version writes differently"
+        );
+    }
+    let mut tick = tokio::time::interval(Duration::from_secs(15 * 60));
+    loop {
+        tick.tick().await;
+        let done = app.deployer.proxy().retry_certificates().await;
+        if done > 0 {
+            info!(
+                sites = done,
+                "got certificates on a retry: those sites are on HTTPS now"
+            );
+        }
+    }
 }
 
 async fn housekeeping(app: Arc<App>) {
