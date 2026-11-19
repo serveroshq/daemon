@@ -118,6 +118,7 @@ impl Deployer {
         let service = spec.service.clone();
         let commit = spec.commit.clone();
         let previous = ledger.current(&service);
+        let slot = slot_for(&service, &commit, previous.as_ref());
 
         progress.phase("prepare", Some(5)).await;
         let workspace = self.paths.jobs_dir().join(ctx.id.to_string());
@@ -125,7 +126,7 @@ impl Deployer {
             .map_err(|e| Failure::new("prepare", format!("could not create workspace: {e}")))?;
 
         let result = self
-            .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &mut cancel)
+            .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &slot, &mut cancel)
             .await;
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -133,8 +134,14 @@ impl Deployer {
         match result {
             Ok(result) => Ok(result),
             Err(failure) => {
-                let _ = ledger.mark_failed(&service, &commit);
-                container::remove(&container::container_name(&service, &commit), progress).await;
+                // The live commit deployed again failed beside it: that
+                // release is still serving, so it isn't marked failed.
+                let live_again = spec.compose_file.is_none()
+                    && previous.as_ref().is_some_and(|p| p.commit == commit);
+                if !live_again {
+                    let _ = ledger.mark_failed(&service, &commit);
+                }
+                container::remove(&slot.name, progress).await;
                 if let Some(prev) = &previous {
                     progress
                         .line(format!(
@@ -155,6 +162,7 @@ impl Deployer {
         spec: &DeploySpec,
         workspace: &Path,
         previous: Option<&Release>,
+        slot: &Slot,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<DeployResult, Failure> {
         let progress = &ctx.progress;
@@ -266,8 +274,16 @@ impl Deployer {
         .await?;
 
         progress.phase("start", Some(60)).await;
-        let name = container::container_name(service, commit);
-        let host_port = releases::port_for(service, commit);
+        let name = slot.name.clone();
+        let host_port = slot.port;
+        if previous.is_some_and(|p| p.commit == *commit) {
+            progress
+                .line(format!(
+                    "{} is live already: starting it again beside itself as {name}, so it keeps serving until the swap",
+                    &commit[..7.min(commit.len())]
+                ))
+                .await;
+        }
         let container_port = spec.port.unwrap_or(80);
 
         // Folders the Dockerfile declares with VOLUME are the app's data:
@@ -354,6 +370,11 @@ impl Deployer {
                         prev.container, e.message
                     ))
                     .await;
+            }
+            // The same commit's other container: the ledger now holds
+            // the new one for this commit, so the old one is let go.
+            if prev.commit == *commit {
+                container::remove(&prev.container, progress).await;
             }
         }
 
@@ -505,9 +526,44 @@ fn refuse_compose(release: Option<&Release>) -> Result<(), Failure> {
     }
 }
 
+/// Where a release runs: its container and the local port it listens on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Slot {
+    name: String,
+    port: u16,
+}
+
+/// A commit runs as a container named for it, on a port of its own. When
+/// it's the commit that's live (an env change redeploys the same commit),
+/// that name and port are taken, so it starts under its other name and
+/// port beside the live one, which serves until the new one is healthy and
+/// the proxy has moved over, as on any deploy. The next time, it goes back
+/// to the first.
+fn slot_for(service: &str, commit: &str, previous: Option<&Release>) -> Slot {
+    let first = Slot {
+        name: container::container_name(service, commit),
+        port: releases::port_for(service, commit),
+    };
+    let second = Slot {
+        name: container::alternate_container_name(service, commit),
+        port: releases::alternate_port(service, commit),
+    };
+    let Some(prev) = previous else {
+        return first;
+    };
+    let taken = |slot: &Slot| prev.container == slot.name || prev.port == slot.port;
+    if !taken(&first) {
+        first
+    } else if !taken(&second) || prev.container == first.name {
+        second
+    } else {
+        first
+    }
+}
+
 /// The release to stop once the new one is live: the one before it, unless
-/// it was the same commit deployed again, whose container the new one has
-/// already replaced (same name), so stopping it would take the app down.
+/// it has the new one's name, in which case the new one already replaced
+/// it and stopping it would take the app down.
 fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Release> {
     previous.filter(|prev| prev.container != container)
 }
@@ -643,11 +699,50 @@ mod tests {
         let older = release("serveros-shop-bbbbbbbbbbbb");
 
         assert!(to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa").is_none());
+        // The live commit deployed again runs beside it, so the old one
+        // is drained like any other.
+        assert_eq!(
+            to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa-b").map(|r| r.container.as_str()),
+            Some("serveros-shop-aaaaaaaaaaaa")
+        );
         assert_eq!(
             to_drain(Some(&older), "serveros-shop-aaaaaaaaaaaa").map(|r| r.container.as_str()),
             Some("serveros-shop-bbbbbbbbbbbb")
         );
         assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
+    }
+
+    #[test]
+    fn the_live_commit_deployed_again_starts_beside_itself() {
+        let commit = "a".repeat(40);
+        let release = |slot: &Slot, commit: &str| Release {
+            commit: commit.into(),
+            image: container::image_tag("shop", commit),
+            container: slot.name.clone(),
+            port: slot.port,
+            deployed_at: 0,
+            status: "live".into(),
+            http: true,
+            compose: false,
+        };
+
+        let first = slot_for("shop", &commit, None);
+        assert_eq!(first.name, "serveros-shop-aaaaaaaaaaaa");
+        assert_eq!(first.port, releases::port_for("shop", &commit));
+
+        // Another commit live: the usual name and port.
+        let other = release(&slot_for("shop", &"b".repeat(40), None), &"b".repeat(40));
+        assert_eq!(slot_for("shop", &commit, Some(&other)), first);
+
+        // Itself live: the other slot, then back again.
+        let second = slot_for("shop", &commit, Some(&release(&first, &commit)));
+        assert_eq!(second.name, "serveros-shop-aaaaaaaaaaaa-b");
+        assert_ne!(second.port, first.port);
+        assert!((20_000..30_000).contains(&second.port));
+        assert_eq!(
+            slot_for("shop", &commit, Some(&release(&second, &commit))),
+            first
+        );
     }
 
     #[test]

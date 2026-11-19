@@ -26,6 +26,13 @@ pub fn container_name(service: &str, commit: &str) -> String {
     )
 }
 
+/// The other name a release of `commit` can run under, so the commit that's
+/// live can be started again beside itself. The slot goes after the commit,
+/// so the name still reads as `serveros-<app>-<commit>` with `-b` on the end.
+pub fn alternate_container_name(service: &str, commit: &str) -> String {
+    format!("{}-b", container_name(service, commit))
+}
+
 /// The label on an app's containers and volumes naming the app.
 pub const APP_LABEL: &str = "com.serveros.app";
 
@@ -579,6 +586,10 @@ mod tests {
             "serveros/shop-web:abcdef123456"
         );
         assert_eq!(container_name("app", "a1b2c3d"), "serveros-app-a1b2c3d");
+        assert_eq!(
+            alternate_container_name("shop", "abcdef1234567890"),
+            "serveros-shop-abcdef123456-b"
+        );
     }
 
     #[test]
