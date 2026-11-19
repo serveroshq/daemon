@@ -497,7 +497,10 @@ mod tests {
         assert_eq!(pick_ref(&out, Some("main")), None);
         assert_eq!(pick_ref(&[], Some("main")), None);
 
-        let out = vec!["ref: refs/heads/trunk\tHEAD".to_string(), format!("{a}\tHEAD")];
+        let out = vec![
+            "ref: refs/heads/trunk\tHEAD".to_string(),
+            format!("{a}\tHEAD"),
+        ];
         assert_eq!(
             pick_ref(&out, None),
             Some(ResolvedRef {
