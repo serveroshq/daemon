@@ -36,6 +36,10 @@ pub fn alternate_container_name(service: &str, commit: &str) -> String {
 /// The label on an app's containers and volumes naming the app.
 pub const APP_LABEL: &str = "com.serveros.app";
 
+/// The label on an app's images holding the fingerprint of what they were
+/// built from, so a deploy of the same files can use the image as it is.
+pub const BUILD_LABEL: &str = "serveros.build";
+
 /// The named volume an app keeps the folder `path` in. It's the same for
 /// every release, so what one version writes there is there for the next.
 pub fn volume_name(service: &str, path: &str) -> String {
@@ -138,6 +142,29 @@ fn parse_image_volumes(json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The value of `label` on a local image, or None when there's no such
+/// image or it hasn't got the label (images built before it was added).
+pub async fn image_label(tag: &str, label: &str) -> Option<String> {
+    let out = docker_output(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.Labels}}",
+        tag,
+    ])
+    .await
+    .ok()?;
+    parse_label(&out, label)
+}
+
+fn parse_label(json: &str, label: &str) -> Option<String> {
+    serde_json::from_str::<Option<BTreeMap<String, String>>>(json.trim())
+        .ok()
+        .flatten()?
+        .remove(label)
+        .filter(|value| !value.is_empty())
+}
+
 /// The volumes a container has mounted, by the folder they're mounted at.
 /// Empty when there's no such container.
 pub async fn container_volumes(name: &str) -> BTreeMap<String, String> {
@@ -214,10 +241,29 @@ fn failure_from(phase: &str, outcome: ChildOutcome, what: &str) -> Failure {
     }
 }
 
+fn build_args(buildkit: bool, dockerfile: &str, tag: &str, fingerprint: &str) -> Vec<String> {
+    let mut args = vec!["build".to_string(), "--pull".into()];
+    if buildkit {
+        args.push("--progress=plain".into());
+    }
+    args.extend([
+        "--label".into(),
+        format!("{BUILD_LABEL}={fingerprint}"),
+        "-f".into(),
+        dockerfile.into(),
+        "-t".into(),
+        tag.into(),
+        ".".into(),
+    ]);
+    args
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn build(
     workspace: &Path,
     dockerfile: Option<&str>,
     tag: &str,
+    fingerprint: &str,
     limits: &BuildLimits,
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
@@ -243,11 +289,8 @@ pub async fn build(
             .line("buildx isn't installed, so building with Docker's classic builder")
             .await;
     }
-    let mut docker_args = vec!["build", "--pull"];
-    if buildkit {
-        docker_args.push("--progress=plain");
-    }
-    docker_args.extend(["-f", dockerfile, "-t", tag, "."]);
+    let docker_args = build_args(buildkit, dockerfile, tag, fingerprint);
+    let docker_args: Vec<&str> = docker_args.iter().map(String::as_str).collect();
     let env = builder_env(buildkit);
 
     let scoped = scopes_work(cancel).await;
@@ -590,6 +633,37 @@ mod tests {
             alternate_container_name("shop", "abcdef1234567890"),
             "serveros-shop-abcdef123456-b"
         );
+    }
+
+    #[test]
+    fn builds_are_labelled_with_what_they_were_built_from() {
+        let args = build_args(true, "Dockerfile", "serveros/shop:abc", "f00d");
+        assert_eq!(
+            args,
+            [
+                "build",
+                "--pull",
+                "--progress=plain",
+                "--label",
+                "serveros.build=f00d",
+                "-f",
+                "Dockerfile",
+                "-t",
+                "serveros/shop:abc",
+                "."
+            ]
+        );
+        assert!(
+            !build_args(false, "Dockerfile", "t", "f").contains(&"--progress=plain".to_string())
+        );
+
+        assert_eq!(
+            parse_label(r#"{"serveros.build":"f00d","x":"y"}"#, BUILD_LABEL).as_deref(),
+            Some("f00d")
+        );
+        assert_eq!(parse_label("null\n", BUILD_LABEL), None);
+        assert_eq!(parse_label(r#"{"x":"y"}"#, BUILD_LABEL), None);
+        assert_eq!(parse_label("", BUILD_LABEL), None);
     }
 
     #[test]

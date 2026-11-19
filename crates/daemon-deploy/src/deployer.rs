@@ -176,8 +176,24 @@ impl Deployer {
             _ => None,
         };
 
+        // An image already built from these same files (the live commit
+        // redeployed for an env change, say) is used as it is.
+        let tag = container::image_tag(service, commit);
+        let fingerprint = build_fingerprint(spec);
+        let built = spec.compose_file.is_none()
+            && container::image_label(&tag, container::BUILD_LABEL)
+                .await
+                .is_some_and(|label| label == fingerprint);
+
         progress.phase("fetch", Some(15)).await;
-        if spec.repo.is_empty() {
+        if built {
+            progress
+                .line(format!(
+                    "image for {} is already built with the same files; skipping the build",
+                    &commit[..7.min(commit.len())]
+                ))
+                .await;
+        } else if spec.repo.is_empty() {
             if spec.files.is_empty() {
                 return Err(
                     Failure::new("fetch", "nothing to deploy: no repository and no files")
@@ -203,8 +219,13 @@ impl Deployer {
             )
             .await?;
         }
-        let context = build_context(workspace, base_dir, commit, !spec.repo.is_empty())?;
-        write_files(&context, &spec.files)?;
+        let context = if built {
+            None
+        } else {
+            let context = build_context(workspace, base_dir, commit, !spec.repo.is_empty())?;
+            write_files(&context, &spec.files)?;
+            Some(context)
+        };
 
         progress.phase("env", Some(25)).await;
         let env_file = self.write_env(service, commit, &spec.env)?;
@@ -268,17 +289,19 @@ impl Deployer {
         }
 
         progress.phase("build", Some(40)).await;
-        let tag = container::image_tag(service, commit);
-        container::build(
-            &context,
-            spec.dockerfile.as_deref(),
-            &tag,
-            &self.build_limits,
-            step_timeout,
-            cancel,
-            progress,
-        )
-        .await?;
+        if let Some(context) = &context {
+            container::build(
+                context,
+                spec.dockerfile.as_deref(),
+                &tag,
+                &fingerprint,
+                &self.build_limits,
+                step_timeout,
+                cancel,
+                progress,
+            )
+            .await?;
+        }
 
         progress.phase("start", Some(60)).await;
         let name = slot.name.clone();
@@ -590,6 +613,41 @@ fn replace_dir(workspace: &Path, dir: &Path) -> Result<(), Failure> {
     std::fs::rename(workspace, dir).map_err(fail)
 }
 
+/// What an app's image is built from, as a hex sha256: the repository and
+/// commit, the Dockerfile, the job's files and the app's folder. Each part
+/// is written with its length first, so no two sets of inputs run together
+/// into the same bytes.
+fn build_fingerprint(spec: &DeploySpec) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn field(hash: &mut Sha256, value: &str) {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    fn optional(hash: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hash.update([1]);
+                field(hash, value);
+            }
+            None => hash.update([0]),
+        }
+    }
+
+    let mut hash = Sha256::new();
+    field(&mut hash, "serveros.build/1");
+    field(&mut hash, &spec.repo);
+    field(&mut hash, &spec.commit);
+    optional(&mut hash, spec.dockerfile.as_deref());
+    hash.update((spec.files.len() as u64).to_le_bytes());
+    for (name, content) in &spec.files {
+        field(&mut hash, name);
+        field(&mut hash, content);
+    }
+    optional(&mut hash, spec.base_dir.as_deref());
+    hex::encode(hash.finalize())
+}
+
 const MAX_BASE_DIR_LEN: usize = 256;
 
 /// The app's folder in its repository, as a path that can only lead inside
@@ -762,6 +820,58 @@ mod tests {
         let mut big = std::collections::BTreeMap::new();
         big.insert("big".to_string(), "x".repeat(MAX_JOB_FILE_BYTES + 1));
         assert!(write_files(dir.path(), &big).is_err());
+    }
+
+    #[test]
+    fn build_fingerprints_are_stable_and_follow_every_input() {
+        let spec: DeploySpec = serde_json::from_value(serde_json::json!({
+            "service": "web",
+            "repo": "https://github.com/acme/shop.git",
+            "commit": "a".repeat(40),
+            "files": {".serveros/Dockerfile": "FROM node:22\n"},
+        }))
+        .unwrap();
+        let base = build_fingerprint(&spec);
+        assert_eq!(base, build_fingerprint(&spec.clone()));
+        assert_eq!(base.len(), 64);
+
+        // What the app runs with, not what it's built from.
+        let mut same = spec.clone();
+        same.env.insert("APP_KEY".into(), "x".into());
+        same.domains.push("shop.example.com".into());
+        same.port = Some(3000);
+        assert_eq!(build_fingerprint(&same), base);
+
+        type Change = Box<dyn Fn(&mut DeploySpec)>;
+        let changes: Vec<Change> = vec![
+            Box::new(|s| s.repo.push('x')),
+            Box::new(|s| s.commit = "b".repeat(40)),
+            Box::new(|s| s.dockerfile = Some("Dockerfile".into())),
+            Box::new(|s| s.dockerfile = Some(String::new())),
+            Box::new(|s| {
+                s.files
+                    .insert(".serveros/Dockerfile".into(), "FROM node:20\n".into());
+            }),
+            Box::new(|s| {
+                s.files.insert("extra".into(), String::new());
+            }),
+            Box::new(|s| s.files.clear()),
+            Box::new(|s| s.base_dir = Some("apps/web".into())),
+            Box::new(|s| s.base_dir = Some(String::new())),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base.clone()]);
+        for change in changes {
+            let mut changed = spec.clone();
+            change(&mut changed);
+            assert!(seen.insert(build_fingerprint(&changed)), "{changed:?}");
+        }
+
+        // A file's name and content don't run together.
+        let mut a = spec.clone();
+        a.files = [("ab".to_string(), "c".to_string())].into();
+        let mut b = spec.clone();
+        b.files = [("a".to_string(), "bc".to_string())].into();
+        assert_ne!(build_fingerprint(&a), build_fingerprint(&b));
     }
 
     #[test]
