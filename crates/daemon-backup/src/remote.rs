@@ -111,9 +111,12 @@ pub async fn upload(
         return Err(Failure::new("upload", format!("{} is not a configured storage endpoint; the daemon only talks to the panel and configured storage", target.host())));
     }
 
-    let body = std::fs::read(file)
+    // Hashed and then sent straight from disk: holding the archive in
+    // memory once pushed the daemon past its ceiling on bigger backups,
+    // and it restarted mid-job.
+    let (_, body_hash) = crate::sha256_file(file)
+        .await
         .map_err(|e| Failure::new("upload", format!("{}: {e}", file.display())))?;
-    let body_hash = hex::encode(Sha256::digest(&body));
     let timestamp = time::OffsetDateTime::now_utc()
         .format(&time::macros::format_description!(
             "[year][month][day]T[hour][minute][second]Z"
@@ -128,7 +131,7 @@ pub async fn upload(
     let client = Client::new(Trust::WebPki, "serverosd-backup")
         .with_timeout(std::time::Duration::from_secs(600));
     let response = client
-        .put(&target.url(key), &header_refs, &body)
+        .put_file(&target.url(key), &header_refs, file)
         .await
         .map_err(|e| Failure::new("upload", e.to_string()))?;
 

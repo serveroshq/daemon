@@ -5,7 +5,6 @@ use daemon_jobs::{run_child, ChildOutcome, Failure, Progress};
 use daemon_protocol::ServiceAction;
 use daemon_services::{Lifecycle, ManagedService, RunBy};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use crate::retention;
@@ -207,12 +206,14 @@ impl Snapshotter {
         let mut total = 0u64;
 
         for path in &produced {
-            let bytes = std::fs::read(path).map_err(|e| Failure::new("checksum", e.to_string()))?;
-            total += bytes.len() as u64;
+            let (bytes, sha256) = crate::sha256_file(path)
+                .await
+                .map_err(|e| Failure::new("checksum", e.to_string()))?;
+            total += bytes;
             files.push(ManifestFile {
                 name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                bytes: bytes.len() as u64,
-                sha256: hex::encode(Sha256::digest(&bytes)),
+                bytes,
+                sha256,
             });
         }
 
@@ -271,9 +272,10 @@ impl Snapshotter {
 
         progress.phase("verify", Some(5)).await;
         for file in &manifest.files {
-            let bytes = std::fs::read(dir.join(&file.name))
+            let (_, sha256) = crate::sha256_file(&dir.join(&file.name))
+                .await
                 .map_err(|e| Failure::new("verify", format!("{}: {e}", file.name)))?;
-            if hex::encode(Sha256::digest(&bytes)) != file.sha256 {
+            if sha256 != file.sha256 {
                 return Err(Failure::new(
                     "verify",
                     format!(

@@ -1,11 +1,12 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use url::Url;
@@ -146,7 +147,7 @@ impl Client {
             "POST",
             url,
             &[("Content-Type", "application/json")],
-            Some(&bytes),
+            Some(Body::Bytes(&bytes)),
         )
         .await
     }
@@ -161,7 +162,8 @@ impl Client {
         let mut all: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
         all.extend_from_slice(headers);
 
-        self.request("POST", url, &all, Some(&bytes)).await
+        self.request("POST", url, &all, Some(Body::Bytes(&bytes)))
+            .await
     }
 
     pub async fn post(
@@ -170,7 +172,8 @@ impl Client {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Response, HttpError> {
-        self.request("POST", url, headers, Some(body)).await
+        self.request("POST", url, headers, Some(Body::Bytes(body)))
+            .await
     }
 
     pub async fn put(
@@ -179,7 +182,24 @@ impl Client {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Response, HttpError> {
-        self.request("PUT", url, headers, Some(body)).await
+        self.request("PUT", url, headers, Some(Body::Bytes(body)))
+            .await
+    }
+
+    /// PUTs a file read from disk as it's sent, so its size never has to
+    /// fit in memory: backups can be far bigger than the daemon is allowed
+    /// to grow.
+    pub async fn put_file(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        path: &Path,
+    ) -> Result<Response, HttpError> {
+        let file = tokio::fs::File::open(path).await?;
+        let len = file.metadata().await?.len();
+
+        self.request("PUT", url, headers, Some(Body::File(file, len)))
+            .await
     }
 
     async fn request(
@@ -187,7 +207,7 @@ impl Client {
         method: &str,
         url: &str,
         headers: &[(&str, &str)],
-        body: Option<&[u8]>,
+        mut body: Option<Body<'_>>,
     ) -> Result<Response, HttpError> {
         let parsed = Url::parse(url).map_err(|_| HttpError::Url(url.into()))?;
 
@@ -240,7 +260,7 @@ impl Client {
                 request.push_str(&format!("{name}: {value}\r\n"));
             }
 
-            if let Some(body) = body {
+            if let Some(body) = &body {
                 request.push_str(&format!("Content-Length: {}\r\n", body.len()));
             }
 
@@ -248,8 +268,19 @@ impl Client {
 
             tls.write_all(request.as_bytes()).await?;
 
-            if let Some(body) = body {
-                tls.write_all(body).await?;
+            match body.as_mut() {
+                Some(Body::Bytes(bytes)) => tls.write_all(bytes).await?,
+                Some(Body::File(file, len)) => {
+                    let mut reader = BufReader::with_capacity(FILE_CHUNK, file).take(*len);
+                    let sent = tokio::io::copy_buf(&mut reader, &mut tls).await?;
+                    if sent != *len {
+                        return Err(HttpError::Io(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "the file got shorter while it was being sent",
+                        )));
+                    }
+                }
+                None => {}
             }
 
             let mut raw = Vec::new();
@@ -290,6 +321,24 @@ impl Client {
         tokio::time::timeout(self.timeout, work)
             .await
             .map_err(|_| HttpError::Timeout(host_of(url)))?
+    }
+}
+
+/// How much of a file is read at a time when one is sent as a body.
+const FILE_CHUNK: usize = 256 * 1024;
+
+enum Body<'a> {
+    Bytes(&'a [u8]),
+    /// An open file and how many bytes of it to send.
+    File(tokio::fs::File, u64),
+}
+
+impl Body<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Body::Bytes(bytes) => bytes.len() as u64,
+            Body::File(_, len) => *len,
+        }
     }
 }
 
@@ -509,6 +558,78 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
 
         assert_eq!(parse_response(raw, "example").unwrap().body, b"Wikipedia");
+    }
+
+    #[tokio::test]
+    async fn puts_a_file_from_disk_byte_for_byte() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let received = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut raw = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            let head_end = loop {
+                let n = tls.read(&mut chunk).await.unwrap();
+                raw.extend_from_slice(&chunk[..n]);
+                if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_string();
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            while raw.len() < head_end + len {
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "body ended early");
+                raw.extend_from_slice(&chunk[..n]);
+            }
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+            (head, raw[head_end..].to_vec())
+        });
+
+        // Bigger than one read chunk many times over, and not a multiple of it.
+        let body: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &body).unwrap();
+
+        let client = Client::new(Trust::pinned_pem(cert.pem().as_bytes()).unwrap(), "test");
+        let response = client
+            .put_file(
+                &format!("https://localhost:{port}/bucket/key"),
+                &[("x-amz-content-sha256", "abc")],
+                file.path(),
+            )
+            .await
+            .unwrap();
+
+        let (head, got) = received.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert!(head.starts_with("PUT /bucket/key HTTP/1.1\r\n"));
+        assert!(head.contains("x-amz-content-sha256: abc\r\n"));
+        assert_eq!(got.len(), body.len());
+        assert!(got == body, "the file arrived changed");
     }
 
     #[test]
