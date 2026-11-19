@@ -14,10 +14,23 @@ pub struct Release {
     /// asking it for a page. Releases recorded before this was kept did.
     #[serde(default = "answers_http")]
     pub http: bool,
+    /// A Compose project rather than one container. Releases recorded
+    /// before this was kept are told apart by their container and image
+    /// both being the project's name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compose: bool,
 }
 
 fn answers_http() -> bool {
     true
+}
+
+impl Release {
+    /// Whether this release is a Compose project. Compose recreates the
+    /// stack in place, so there's no stopped container of it to go back to.
+    pub fn is_compose(&self) -> bool {
+        self.compose || self.container == self.image
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -140,6 +153,7 @@ mod tests {
             deployed_at: 0,
             status: "live".into(),
             http: true,
+            compose: false,
         }
     }
 
@@ -161,6 +175,29 @@ mod tests {
         );
         assert_eq!(ledger.previous("app").unwrap().commit, "c");
         assert_eq!(ledger.current("app").unwrap().commit, "d");
+    }
+
+    #[test]
+    fn compose_releases_are_told_apart_old_and_new() {
+        assert!(!release("a").is_compose());
+
+        // Recorded before the flag was kept: the project's name twice.
+        let old: Release = serde_json::from_str(
+            r#"{"commit":"a","image":"serveros-shop","container":"serveros-shop","port":0,"deployed_at":0,"status":"live"}"#,
+        )
+        .unwrap();
+        assert!(old.is_compose());
+        assert!(!old.compose);
+
+        let new = Release {
+            compose: true,
+            ..release("a")
+        };
+        assert!(new.is_compose());
+
+        // A container release's record is written as it was before.
+        let json = serde_json::to_string(&release("a")).unwrap();
+        assert!(!json.contains("compose"));
     }
 
     #[test]

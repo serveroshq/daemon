@@ -235,6 +235,7 @@ impl Deployer {
                 deployed_at: daemon_state::State::now(),
                 status: "live".into(),
                 http: spec.health.is_some(),
+                compose: true,
             };
             ReleaseLedger::new(&self.state)
                 .promote(service, release.clone(), RETAINED_RELEASES)
@@ -335,6 +336,7 @@ impl Deployer {
             deployed_at: daemon_state::State::now(),
             status: "live".into(),
             http: spec.health.is_some(),
+            compose: false,
         };
         let evicted = ledger
             .promote(service, release, RETAINED_RELEASES)
@@ -411,6 +413,7 @@ impl Deployer {
         let mut cancel = ctx.cancel.clone();
         let ledger = ReleaseLedger::new(&self.state);
         let current = ledger.current(service);
+        refuse_compose(current.as_ref())?;
         let all = ledger.load(service);
 
         let release = match target {
@@ -425,6 +428,7 @@ impl Deployer {
             Failure::new("rollback", "no previous release to roll back to")
                 .with_next_step("Deploy a new commit instead.")
         })?;
+        refuse_compose(Some(&release))?;
 
         if current.as_ref().is_some_and(|c| c.commit == release.commit) {
             return Err(Failure::new(
@@ -484,6 +488,20 @@ impl Deployer {
             previous: current.map(|c| c.commit),
             restart_note: None,
         })
+    }
+}
+
+/// A Compose release is recorded under its project's name, which isn't a
+/// container, and Compose recreates the stack in place, so there's nothing
+/// stopped to start again. Checked before anything is touched.
+fn refuse_compose(release: Option<&Release>) -> Result<(), Failure> {
+    match release {
+        Some(release) if release.is_compose() => Err(Failure::new(
+            "rollback",
+            "Compose apps roll back by deploying the earlier commit again",
+        )
+        .with_next_step("Deploy the commit you want to go back to.")),
+        _ => Ok(()),
     }
 }
 
@@ -619,6 +637,7 @@ mod tests {
             deployed_at: 0,
             status: "live".into(),
             http: true,
+            compose: false,
         };
         let same = release("serveros-shop-aaaaaaaaaaaa");
         let older = release("serveros-shop-bbbbbbbbbbbb");
@@ -629,6 +648,39 @@ mod tests {
             Some("serveros-shop-bbbbbbbbbbbb")
         );
         assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
+    }
+
+    #[test]
+    fn compose_releases_are_not_rolled_back_by_starting_a_container() {
+        let release = |container: &str, image: &str, compose: bool| Release {
+            commit: "a".repeat(40),
+            image: image.into(),
+            container: container.into(),
+            port: 0,
+            deployed_at: 0,
+            status: "standby".into(),
+            http: false,
+            compose,
+        };
+
+        // Recorded before the flag was kept, and after.
+        for compose in [
+            release("serveros-shop", "serveros-shop", false),
+            release("serveros-shop", "serveros-shop", true),
+        ] {
+            let failure = refuse_compose(Some(&compose)).unwrap_err();
+            assert_eq!(failure.phase, "rollback");
+            assert!(failure.message.contains("deploying the earlier commit"));
+            assert!(failure.next_step.is_some());
+        }
+
+        let container = release(
+            "serveros-shop-aaaaaaaaaaaa",
+            "serveros/shop:aaaaaaaaaaaa",
+            false,
+        );
+        assert!(refuse_compose(Some(&container)).is_ok());
+        assert!(refuse_compose(None).is_ok());
     }
 
     #[test]
