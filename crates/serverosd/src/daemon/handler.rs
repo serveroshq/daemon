@@ -644,6 +644,24 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             Ok(json!({"public_key": result?}))
         }
 
+        Job::ResolveRef {
+            service,
+            repo,
+            git_ref,
+        } => {
+            let grant = authorize(Operation::Deploy(DeployOp::FetchSource {
+                service: service.clone(),
+                workspace: app.paths.jobs_dir(),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .resolve_ref(&service, &repo, git_ref.as_deref(), &mut cancel)
+                .await;
+            grant.finish(&result.as_ref().map(|_| ()), Some("resolve ref"));
+            Ok(json!(result?))
+        }
+
         Job::Deploy(spec) => {
             let workspace = app.paths.jobs_dir().join(ctx.id.to_string());
             let grant = authorize(Operation::Deploy(DeployOp::Build {

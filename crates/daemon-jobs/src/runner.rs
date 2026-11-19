@@ -384,6 +384,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::OpenTerminal { .. } => "open_terminal",
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",
+        Job::ResolveRef { .. } => "resolve_ref",
         Job::Snapshots { .. } => "snapshots",
         Job::DiskUsage { .. } => "disk_usage",
         Job::ServiceClone { .. } => "service_clone",
@@ -405,6 +406,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::PackageUpdates { apply: false, .. }
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
+            | Job::ResolveRef { .. }
     )
 }
 

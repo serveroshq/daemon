@@ -69,6 +69,25 @@ impl Deployer {
         git::ensure_deploy_key(&self.keys_dir(), service, progress).await
     }
 
+    /// The commit `git_ref` (a branch or tag, or the default branch when
+    /// missing) points at in `repo`, asked over the service's deploy key.
+    pub async fn resolve_ref(
+        &self,
+        service: &str,
+        repo: &str,
+        git_ref: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<git::ResolvedRef, Failure> {
+        let (private_key, _) = git::key_paths(&self.keys_dir(), service);
+        git::resolve_ref(
+            repo,
+            git_ref,
+            private_key.exists().then_some(private_key.as_path()),
+            cancel,
+        )
+        .await
+    }
+
     fn write_env(
         &self,
         service: &str,

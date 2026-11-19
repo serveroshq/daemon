@@ -841,6 +841,16 @@ pub enum Job {
     DeployKey {
         service: String,
     },
+    /// The commit a branch or tag points at, asked of the repository over
+    /// the service's deploy key, so a private repository on any git host
+    /// can be deployed pinned to a commit. Missing `ref` means the
+    /// repository's default branch.
+    ResolveRef {
+        service: String,
+        repo: String,
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+        git_ref: Option<String>,
+    },
     Snapshots {
         service: String,
     },
@@ -1304,6 +1314,32 @@ mod tests {
 
         assert_eq!(json["type"], "service_action");
         assert_eq!(json["action"], "reload");
+    }
+
+    #[test]
+    fn resolve_ref_jobs_name_the_ref_ref() {
+        let raw = serde_json::json!({
+            "type": "resolve_ref",
+            "service": "web",
+            "repo": "git@gitlab.com:acme/web.git",
+            "ref": "main",
+        });
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        assert_eq!(
+            job,
+            Job::ResolveRef {
+                service: "web".into(),
+                repo: "git@gitlab.com:acme/web.git".into(),
+                git_ref: Some("main".into()),
+            }
+        );
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
+
+        let raw = serde_json::json!({"type": "resolve_ref", "service": "web", "repo": "x"});
+        assert!(matches!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::ResolveRef { git_ref: None, .. }
+        ));
     }
 
     #[test]
