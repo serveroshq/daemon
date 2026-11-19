@@ -169,6 +169,12 @@ impl Deployer {
         let service = &spec.service;
         let commit = &spec.commit;
         let step_timeout = ctx.timeout;
+        // An app in a subfolder builds from there; a Compose file names
+        // its own path, so it builds from the repository's root.
+        let base_dir = match (&spec.compose_file, &spec.base_dir) {
+            (None, Some(dir)) => Some(base_dir_path(dir)?),
+            _ => None,
+        };
 
         progress.phase("fetch", Some(15)).await;
         if spec.repo.is_empty() {
@@ -197,7 +203,8 @@ impl Deployer {
             )
             .await?;
         }
-        write_files(workspace, &spec.files)?;
+        let context = build_context(workspace, base_dir, commit, !spec.repo.is_empty())?;
+        write_files(&context, &spec.files)?;
 
         progress.phase("env", Some(25)).await;
         let env_file = self.write_env(service, commit, &spec.env)?;
@@ -263,7 +270,7 @@ impl Deployer {
         progress.phase("build", Some(40)).await;
         let tag = container::image_tag(service, commit);
         container::build(
-            workspace,
+            &context,
             spec.dockerfile.as_deref(),
             &tag,
             &self.build_limits,
@@ -583,6 +590,80 @@ fn replace_dir(workspace: &Path, dir: &Path) -> Result<(), Failure> {
     std::fs::rename(workspace, dir).map_err(fail)
 }
 
+const MAX_BASE_DIR_LEN: usize = 256;
+
+/// The app's folder in its repository, as a path that can only lead inside
+/// it: relative, and without `..` or `.` parts.
+fn base_dir_path(base_dir: &str) -> Result<&Path, Failure> {
+    use std::path::Component;
+
+    let path = Path::new(base_dir);
+    let confined = !base_dir.is_empty()
+        && base_dir.len() <= MAX_BASE_DIR_LEN
+        && path.components().all(|c| matches!(c, Component::Normal(_)));
+    if confined {
+        Ok(path)
+    } else {
+        Err(Failure::new(
+            "prepare",
+            format!("{base_dir:?} must be a folder inside the repository, like apps/web"),
+        )
+        .with_next_step("Set the app's folder to a path relative to the repository's root."))
+    }
+}
+
+/// Where the image is built from and the job's files go: the repository,
+/// or the app's folder in it. The folder has to be in the repository at
+/// this commit, and a link in the repository can't point it elsewhere on
+/// the machine. Without a repository the job's files are the app, so the
+/// folder is made for them.
+fn build_context(
+    workspace: &Path,
+    base_dir: Option<&Path>,
+    commit: &str,
+    fetched: bool,
+) -> Result<PathBuf, Failure> {
+    let Some(base_dir) = base_dir else {
+        return Ok(workspace.to_path_buf());
+    };
+    let context = workspace.join(base_dir);
+    if !fetched {
+        std::fs::create_dir_all(&context).map_err(|e| {
+            Failure::new(
+                "prepare",
+                format!("could not create {}: {e}", base_dir.display()),
+            )
+        })?;
+        return Ok(context);
+    }
+
+    let missing = || {
+        Failure::new(
+            "fetch",
+            format!(
+                "{} isn't in the repository at {}",
+                base_dir.display(),
+                &commit[..7.min(commit.len())]
+            ),
+        )
+        .with_next_step("Check the app's folder, or push the commit that adds it.")
+    };
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| Failure::new("prepare", format!("could not read the workspace: {e}")))?;
+    let real = context.canonicalize().map_err(|_| missing())?;
+    if !real.starts_with(&root) {
+        return Err(Failure::new(
+            "fetch",
+            format!("{} leads outside the repository", base_dir.display()),
+        ));
+    }
+    if !real.is_dir() {
+        return Err(missing());
+    }
+    Ok(real)
+}
+
 fn write_files(
     workspace: &Path,
     files: &std::collections::BTreeMap<String, String>,
@@ -681,6 +762,77 @@ mod tests {
         let mut big = std::collections::BTreeMap::new();
         big.insert("big".to_string(), "x".repeat(MAX_JOB_FILE_BYTES + 1));
         assert!(write_files(dir.path(), &big).is_err());
+    }
+
+    #[test]
+    fn app_folders_must_stay_inside_the_repository() {
+        for good in ["apps/web", "web", "apps/web/", "services/api-v2"] {
+            assert!(base_dir_path(good).is_ok(), "{good:?} was refused");
+        }
+        let long = "a/".repeat(MAX_BASE_DIR_LEN);
+        for bad in [
+            "",
+            "/apps/web",
+            "../web",
+            "apps/../../web",
+            "./web",
+            ".",
+            long.as_str(),
+        ] {
+            let failure = base_dir_path(bad).unwrap_err();
+            assert!(failure.next_step.is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_apps_folder_is_its_build_context_and_gets_the_job_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("apps/web")).unwrap();
+        let root = repo.path().canonicalize().unwrap();
+
+        assert_eq!(
+            build_context(repo.path(), None, "abcdef1", true).unwrap(),
+            repo.path()
+        );
+
+        let context =
+            build_context(repo.path(), Some(Path::new("apps/web")), "abcdef1", true).unwrap();
+        assert_eq!(context, root.join("apps/web"));
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            ".serveros/Dockerfile".to_string(),
+            "FROM scratch\n".to_string(),
+        );
+        write_files(&context, &files).unwrap();
+        assert!(root.join("apps/web/.serveros/Dockerfile").is_file());
+        assert!(!root.join(".serveros").exists());
+
+        let missing = build_context(repo.path(), Some(Path::new("apps/api")), "abcdef1234", true)
+            .unwrap_err();
+        assert_eq!(
+            missing.message,
+            "apps/api isn't in the repository at abcdef1"
+        );
+
+        std::fs::write(repo.path().join("README"), "").unwrap();
+        assert!(build_context(repo.path(), Some(Path::new("README")), "abcdef1", true).is_err());
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("link")).unwrap();
+        let outside =
+            build_context(repo.path(), Some(Path::new("link")), "abcdef1", true).unwrap_err();
+        assert!(outside.message.contains("outside the repository"));
+
+        // No repository: the job's files are the app, so its folder is made.
+        let files_only = tempfile::tempdir().unwrap();
+        let context = build_context(
+            files_only.path(),
+            Some(Path::new("apps/web")),
+            "abcdef1",
+            false,
+        )
+        .unwrap();
+        assert!(context.is_dir());
     }
 
     #[test]

@@ -1020,6 +1020,13 @@ pub struct DeploySpec {
     /// one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub https: Option<bool>,
+    /// The folder the app is built from, for an app in a monorepo: a path
+    /// relative to the repository's root, like `apps/web`. The image is
+    /// built with it as the context, `dockerfile` is relative to it, and
+    /// `files` are written into it. Compose deploys ignore it, since
+    /// `compose_file` is a path already. Missing builds from the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1297,6 +1304,30 @@ mod tests {
 
         assert_eq!(json["type"], "service_action");
         assert_eq!(json["action"], "reload");
+    }
+
+    #[test]
+    fn deploy_jobs_build_from_a_folder_only_when_given_one() {
+        let raw = serde_json::json!({"type": "deploy", "service": "web", "commit": "abc"});
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(spec.base_dir, None);
+        assert!(serde_json::to_value(&*spec)
+            .unwrap()
+            .get("base_dir")
+            .is_none());
+
+        let raw = serde_json::json!({
+            "type": "deploy",
+            "service": "web",
+            "commit": "abc",
+            "base_dir": "apps/web",
+        });
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(spec.base_dir.as_deref(), Some("apps/web"));
     }
 
     #[test]
