@@ -392,6 +392,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::Tunnel { .. } => "tunnel",
         Job::SiteOptions { .. } => "site_options",
         Job::Traffic { .. } => "traffic",
+        Job::TrafficTiming { .. } => "traffic_timing",
     }
 }
 
@@ -406,6 +407,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::ListDir { .. }
             | Job::TailLogs { .. }
             | Job::PackageUpdates { apply: false, .. }
+            | Job::TrafficTiming { apply: false, .. }
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
             | Job::ResolveRef { .. }
@@ -558,6 +560,23 @@ mod tests {
         };
         assert!(mutates(&tunnel));
         runner.submit(Uuid::new_v4(), command(tunnel)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
+
+        // Adding response times to a site's own config is a change; asking
+        // what it would add is not.
+        let timing = Job::TrafficTiming {
+            site: "nginx.shop.test".into(),
+            apply: true,
+        };
+        assert!(mutates(&timing));
+        assert!(!mutates(&Job::TrafficTiming {
+            site: "nginx.shop.test".into(),
+            apply: false,
+        }));
+        runner.submit(Uuid::new_v4(), command(timing)).await;
         assert_eq!(
             collect_until_terminal(&mut rx).await.last().unwrap().state,
             JobState::Refused

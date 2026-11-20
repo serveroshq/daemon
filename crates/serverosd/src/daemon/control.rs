@@ -201,6 +201,7 @@ async fn backfill(app: &App, link: &Link, from: i64, to: i64) {
                 backfill: true,
                 gap_before,
                 traffic: Vec::new(),
+                traffic_sites: None,
             }))
             .await;
     }
@@ -277,6 +278,7 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                         backfill: true,
                         gap_before,
                         traffic: Vec::new(),
+                        traffic_sites: None,
                     }))
                     .await;
                 }

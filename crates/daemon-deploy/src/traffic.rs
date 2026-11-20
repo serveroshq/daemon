@@ -292,7 +292,7 @@ fn apache_unescape(line: &str) -> String {
     out
 }
 
-fn strip_port(host: &str) -> String {
+pub fn strip_port(host: &str) -> String {
     let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if host.starts_with('[') {
         return host

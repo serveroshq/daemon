@@ -34,6 +34,7 @@ pub async fn run(app: Arc<App>) {
                 backfill: false,
                 gap_before: false,
                 traffic: Vec::new(),
+                traffic_sites: None,
             }))
             .await;
         }

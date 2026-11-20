@@ -8,6 +8,7 @@ description = "The release flow: fetch by commit, build, health check, proxy swa
 [dependencies]
 daemon-core.workspace = true
 daemon-protocol.workspace = true
+daemon-inventory.workspace = true
 daemon-state.workspace = true
 daemon-jobs.workspace = true
 daemon-files.workspace = true

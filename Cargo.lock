@@ -432,6 +432,7 @@ dependencies = [
  "daemon-core",
  "daemon-files",
  "daemon-http",
+ "daemon-inventory",
  "daemon-jobs",
  "daemon-protocol",
  "daemon-state",

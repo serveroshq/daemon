@@ -285,6 +285,51 @@ pub struct TelemetryBatch {
     /// when there are none, so the batch reads as it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub traffic: Vec<TrafficRollup>,
+    /// The sites counted from the machine's own web server configs (not
+    /// ones ServerOS wrote), all of them, when the list changed or every
+    /// few minutes while traffic is on. Left out otherwise, so older
+    /// panels read the batch as they always did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_sites: Option<Vec<TrafficSite>>,
+}
+
+/// A site the daemon counts traffic for that ServerOS didn't write: one
+/// the machine's own nginx or Apache serves from its own config, counted
+/// from the access log that config already writes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficSite {
+    /// Its key in rollups: the server and its first name
+    /// (`nginx.shop.example.com`), or for a log several sites share
+    /// without saying which, the server and the file
+    /// (`nginx.log.access.log-1a2b3c`). Always has a dot, which the keys of
+    /// sites ServerOS writes never have.
+    pub site: String,
+    /// "nginx" or "apache".
+    pub server: String,
+    /// Its server names, first one first.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// The access logs it's counted from.
+    #[serde(default)]
+    pub logs: Vec<String>,
+    /// The lines say how long each request took, so rollups carry p50 and
+    /// p95.
+    #[serde(default)]
+    pub timed: bool,
+    /// Several sites write this log and its lines don't say which, so
+    /// they're counted together as this one.
+    #[serde(default)]
+    pub shared: bool,
+    /// ServerOS added a copy of its log with response times, and counts
+    /// from that.
+    #[serde(default)]
+    pub copy: bool,
+    /// The config files its server blocks or VirtualHosts are in.
+    #[serde(default)]
+    pub configs: Vec<String>,
+    /// Local ports it passes requests on to.
+    #[serde(default)]
+    pub upstream_ports: Vec<u16>,
 }
 
 /// One site's traffic in one whole minute, rolled up on the machine. Sent
@@ -943,6 +988,17 @@ pub enum Job {
     Traffic {
         enabled: bool,
     },
+    /// Response times for one site the machine's own nginx or Apache
+    /// serves (see `TrafficSite`): adds a second access log in ServerOS's
+    /// format to its server blocks, and a log format in a file ServerOS
+    /// owns. Without `apply` it changes nothing and says exactly which
+    /// lines it would add, where. With it, the files are backed up, the
+    /// config is checked and reloaded, and put back if the check fails.
+    TrafficTiming {
+        site: String,
+        #[serde(default)]
+        apply: bool,
+    },
 }
 
 /// The switches on one app's site. All off is a plain site.
@@ -1464,6 +1520,35 @@ mod tests {
         let job: Job = serde_json::from_str(r#"{"type":"traffic","enabled":true}"#).unwrap();
         assert_eq!(job, Job::Traffic { enabled: true });
 
+        let job: Job =
+            serde_json::from_str(r#"{"type":"traffic_timing","site":"nginx.shop.test"}"#).unwrap();
+        assert_eq!(
+            job,
+            Job::TrafficTiming {
+                site: "nginx.shop.test".into(),
+                apply: false
+            }
+        );
+
+        // Sites from the machine's own configs: sent whole, even when none.
+        let sites: TelemetryBatch = serde_json::from_str(
+            r#"{"samples":[],"traffic_sites":[{"site":"nginx.shop.test","server":"nginx","names":["shop.test"],"logs":["/var/log/nginx/access.log"],"shared":true}]}"#,
+        )
+        .unwrap();
+        let listed = sites.traffic_sites.unwrap();
+        assert!(listed[0].shared && !listed[0].timed && listed[0].upstream_ports.is_empty());
+        let none = TelemetryBatch {
+            samples: Vec::new(),
+            backfill: false,
+            gap_before: false,
+            traffic: Vec::new(),
+            traffic_sites: Some(Vec::new()),
+        };
+        assert_eq!(
+            serde_json::to_value(&none).unwrap()["traffic_sites"],
+            serde_json::json!([])
+        );
+
         // A batch without traffic reads and writes as it always did.
         let old: TelemetryBatch = serde_json::from_str(r#"{"samples":[]}"#).unwrap();
         assert!(old.traffic.is_empty());
@@ -1482,8 +1567,10 @@ mod tests {
                 paths: vec![("/".into(), 3)],
                 ..Default::default()
             }],
+            traffic_sites: None,
         };
         let json = serde_json::to_value(&batch).unwrap();
+        assert!(json.get("traffic_sites").is_none());
         assert_eq!(json["traffic"][0]["site"], "shop");
         assert_eq!(json["traffic"][0]["paths"][0][0], "/");
         assert_eq!(json["traffic"][0]["paths"][0][1], 3);

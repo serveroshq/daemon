@@ -1,3 +1,4 @@
+pub mod access_logs;
 pub mod classify;
 pub mod cron;
 pub mod docker;

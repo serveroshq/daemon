@@ -121,13 +121,13 @@ fn apply_nginx_directive(host: &mut VirtualHost, name: &str, args: &[String]) {
     }
 }
 
-enum NginxItem {
+pub(crate) enum NginxItem {
     Open(String),
     Close,
     Directive(String, Vec<String>),
 }
 
-fn nginx_statements(text: &str) -> Vec<NginxItem> {
+pub(crate) fn nginx_statements(text: &str) -> Vec<NginxItem> {
     let mut items = Vec::new();
     let mut tokens: Vec<String> = Vec::new();
     let mut token = String::new();
@@ -142,6 +142,11 @@ fn nginx_statements(text: &str) -> Vec<NginxItem> {
 
     while let Some(c) = chars.next() {
         match (quote, c) {
+            // nginx keeps a backslash-escaped quote inside a quoted string.
+            (Some(q), '\\') if chars.peek() == Some(&q) => {
+                token.push(q);
+                chars.next();
+            }
             (Some(q), ch) if ch == q => quote = None,
             (Some(_), ch) => token.push(ch),
             (None, '\'') | (None, '"') => quote = Some(c),
@@ -177,7 +182,7 @@ fn nginx_statements(text: &str) -> Vec<NginxItem> {
     items
 }
 
-fn expand_include(pattern: &str, prefix: &Path, budget: &mut usize) -> Vec<PathBuf> {
+pub(crate) fn expand_include(pattern: &str, prefix: &Path, budget: &mut usize) -> Vec<PathBuf> {
     let full = if pattern.starts_with('/') {
         PathBuf::from(pattern)
     } else {

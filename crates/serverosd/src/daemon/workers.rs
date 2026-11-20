@@ -132,7 +132,7 @@ async fn telemetry(app: Arc<App>) {
                 }
                 let samples = daemon_telemetry::aggregate::downsample(&std::mem::take(&mut pending), 60);
                 if app.status.read().unwrap().connected {
-                    app.send(Outbound::Telemetry(TelemetryBatch { samples, backfill: false, gap_before: false, traffic: Vec::new() })).await;
+                    app.send(Outbound::Telemetry(TelemetryBatch { samples, backfill: false, gap_before: false, traffic: Vec::new(), traffic_sites: None })).await;
                 }
                 let _ = app.state.prune_samples(daemon_state::State::now() - retention.as_secs() as i64);
             }

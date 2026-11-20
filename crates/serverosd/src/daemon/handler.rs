@@ -1273,15 +1273,91 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 service: "traffic".into(),
             }))?;
             let mut cancel = ctx.cancel.clone();
-            let result = app
-                .deployer
-                .proxy()
-                .set_traffic(enabled, &mut cancel, &ctx.progress)
-                .await;
+            let proxy = app.deployer.proxy();
+            // With no proxy of ServerOS's, only the sites in the machine's
+            // own web server configs are counted.
+            let ours = if proxy.backend == daemon_core::config::ProxyBackend::None {
+                Ok(json!({ "enabled": enabled, "sites": 0 }))
+            } else {
+                proxy.set_traffic(enabled, &mut cancel, &ctx.progress).await
+            };
+            let result = match ours {
+                Ok(mut value) => {
+                    app.state
+                        .kv_set(
+                            super::traffic::EXISTING_KEY,
+                            if enabled { "on" } else { "off" },
+                        )
+                        .map_err(|e| {
+                            Failure::new("traffic", format!("could not save the setting: {e}"))
+                        })?;
+                    let existing = if enabled {
+                        let proxy = proxy.clone();
+                        tokio::task::spawn_blocking(move || {
+                            super::traffic::existing_plan(&proxy).sites.len()
+                        })
+                        .await
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if enabled {
+                        ctx.progress
+                            .line(format!(
+                                "Counting {existing} site(s) from the access logs the web server's own config writes, read only"
+                            ))
+                            .await;
+                    }
+                    value["existing"] = json!(existing);
+                    Ok(value)
+                }
+                Err(failure) => Err(failure),
+            };
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 Some(if enabled { "on" } else { "off" }),
             );
+            result
+        }
+
+        Job::TrafficTiming { site, apply } => {
+            let proxy = app.deployer.proxy();
+            let places = daemon_deploy::timing::Places {
+                traffic_dir: proxy.traffic_dir.clone(),
+                nginx_conf: ["/etc/nginx/nginx.conf", "/usr/local/nginx/conf/nginx.conf"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|p| p.exists())
+                    .unwrap_or_else(|| PathBuf::from("/etc/nginx/nginx.conf")),
+                nginx_format_file: daemon_deploy::timing::NGINX_FORMAT_FILE.into(),
+                backups: app.paths.state_dir.join("backups").join("traffic-timing"),
+            };
+            let planned =
+                tokio::task::spawn_blocking(move || super::traffic::existing_plan(&proxy))
+                    .await
+                    .map_err(|e| {
+                        Failure::new(
+                            "traffic",
+                            format!("could not read the web server config: {e}"),
+                        )
+                    })?;
+            let found = planned.site(&site).ok_or_else(|| {
+                Failure::new(
+                    "traffic",
+                    format!("{site} isn't a site this machine's own web server serves"),
+                )
+            })?;
+            let fix = daemon_deploy::timing::plan_fix(found, &places)?;
+            if !apply {
+                return Ok(fix.describe(false));
+            }
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: format!("traffic-timing:{site}"),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result =
+                daemon_deploy::timing::apply_fix(&fix, &places, &mut cancel, &ctx.progress).await;
+            grant.finish(&result.as_ref().map(|_| ()), Some("response times"));
             result
         }
 
