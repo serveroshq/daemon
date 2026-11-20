@@ -15,6 +15,7 @@ mod ports;
 mod service_ops;
 mod service_stats;
 mod tls_ask;
+mod traffic;
 mod tunnel;
 mod workers;
 

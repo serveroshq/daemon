@@ -18,6 +18,7 @@ pub fn spawn_all(app: Arc<App>) {
     tokio::spawn(discovery(Arc::clone(&app)));
     tokio::spawn(super::service_stats::run(Arc::clone(&app)));
     tokio::spawn(super::log_shipper::run(Arc::clone(&app)));
+    tokio::spawn(super::traffic::run(Arc::clone(&app)));
     tokio::spawn({
         let app = Arc::clone(&app);
         async move {
@@ -131,7 +132,7 @@ async fn telemetry(app: Arc<App>) {
                 }
                 let samples = daemon_telemetry::aggregate::downsample(&std::mem::take(&mut pending), 60);
                 if app.status.read().unwrap().connected {
-                    app.send(Outbound::Telemetry(TelemetryBatch { samples, backfill: false, gap_before: false })).await;
+                    app.send(Outbound::Telemetry(TelemetryBatch { samples, backfill: false, gap_before: false, traffic: Vec::new() })).await;
                 }
                 let _ = app.state.prune_samples(daemon_state::State::now() - retention.as_secs() as i64);
             }

@@ -1256,6 +1256,23 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
+        Job::Traffic { enabled } => {
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: "traffic".into(),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .proxy()
+                .set_traffic(enabled, &mut cancel, &ctx.progress)
+                .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(if enabled { "on" } else { "off" }),
+            );
+            result
+        }
+
         Job::SshKey {
             user,
             action,

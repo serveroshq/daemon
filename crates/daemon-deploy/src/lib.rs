@@ -7,6 +7,7 @@ pub mod native;
 pub mod proxy;
 pub mod releases;
 pub mod site_options;
+pub mod traffic;
 
 pub use deployer::{DeployResult, Deployer};
 pub use releases::{Release, ReleaseLedger};

@@ -6,6 +6,7 @@ use daemon_jobs::{run_child, Failure, Progress};
 use tokio::sync::watch;
 
 use crate::site_options::{self, SiteOptions, MAINTENANCE_PORT, SITES_DIR};
+use crate::traffic::{self, APACHE_LOG_FORMAT, TRAEFIK_LOG, TRAFFIC_LOG_DIR};
 
 pub const CADDYFILE: &str = "/etc/caddy/Caddyfile";
 pub const INCLUDE_DIR: &str = "/etc/caddy/serveros.d";
@@ -17,6 +18,9 @@ const CADDY_IMPORT_LINE: &str = "import /etc/caddy/serveros.d/*.caddy";
 const PLAIN_HTTP_MARKER: &str = ".plain-http";
 
 const MANAGED_HEADER: &str = "# Managed by ServerOS.";
+
+/// Marks traffic as on for every site here, beside the site switches.
+const TRAFFIC_MARKER: &str = ".traffic";
 
 /// Where the daemon answers Caddy's on-demand TLS question ("may I get a
 /// certificate for this name?"), on loopback only.
@@ -57,7 +61,7 @@ const NGINX_INCLUDE_LINE: &str = "include /etc/nginx/serveros.d/*.conf;";
 /// Settings every nginx site of ours shares. Sorts before any site file,
 /// since nginx wants a variable defined before a server block uses it.
 const NGINX_SHARED_FILE: &str = "00-serveros.conf";
-const NGINX_SHARED: &str = "# Written by ServerOS: settings the sites in serveros.d share.\nmap $http_upgrade $serveros_connection_upgrade {\n    default upgrade;\n    ''      close;\n}\n";
+const NGINX_SHARED: &str = "# Written by ServerOS: settings the sites in serveros.d share.\nmap $http_upgrade $serveros_connection_upgrade {\n    default upgrade;\n    ''      close;\n}\n\n# The access log sites write when traffic is on (unused until then).\nlog_format serveros_traffic escape=json '{\"t\":$msec,\"host\":\"$host\",\"ip\":\"$remote_addr\",\"uri\":\"$request_uri\",\"status\":$status,\"bytes\":$body_bytes_sent,\"time\":$request_time,\"referer\":\"$http_referer\",\"ua\":\"$http_user_agent\"}';\n";
 
 pub const APACHE_CONF: &str = "/etc/apache2/apache2.conf";
 pub const APACHE_INCLUDE_DIR: &str = "/etc/apache2/serveros.d";
@@ -193,6 +197,9 @@ pub struct Proxy {
     /// Where each app's site switches are kept (site_options), whichever
     /// proxy serves it.
     pub sites_dir: PathBuf,
+    /// Where sites write the access logs traffic is counted from, when
+    /// it's on.
+    pub traffic_dir: PathBuf,
 }
 
 /// One app's site: the names it answers to and the port on the machine it
@@ -219,6 +226,9 @@ struct Switches {
     /// The password file nginx and Apache read; Caddy and Traefik take the
     /// hash in their config.
     auth_file: Option<PathBuf>,
+    /// The access log this site writes, when traffic is on (Traefik keeps
+    /// one for every site, in its own config).
+    access_log: Option<PathBuf>,
 }
 
 impl Switches {
@@ -238,7 +248,13 @@ impl Switches {
             canonical,
             alias,
             auth_file,
+            access_log: None,
         }
+    }
+
+    fn with_access_log(mut self, access_log: Option<PathBuf>) -> Self {
+        self.access_log = access_log;
+        self
     }
 
     /// Where visitors go: the app, or the daemon's maintenance page.
@@ -396,6 +412,14 @@ pub fn render(domains: &[String], upstream_port: u16, plain_http: bool) -> Resul
 /// password, then the app (or the maintenance page).
 fn caddy_body(switches: &Switches, upstream_port: u16, forwarded_https: bool) -> String {
     let mut out = String::new();
+    if let Some(file) = &switches.access_log {
+        // Rolled at 50 MiB (one backup), in case the daemon isn't there to
+        // read and empty it.
+        out.push_str(&format!(
+            "\tlog {{\n\t\toutput file {} {{\n\t\t\troll_size 50MiB\n\t\t\troll_keep 1\n\t\t\troll_uncompressed\n\t\t}}\n\t\tformat json\n\t}}\n",
+            file.display()
+        ));
+    }
     for r in &switches.options.redirects {
         out.push_str(&format!(
             "\tredir {} {} {}\n",
@@ -547,6 +571,12 @@ fn nginx_proxy(upstream_port: u16, proto: &str) -> String {
 /// alias sends visitors: https, http or `$scheme`.
 fn nginx_locations(switches: &Switches, upstream_port: u16, proto: &str, scheme: &str) -> String {
     let mut out = String::new();
+    if let Some(file) = &switches.access_log {
+        out.push_str(&format!(
+            "    access_log {} serveros_traffic;\n",
+            file.display()
+        ));
+    }
     for r in &switches.options.redirects {
         out.push_str(&format!(
             "    location = {} {{\n        return {} {};\n    }}\n",
@@ -697,6 +727,12 @@ fn apache_names(stem: &str, names: &[&String]) -> String {
 /// mod_proxy), and the password, with certificate challenges left open.
 fn apache_body(switches: &Switches, upstream_port: u16, proto: &str, scheme: &str) -> String {
     let mut out = String::new();
+    if let Some(file) = &switches.access_log {
+        out.push_str(&format!(
+            "    CustomLog {} {APACHE_LOG_FORMAT}\n",
+            file.display()
+        ));
+    }
     if switches.www().is_some() || !switches.options.redirects.is_empty() {
         out.push_str("    RewriteEngine On\n");
         if let Some((alias, canonical)) = switches.www() {
@@ -1061,6 +1097,7 @@ impl Proxy {
             include_dir: include_dir.into(),
             cert_root: LETSENCRYPT_LIVE.into(),
             sites_dir: SITES_DIR.into(),
+            traffic_dir: TRAFFIC_LOG_DIR.into(),
         }
     }
 
@@ -1122,6 +1159,234 @@ impl Proxy {
             .with_next_step("Pick a reverse proxy when you deploy, or publish the port yourself.")
     }
 
+    /// Whether traffic is on: sites write access logs that the daemon rolls
+    /// up and reports. Kept with the site switches, so it outlives deploys
+    /// and proxy switches.
+    pub fn traffic_on(&self) -> bool {
+        self.sites_dir.join(TRAFFIC_MARKER).exists()
+    }
+
+    /// The access log a site writes while traffic is on. Traefik writes one
+    /// for every site, set in its own config.
+    fn access_log(&self, stem: &str) -> Option<PathBuf> {
+        (self.traffic_on() && !matches!(self.backend, ProxyBackend::Traefik | ProxyBackend::None))
+            .then(|| self.traffic_dir.join(format!("{stem}.log")))
+    }
+
+    /// The log files these sites write while traffic is on.
+    fn traffic_files(&self, stems: &[String]) -> Vec<PathBuf> {
+        match self.backend {
+            ProxyBackend::Traefik => vec![self.traffic_dir.join(TRAEFIK_LOG)],
+            ProxyBackend::None => Vec::new(),
+            _ => stems
+                .iter()
+                .map(|stem| self.traffic_dir.join(format!("{stem}.log")))
+                .collect(),
+        }
+    }
+
+    /// What the daemon reads traffic from, while it's on: the logs' format
+    /// and folder.
+    pub fn traffic_source(&self) -> Option<(traffic::Format, PathBuf)> {
+        if !self.traffic_on() {
+            return None;
+        }
+        Some((traffic::Format::of(self.backend)?, self.traffic_dir.clone()))
+    }
+
+    /// Makes the log folder and files before the proxy (or its config
+    /// check, which runs as root) opens them: Caddy and Traefik write as
+    /// their own users, nginx and Apache open logs as root. Nobody else can
+    /// read them, since they hold visitors' addresses until the daemon
+    /// empties them.
+    fn prepare_traffic_logs(&self, files: &[PathBuf]) -> Result<(), Failure> {
+        use std::os::unix::fs::PermissionsExt;
+        let failed = |path: &Path, e: std::io::Error| {
+            Failure::new(
+                "traffic",
+                format!("could not set up {}: {e}", path.display()),
+            )
+        };
+        let dir = &self.traffic_dir;
+        std::fs::create_dir_all(dir).map_err(|e| failed(dir, e))?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o750))
+            .map_err(|e| failed(dir, e))?;
+        let owner = match self.backend {
+            ProxyBackend::Caddy => system_user("caddy"),
+            ProxyBackend::Traefik => system_user("traefik"),
+            _ => None,
+        };
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::chown(dir, Some(uid), Some(gid)).map_err(|e| failed(dir, e))?;
+        }
+        for file in files {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(file)
+                .map_err(|e| failed(file, e))?;
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o640))
+                .map_err(|e| failed(file, e))?;
+            if let Some((uid, gid)) = owner {
+                std::os::unix::fs::chown(file, Some(uid), Some(gid))
+                    .map_err(|e| failed(file, e))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds ServerOS's access log section to a Traefik config it wrote, or
+    /// takes it out. Returns the config as it was when that changed it.
+    /// Traefik reads this config only when it starts.
+    fn set_traefik_access_log(&self, on: bool) -> Result<Option<String>, Failure> {
+        let before = std::fs::read_to_string(&self.main_config).unwrap_or_default();
+        if on && !before.starts_with("# Installed by ServerOS.") {
+            return Err(Failure::new(
+                "traffic",
+                format!(
+                    "Traefik's config ({}) isn't one ServerOS wrote, so it can't add an access log to it",
+                    self.main_config.display()
+                ),
+            )
+            .with_next_step(format!(
+                "Add this to it yourself and restart Traefik, then turn traffic on again:\n{}",
+                traffic::traefik_access_log(&self.traffic_dir.join(TRAEFIK_LOG))
+            )));
+        }
+        let Some(after) =
+            traffic::with_traefik_access_log(&before, &self.traffic_dir.join(TRAEFIK_LOG), on)
+        else {
+            return Ok(None);
+        };
+        std::fs::write(&self.main_config, after).map_err(|e| {
+            Failure::new(
+                "proxy",
+                format!("could not update {}: {e}", self.main_config.display()),
+            )
+        })?;
+        Ok(Some(before))
+    }
+
+    /// Turns traffic on or off for every site ServerOS runs here, rewriting
+    /// their site files at once (no redeploy). A site with traffic off is
+    /// written exactly as before. Traefik keeps its access log in its own
+    /// config, so it restarts (a second or so). If the proxy won't take
+    /// the change, everything is put back as it was.
+    pub async fn set_traffic(
+        &self,
+        on: bool,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<serde_json::Value, Failure> {
+        if self.backend == ProxyBackend::None {
+            return Err(Self::none_configured());
+        }
+        let stems: Vec<String> = self.our_sites().into_iter().map(|(stem, _)| stem).collect();
+        if on {
+            self.prepare_traffic_logs(&self.traffic_files(&stems))?;
+        }
+        if self.backend == ProxyBackend::Nginx {
+            // The shared file defines the log format the sites use.
+            self.ensure_import()?;
+        }
+
+        let was_on = self.traffic_on();
+        let marker = self.sites_dir.join(TRAFFIC_MARKER);
+        let set_marker = |on: bool| -> std::io::Result<()> {
+            if on {
+                std::fs::create_dir_all(&self.sites_dir)?;
+                std::fs::write(
+                    &marker,
+                    "Written by ServerOS: sites here write access logs for their traffic.\n",
+                )
+            } else {
+                match std::fs::remove_file(&marker) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                }
+            }
+        };
+        let traefik_before = if self.backend == ProxyBackend::Traefik {
+            self.set_traefik_access_log(on)?
+        } else {
+            None
+        };
+        let put_back = |rewrites: &[(PathBuf, String, String)]| {
+            for (path, before, _) in rewrites {
+                let _ = std::fs::write(path, before);
+            }
+            let _ = set_marker(was_on);
+            if let Some(config) = &traefik_before {
+                let _ = std::fs::write(&self.main_config, config);
+            }
+        };
+        if let Err(e) = set_marker(on) {
+            put_back(&[]);
+            return Err(Failure::new(
+                "traffic",
+                format!("could not update {}: {e}", marker.display()),
+            ));
+        }
+
+        let rewrites = self.rerendered(self.plain_http());
+        for (path, _, after) in &rewrites {
+            if let Err(e) = std::fs::write(path, after) {
+                put_back(&rewrites);
+                return Err(Failure::new(
+                    "proxy",
+                    format!("could not write {}: {e}", path.display()),
+                ));
+            }
+        }
+        if !rewrites.is_empty() {
+            if let Err(failure) = self.validate(cancel, progress).await {
+                put_back(&rewrites);
+                return Err(failure);
+            }
+            self.reload(cancel, progress).await?;
+        }
+        if traefik_before.is_some() && unit_active("traefik").await {
+            progress
+                .line(
+                    "Restarting Traefik, which reads its access log setting only when it starts"
+                        .to_string(),
+                )
+                .await;
+            if !systemctl(&["restart", "traefik"], cancel, progress).await {
+                put_back(&rewrites);
+                let _ = systemctl(&["restart", "traefik"], cancel, progress).await;
+                return Err(
+                    Failure::new("traffic", "Traefik didn't restart with its access log")
+                        .with_next_step(
+                            "`journalctl -u traefik` says why. Its config is back as it was.",
+                        ),
+                );
+            }
+        }
+
+        if on {
+            progress
+                .line(format!(
+                    "Counting traffic for {} site(s): it shows up a minute or two after the first visits",
+                    stems.len()
+                ))
+                .await;
+        } else {
+            if let Ok(entries) = std::fs::read_dir(&self.traffic_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().extension().is_some_and(|x| x == "log") {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            progress
+                .line("Traffic is off: sites no longer write access logs for it".to_string())
+                .await;
+        }
+
+        Ok(serde_json::json!({ "enabled": on, "sites": stems.len() }))
+    }
+
     /// The site file for one app, as this proxy writes it now, with the
     /// app's switches.
     fn render_site(&self, stem: &str, site: &Site, plain_http: bool) -> Result<String, Failure> {
@@ -1157,7 +1422,7 @@ impl Proxy {
     fn switches(&self, stem: &str, domains: &[String]) -> Switches {
         let options = site_options::load(&self.sites_dir, stem);
         let auth_file = self.uses_auth_file().then(|| self.auth_file(stem));
-        Switches::new(domains, options, auth_file)
+        Switches::new(domains, options, auth_file).with_access_log(self.access_log(stem))
     }
 
     /// nginx and Apache read a site's password from a file of their own;
@@ -1366,7 +1631,12 @@ impl Proxy {
         }
 
         if self.backend == ProxyBackend::Traefik {
-            return self.ensure_traefik_provider();
+            let provider = self.ensure_traefik_provider()?;
+            // A Traefik ServerOS just installed or moved to gets its access
+            // log before it first starts, when traffic is on.
+            let logged =
+                self.traffic_on() && matches!(self.set_traefik_access_log(true), Ok(Some(_)));
+            return Ok(provider || logged);
         }
 
         let existing = std::fs::read_to_string(&self.main_config).unwrap_or_default();
@@ -1468,6 +1738,9 @@ impl Proxy {
         };
         let rendered = self.render_site(&stem, &site, plain_http)?;
         self.write_auth_file(&stem, &site_options::load(&self.sites_dir, &stem))?;
+        if self.traffic_on() {
+            self.prepare_traffic_logs(&self.traffic_files(std::slice::from_ref(&stem)))?;
+        }
         let path = self.site_file(service);
         let previous = std::fs::read(&path).ok();
 
@@ -1699,6 +1972,10 @@ impl Proxy {
         if rewrites.is_empty() {
             return 0;
         }
+        if self.traffic_on() {
+            let stems: Vec<String> = self.our_sites().into_iter().map(|(stem, _)| stem).collect();
+            let _ = self.prepare_traffic_logs(&self.traffic_files(&stems));
+        }
         if self.uses_certbot() {
             let _ = self.ensure_import();
         }
@@ -1869,6 +2146,7 @@ impl Proxy {
             backend: to,
             cert_root: self.cert_root.clone(),
             sites_dir: self.sites_dir.clone(),
+            traffic_dir: self.traffic_dir.clone(),
             ..Proxy::for_backend(to)
         };
         let sites = self.our_sites();
@@ -2387,6 +2665,17 @@ async fn unit_active(unit: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A system user's uid and gid, from /etc/passwd.
+fn system_user(name: &str) -> Option<(u32, u32)> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == name).then_some(())?;
+        let _password = fields.next()?;
+        Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+    })
+}
+
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|d| d.join(program).is_file()))
@@ -2642,6 +2931,7 @@ mod tests {
             include_dir: dir.clone(),
             cert_root: dir.join("live"),
             sites_dir: dir.join("sites"),
+            traffic_dir: dir.join("traffic"),
         };
 
         assert!(proxy.allows_on_demand("tenant-1.acme.io"));
@@ -2709,6 +2999,7 @@ mod tests {
             include_dir: dir.clone(),
             cert_root: dir.join("live"),
             sites_dir: dir.join("sites"),
+            traffic_dir: dir.join("traffic"),
         };
 
         assert!(!proxy.plain_http());
@@ -2740,6 +3031,7 @@ mod tests {
             include_dir: dir.clone(),
             cert_root: dir.join("live"),
             sites_dir: dir.join("sites"),
+            traffic_dir: dir.join("traffic"),
         };
         let (_tx, mut cancel) = watch::channel(false);
         let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
@@ -2831,6 +3123,7 @@ mod tests {
             include_dir: dir.join("serveros.d"),
             cert_root: dir.join("live"),
             sites_dir: dir.join("sites"),
+            traffic_dir: dir.join("traffic"),
         }
     }
 
@@ -3530,6 +3823,243 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Renders shop (acme.io and its wildcard) with traffic on or off, and
+    /// optionally every switch, logging to the real log folder.
+    fn rendered_with_traffic(
+        backend: ProxyBackend,
+        (https, plain_http, cert): (bool, bool, bool),
+        traffic: bool,
+        switches: bool,
+    ) -> String {
+        let dir = temp_dir(&format!(
+            "traffic-{}-{https}-{plain_http}-{cert}-{switches}",
+            backend.label()
+        ));
+        let proxy = Proxy {
+            traffic_dir: PathBuf::from(TRAFFIC_LOG_DIR),
+            ..proxy_in(backend, &dir)
+        };
+        std::fs::create_dir_all(&proxy.sites_dir).unwrap();
+        if switches {
+            site_options::save(&proxy.sites_dir, "shop", &all_switches()).unwrap();
+        }
+        if traffic {
+            std::fs::write(proxy.sites_dir.join(TRAFFIC_MARKER), "").unwrap();
+        }
+        if cert {
+            std::fs::create_dir_all(proxy.cert_dir("shop")).unwrap();
+            std::fs::write(proxy.cert_dir("shop").join("fullchain.pem"), "x").unwrap();
+        }
+        let site = Site {
+            domains: vec!["acme.io".into(), "*.acme.io".into()],
+            port: 4123,
+            https,
+        };
+        assert_eq!(proxy.traffic_on(), traffic);
+        let text = proxy.render_site("shop", &site, plain_http).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        text
+    }
+
+    const MODES: [(bool, bool, bool); 4] = [
+        (true, false, false),
+        (true, false, true),
+        (true, true, false),
+        (false, false, false),
+    ];
+
+    /// The traffic lines of a rendered site taken out again: a Caddy log
+    /// block, an nginx access_log or an Apache CustomLog.
+    fn without_traffic_lines(text: &str) -> String {
+        let mut out = String::new();
+        let mut in_block = false;
+        for line in text.split_inclusive('\n') {
+            if line == "\tlog {\n" {
+                in_block = true;
+                continue;
+            }
+            if in_block {
+                if line == "\t}\n" {
+                    in_block = false;
+                }
+                continue;
+            }
+            if line.contains("serveros_traffic;") || line.trim_start().starts_with("CustomLog ") {
+                continue;
+            }
+            out.push_str(line);
+        }
+        out
+    }
+
+    #[test]
+    fn traffic_only_adds_the_access_log_and_off_is_exactly_as_before() {
+        for backend in [
+            ProxyBackend::Caddy,
+            ProxyBackend::Nginx,
+            ProxyBackend::Apache,
+            ProxyBackend::Traefik,
+        ] {
+            for mode in MODES {
+                for switches in [false, true] {
+                    let label = format!("{} {mode:?} switches={switches}", backend.label());
+                    let off = rendered_with_traffic(backend, mode, false, switches);
+                    let on = rendered_with_traffic(backend, mode, true, switches);
+                    assert_eq!(without_traffic_lines(&on), off, "{label}");
+                    let log = "/var/log/serveros-traffic/shop.log";
+                    match backend {
+                        // Traefik's log is in its own config, for every site.
+                        ProxyBackend::Traefik => assert_eq!(on, off, "{label}"),
+                        _ => assert!(on.contains(log) && !off.contains(log), "{label}"),
+                    }
+                }
+            }
+        }
+
+        // With no switches, off is what the plain renderers always wrote.
+        let domains: Vec<String> = vec!["acme.io".into(), "*.acme.io".into()];
+        assert_eq!(
+            rendered_with_traffic(ProxyBackend::Caddy, MODES[0], false, false),
+            render(&domains, 4123, false).unwrap()
+        );
+        assert_eq!(
+            rendered_with_traffic(ProxyBackend::Nginx, MODES[0], false, false),
+            render_nginx(&domains, 4123, None, false).unwrap()
+        );
+        assert_eq!(
+            rendered_with_traffic(ProxyBackend::Apache, MODES[2], false, false),
+            render_apache("shop", &domains, 4123, None, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn only_blocks_that_serve_the_site_log_it() {
+        // With a certificate: the HTTPS block and the wildcard block log;
+        // the plain HTTP block only sends visitors to HTTPS.
+        let nginx = rendered_with_traffic(ProxyBackend::Nginx, MODES[1], true, false);
+        assert_eq!(nginx.matches("access_log ").count(), 2, "{nginx}");
+        let redirect = nginx.split("server {").nth(1).unwrap();
+        assert!(redirect.contains("return 301 https://$host"));
+        assert!(!redirect.contains("access_log"));
+
+        let apache = rendered_with_traffic(ProxyBackend::Apache, MODES[1], true, false);
+        assert_eq!(apache.matches("CustomLog ").count(), 2, "{apache}");
+        assert!(apache.contains(&format!(
+            "CustomLog /var/log/serveros-traffic/shop.log {APACHE_LOG_FORMAT}\n"
+        )));
+
+        // Caddy: the site and its wildcard, never the www alias's redirect.
+        let caddy = rendered_with_traffic(ProxyBackend::Caddy, MODES[0], true, true);
+        assert_eq!(caddy.matches("\tlog {").count(), 2, "{caddy}");
+        let alias = caddy.split("\nwww.acme.io {").nth(1).unwrap();
+        assert!(!alias.contains("log {"));
+        assert!(caddy.contains("output file /var/log/serveros-traffic/shop.log {"));
+        assert!(caddy.contains("roll_size 50MiB"));
+    }
+
+    #[test]
+    fn the_nginx_log_format_matches_what_the_reader_reads() {
+        assert!(NGINX_SHARED.contains("log_format serveros_traffic escape=json"));
+        // A line as nginx writes it with this format.
+        let line = NGINX_SHARED
+            .split('\'')
+            .nth(3)
+            .unwrap()
+            .replace("$msec", "1763640005.250")
+            .replace("$host", "acme.io")
+            .replace("$remote_addr", "203.0.113.1")
+            .replace("$request_uri", "/a?b")
+            .replace("$status", "200")
+            .replace("$body_bytes_sent", "12")
+            .replace("$request_time", "0.004")
+            .replace("$http_referer", "https://example.org/x")
+            .replace("$http_user_agent", "curl/8");
+        let hit = traffic::parse_line(traffic::Format::Line, &line).unwrap();
+        assert_eq!((hit.ts, hit.status, hit.bytes), (1763640005, 200, 12));
+        assert_eq!(hit.path, "/a");
+        assert_eq!(hit.referrer.as_deref(), Some("example.org"));
+    }
+
+    #[tokio::test]
+    async fn traffic_is_kept_beside_the_switches_and_traefik_gets_its_log() {
+        let dir = temp_dir("traffic-switch");
+        let (_tx, mut cancel) = watch::channel(false);
+        let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let progress = Progress::new(uuid::Uuid::new_v4(), state, tx, vec![]);
+
+        // No sites yet: only the setting and the log folder change.
+        let caddy = proxy_in(ProxyBackend::Caddy, &dir);
+        assert!(caddy.traffic_source().is_none());
+        let result = caddy
+            .set_traffic(true, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(result["enabled"], true);
+        assert!(caddy.traffic_on());
+        assert!(caddy.traffic_dir.is_dir());
+        let (format, from) = caddy.traffic_source().unwrap();
+        assert_eq!(
+            (format, from),
+            (traffic::Format::Caddy, caddy.traffic_dir.clone())
+        );
+
+        std::fs::write(caddy.traffic_dir.join("old.log"), "x").unwrap();
+        caddy
+            .set_traffic(false, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert!(!caddy.traffic_on());
+        assert!(!caddy.traffic_dir.join("old.log").exists());
+
+        // Traefik: its own config gets the access log, someone else's
+        // doesn't, and off takes it out again.
+        let traefik = Proxy {
+            main_config: dir.join("traefik.toml"),
+            ..proxy_in(ProxyBackend::Traefik, &dir)
+        };
+        std::fs::write(&traefik.main_config, fresh_traefik_config()).unwrap();
+        traefik
+            .set_traffic(true, &mut cancel, &progress)
+            .await
+            .unwrap();
+        let config = std::fs::read_to_string(&traefik.main_config).unwrap();
+        assert!(config.starts_with(&fresh_traefik_config()));
+        assert!(config.contains("[accessLog]"));
+        assert!(traefik.traffic_dir.join(TRAEFIK_LOG).exists());
+        traefik
+            .set_traffic(false, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&traefik.main_config).unwrap(),
+            fresh_traefik_config()
+        );
+
+        std::fs::write(
+            &traefik.main_config,
+            "[providers.file]\n  directory = \"x\"\n",
+        )
+        .unwrap();
+        let refused = traefik
+            .set_traffic(true, &mut cancel, &progress)
+            .await
+            .unwrap_err();
+        assert!(
+            refused.message.contains("isn't one ServerOS wrote"),
+            "{}",
+            refused.message
+        );
+        assert!(!traefik.traffic_on());
+
+        let none = proxy_in(ProxyBackend::None, &dir);
+        assert!(none
+            .set_traffic(true, &mut cancel, &progress)
+            .await
+            .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Writes every proxy's site with all switches on to
     /// $SERVEROS_DUMP_SITES, for checking them against the real proxies.
     #[test]
@@ -3540,6 +4070,17 @@ mod tests {
         };
         let out = PathBuf::from(out);
         std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("nginx-shared.conf"), NGINX_SHARED).unwrap();
+        std::fs::write(
+            out.join("traefik-traffic.toml"),
+            traffic::with_traefik_access_log(
+                &fresh_traefik_config(),
+                &Path::new(TRAFFIC_LOG_DIR).join(TRAEFIK_LOG),
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         for backend in [
             ProxyBackend::Caddy,
             ProxyBackend::Nginx,
@@ -3555,6 +4096,15 @@ mod tests {
                 let text = rendered_with_switches(backend, https, plain_http, cert);
                 std::fs::write(
                     out.join(format!("{}-{name}.txt", backend.label().to_lowercase())),
+                    text,
+                )
+                .unwrap();
+                let text = rendered_with_traffic(backend, (https, plain_http, cert), true, false);
+                std::fs::write(
+                    out.join(format!(
+                        "{}-{name}-traffic.txt",
+                        backend.label().to_lowercase()
+                    )),
                     text,
                 )
                 .unwrap();

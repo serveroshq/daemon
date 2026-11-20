@@ -200,6 +200,7 @@ async fn backfill(app: &App, link: &Link, from: i64, to: i64) {
                 samples: chunk.to_vec(),
                 backfill: true,
                 gap_before,
+                traffic: Vec::new(),
             }))
             .await;
     }
@@ -275,6 +276,7 @@ async fn dispatch(app: &Arc<App>, inbound: Inbound) {
                         samples: chunk.to_vec(),
                         backfill: true,
                         gap_before,
+                        traffic: Vec::new(),
                     }))
                     .await;
                 }

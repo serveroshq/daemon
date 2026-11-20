@@ -33,6 +33,7 @@ pub async fn run(app: Arc<App>) {
                 samples,
                 backfill: false,
                 gap_before: false,
+                traffic: Vec::new(),
             }))
             .await;
         }
