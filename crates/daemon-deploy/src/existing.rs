@@ -1251,7 +1251,16 @@ pub fn plan_with(
                 Some((.., writers)) => writers.push(index),
                 None => {
                     if files.len() < MAX_SOURCES {
-                        files.push((log.target.clone(), log.path.clone(), format, vec![index]));
+                        // A log read from a container's output is named as
+                        // that, whatever path its config gives it.
+                        let shown = match &log.target {
+                            LogTarget::Container { stderr: true, .. } => {
+                                PathBuf::from("/dev/stderr")
+                            }
+                            LogTarget::Container { .. } => PathBuf::from("/dev/stdout"),
+                            LogTarget::File(_) => log.path.clone(),
+                        };
+                        files.push((log.target.clone(), shown, format, vec![index]));
                     }
                 }
             }
@@ -2135,6 +2144,7 @@ mod tests {
         );
         let shop = plan.site("traefik-coolify-proxy.shop.test").unwrap();
         assert_eq!(shop.info.container.as_deref(), Some("coolify-proxy"));
+        assert_eq!(shop.info.logs, vec!["/dev/stdout"]);
         assert_eq!(shop.info.upstream_containers, vec!["shop.test-app"]);
         assert!(!shop.info.editable);
         assert_eq!(plan.sources.len(), 1);
