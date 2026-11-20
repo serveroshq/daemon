@@ -8,6 +8,7 @@ mod handler;
 mod local;
 mod log_shipper;
 mod machine;
+mod maintenance;
 mod network;
 mod packages;
 mod ports;
@@ -137,6 +138,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         workers::spawn_all(Arc::clone(&app));
         local::serve(Arc::clone(&app));
         tls_ask::serve(Arc::clone(&app));
+        maintenance::serve(Arc::clone(&app));
         tokio::spawn(network::restore_all(Arc::clone(&app)));
 
         let firewall = app.config.read().unwrap().integrations.firewall;

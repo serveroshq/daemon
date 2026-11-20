@@ -390,6 +390,7 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::ServiceClone { .. } => "service_clone",
         Job::Network(_) => "network",
         Job::Tunnel { .. } => "tunnel",
+        Job::SiteOptions { .. } => "site_options",
     }
 }
 

@@ -33,6 +33,12 @@ impl Handler for JobHandler {
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
+            // Only ever a hash, but there's no reason to keep it in logs.
+            Job::SiteOptions { options, .. } => options
+                .basic_auth
+                .iter()
+                .map(|auth| auth.hash.clone())
+                .collect(),
             // The token as sent and as used (trimmed), so neither form is
             // ever logged or kept.
             Job::Tunnel {
@@ -1232,6 +1238,21 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                     daemon_protocol::TunnelAction::Down => "down",
                 }),
             );
+            result
+        }
+
+        Job::SiteOptions { service, options } => {
+            daemon_deploy::site_options::validate(&options)?;
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: service.clone(),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .proxy()
+                .set_site_options(&service, &options, &mut cancel, &ctx.progress)
+                .await;
+            grant.finish(&result.as_ref().map(|_| ()), Some("site options"));
             result
         }
 

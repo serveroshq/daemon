@@ -888,6 +888,57 @@ pub enum Job {
         #[serde(default)]
         token: Option<String>,
     },
+    /// An app's site switches: a maintenance page, a password in front of
+    /// it and redirects, as exactly these (each job replaces the last).
+    /// Applied to the app's site at once, with no redeploy, and kept
+    /// through later deploys, proxy switches and tunnels. A job of its
+    /// own, so a daemon that predates it refuses it instead of ignoring it.
+    SiteOptions {
+        service: String,
+        #[serde(default)]
+        options: SiteOptions,
+    },
+}
+
+/// The switches on one app's site. All off is a plain site.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteOptions {
+    /// Visitors get a "back soon" page (503) while the app keeps running
+    /// behind it.
+    #[serde(default)]
+    pub maintenance: bool,
+    /// The maintenance page's HTML, instead of the plain default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_html: Option<String>,
+    /// A username and password in front of the site (HTTP basic auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuth>,
+    /// Also answer on the first domain's www name (or its bare name, for a
+    /// www domain) and send visitors there to the first domain.
+    #[serde(default)]
+    pub www_redirect: bool,
+    /// Paths sent somewhere else, checked before the app sees them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<PathRedirect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BasicAuth {
+    pub user: String,
+    /// The password's bcrypt hash. The password itself never leaves the
+    /// panel.
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathRedirect {
+    /// An exact path on the site, like `/old-pricing`.
+    pub from: String,
+    /// A path on the same site (`/pricing`) or a full http(s) address.
+    pub to: String,
+    /// 301 when true, 302 when false.
+    #[serde(default = "default_true")]
+    pub permanent: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
