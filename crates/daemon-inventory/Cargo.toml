@@ -18,6 +18,7 @@ rustls-pemfile.workspace = true
 libc.workspace = true
 tracing.workspace = true
 httparse.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -294,17 +294,21 @@ pub struct TelemetryBatch {
 }
 
 /// A site the daemon counts traffic for that ServerOS didn't write: one
-/// the machine's own nginx or Apache serves from its own config, counted
-/// from the access log that config already writes.
+/// the machine's own nginx, Apache, Caddy or Traefik serves from its own
+/// config (on the machine or in a container), counted from the access log
+/// that config already writes. Sites whose config writes no access log are
+/// listed too, with `unlogged` saying why, so the panel can say so.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrafficSite {
     /// Its key in rollups: the server and its first name
-    /// (`nginx.shop.example.com`), or for a log several sites share
+    /// (`nginx.shop.example.com`, `caddy.any` for a catch-all), with the
+    /// container after a dash when it runs in one
+    /// (`nginx-web.shop.example.com`), or for a log several sites share
     /// without saying which, the server and the file
     /// (`nginx.log.access.log-1a2b3c`). Always has a dot, which the keys of
     /// sites ServerOS writes never have.
     pub site: String,
-    /// "nginx" or "apache".
+    /// "nginx", "apache", "caddy" or "traefik".
     pub server: String,
     /// Its server names, first one first.
     #[serde(default)]
@@ -330,6 +334,35 @@ pub struct TrafficSite {
     /// Local ports it passes requests on to.
     #[serde(default)]
     pub upstream_ports: Vec<u16>,
+    /// The container the web server runs in, by name, when it runs in one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    /// Containers it passes requests on to, by name (Traefik's labels).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_containers: Vec<String>,
+    /// It answers every host no other site does (no host in its config).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub catch_all: bool,
+    /// The folders it serves files from (`root`, `DocumentRoot`, Caddy's
+    /// `root`), so the panel can tie it to the app that lives there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
+    /// Local sockets it passes requests on to (php-fpm's, most often).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sockets: Vec<String>,
+    /// Why nothing is counted, when nothing is: "off" (its config writes no
+    /// access log) or "elsewhere" (to syslog, the journal or a pipe, which
+    /// can't be read). None for a site that's counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unlogged: Option<String>,
+    /// ServerOS can change its config on request (`TrafficLogging`): a
+    /// config file on this machine, not one inside a container image or a
+    /// config only an API holds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editable: bool,
+    /// Set by hand (`TrafficSource`): a log file an app writes itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
 }
 
 /// One site's traffic in one whole minute, rolled up on the machine. Sent
@@ -999,6 +1032,39 @@ pub enum Job {
         #[serde(default)]
         apply: bool,
     },
+    /// Starts (`add`) or stops (`remove`) ServerOS's own access log for one
+    /// site of the machine's own web server (see `TrafficSite`): for a site
+    /// whose config writes no log, a log of ServerOS's own in its block
+    /// (Caddy: a named `log`; nginx and Apache: the same copy as
+    /// `TrafficTiming`; Traefik on the machine: an `accessLog` section).
+    /// `remove` takes out exactly the lines ServerOS added, for either job.
+    /// Without `apply` nothing changes and the result lists every line and
+    /// where. With it, files are backed up, the config is checked, put back
+    /// if the check fails, and the server reloaded. A job of its own, so an
+    /// older daemon refuses it.
+    TrafficLogging {
+        site: String,
+        action: TrafficLoggingAction,
+        #[serde(default)]
+        apply: bool,
+    },
+    /// Counts a log file an app writes itself (common, combined or JSON
+    /// lines), for an app with no web server in front: `add` with a name
+    /// and the file, `remove` by the site's key. Kept by the daemon.
+    TrafficSource {
+        action: TrafficLoggingAction,
+        /// The site's name (`add`) or key (`remove`).
+        name: String,
+        #[serde(default)]
+        path: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrafficLoggingAction {
+    Add,
+    Remove,
 }
 
 /// The switches on one app's site. All off is a plain site.

@@ -2666,7 +2666,7 @@ async fn unit_active(unit: &str) -> bool {
 }
 
 /// A system user's uid and gid, from /etc/passwd.
-fn system_user(name: &str) -> Option<(u32, u32)> {
+pub(crate) fn system_user(name: &str) -> Option<(u32, u32)> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');

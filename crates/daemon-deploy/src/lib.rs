@@ -4,6 +4,7 @@ pub mod deployer;
 pub mod existing;
 pub mod git;
 pub mod health;
+pub mod logging;
 pub mod native;
 pub mod proxy;
 pub mod registry;

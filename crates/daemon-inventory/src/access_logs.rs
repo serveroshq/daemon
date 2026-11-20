@@ -1,13 +1,17 @@
 //! Where the sites nginx and Apache already serve write their access logs,
 //! as their own configs say: each server block's or VirtualHost's
 //! `access_log` / `CustomLog`, or the one it inherits from the http block or
-//! the main server, and the line format of each file. Read-only: this only
-//! reads config files.
+//! the main server, and the line format of each file. The same for a server
+//! running in a container, read through its process's root, where a log
+//! that points at the container's output is read from the container's
+//! logs. Caddy and Traefik sites (see `caddy`, `traefik`) are described the
+//! same way. Read-only: this only reads config files.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::webservers::{expand_include, nginx_statements, NginxItem};
+use crate::procs::{glob_in, read_in, resolve_in, Resolved};
+use crate::webservers::{nginx_statements, NginxItem};
 
 /// nginx's built-in format, used when an `access_log` names none.
 pub const NGINX_COMBINED: &str = "$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"";
@@ -28,11 +32,11 @@ const APACHE_DEFAULTS: &[(&str, &str)] = &[
 
 const MAX_FILES: usize = 400;
 
-/// One site's server block (nginx) or VirtualHost (Apache), as far as its
-/// access logs go.
+/// One site's server block (nginx), VirtualHost (Apache), route (Caddy) or
+/// router (Traefik), as far as its access logs go.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VhostLogs {
-    /// "nginx" or "apache".
+    /// "nginx", "apache", "caddy" or "traefik".
     pub server: String,
     pub names: Vec<String>,
     /// The file the block is in.
@@ -50,16 +54,73 @@ pub struct VhostLogs {
     /// The block names no log of its own, so `logs` are the ones it
     /// inherits from the http block (nginx) or the main server (Apache).
     pub inherited: bool,
+    /// The container the server runs in, when it runs in one.
+    pub container: Option<Container>,
+    /// It answers every host no other site does.
+    pub catch_all: bool,
+    /// The folders it serves files from.
+    pub roots: Vec<String>,
+    /// Local sockets it passes requests on to (php-fpm's).
+    pub sockets: Vec<String>,
+    /// Why it has no log that can be read: "off" or "elsewhere".
+    pub unlogged: Option<String>,
+    /// Its config is a file on this machine that ServerOS could change on
+    /// request.
+    pub editable: bool,
+    /// Traefik: its routers' full names (`shop@docker`).
+    pub routers: Vec<String>,
+    /// Containers it passes requests on to, by name (Traefik's labels).
+    pub upstream_containers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Container {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogFile {
+    /// As its config names it (inside the container, for one).
     pub path: PathBuf,
-    /// The log line template: an nginx `log_format` or Apache `LogFormat`.
+    /// The log line template: an nginx `log_format` or Apache `LogFormat`,
+    /// or for Caddy and Traefik one of the `FORMAT_*` names.
     pub format: String,
     /// The format's name in the config, when it has one (`combined`).
     pub format_name: Option<String>,
+    /// Where its lines are read from.
+    pub target: LogTarget,
 }
+
+impl LogFile {
+    /// A file on this machine, at the path its config names.
+    pub fn file(path: impl Into<PathBuf>, format: &str, format_name: Option<&str>) -> Self {
+        let path = path.into();
+        Self {
+            target: LogTarget::File(path.clone()),
+            path,
+            format: format.to_string(),
+            format_name: format_name.map(str::to_string),
+        }
+    }
+}
+
+/// Where a log's lines can be read.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LogTarget {
+    /// A file, as seen from the machine.
+    File(PathBuf),
+    /// A container's output, as Docker keeps it.
+    Container { id: String, stderr: bool },
+}
+
+/// Caddy's JSON access log lines, and its console ones (a JSON object after
+/// tab-separated time, level and logger).
+pub const FORMAT_CADDY: &str = "@caddy-json";
+pub const FORMAT_CADDY_CONSOLE: &str = "@caddy-console";
+/// Traefik's JSON access log, and its default common one.
+pub const FORMAT_TRAEFIK: &str = "@traefik-json";
+pub const FORMAT_TRAEFIK_COMMON: &str = "@traefik-common";
 
 /// Where to look. The real paths in production; folders in tests.
 #[derive(Debug, Clone)]
@@ -67,6 +128,10 @@ pub struct Paths {
     pub nginx_confs: Vec<(PathBuf, PathBuf)>,
     pub apache_confs: Vec<(PathBuf, PathBuf)>,
     pub apache_envvars: PathBuf,
+    /// Where these paths are, as seen from here: `/`, or a container's
+    /// process's root.
+    pub root: PathBuf,
+    pub container: Option<Container>,
 }
 
 impl Default for Paths {
@@ -84,7 +149,58 @@ impl Default for Paths {
                 ("/etc/httpd/conf/httpd.conf".into(), "/etc/httpd".into()),
             ],
             apache_envvars: "/etc/apache2/envvars".into(),
+            root: "/".into(),
+            container: None,
         }
+    }
+}
+
+impl Paths {
+    /// Where nginx and Apache usually keep their config in a container
+    /// (official images, Debian and Alpine based ones), seen through its
+    /// root. `config` is the file its command line names, when it does.
+    pub fn in_container(
+        root: PathBuf,
+        container: Container,
+        server: &str,
+        config: Option<PathBuf>,
+    ) -> Self {
+        let mut paths = Self {
+            root,
+            container: Some(container),
+            ..Self::default()
+        };
+        paths.apache_confs.insert(
+            0,
+            (
+                "/usr/local/apache2/conf/httpd.conf".into(),
+                "/usr/local/apache2".into(),
+            ),
+        );
+        if let Some(config) = config {
+            let prefix = config
+                .parent()
+                .map(|p| {
+                    if server == "apache" && p.ends_with("conf") {
+                        p.parent().unwrap_or(p).to_path_buf()
+                    } else {
+                        p.to_path_buf()
+                    }
+                })
+                .unwrap_or_else(|| PathBuf::from("/"));
+            let list = if server == "nginx" {
+                &mut paths.nginx_confs
+            } else {
+                &mut paths.apache_confs
+            };
+            list.insert(0, (config, prefix));
+        }
+        if server == "nginx" {
+            paths.apache_confs.clear();
+        } else {
+            paths.nginx_confs.clear();
+        }
+        paths
     }
 }
 
@@ -96,26 +212,54 @@ pub fn discover() -> Vec<VhostLogs> {
 
 pub fn discover_in(paths: &Paths) -> Vec<VhostLogs> {
     let mut found = Vec::new();
+    let root = paths.root.as_path();
     for (conf, prefix) in &paths.nginx_confs {
-        if let Ok(text) = std::fs::read_to_string(conf) {
-            found.extend(nginx(&text, conf, prefix));
+        if let Some(text) = read_in(root, conf) {
+            found.extend(nginx(&text, conf, prefix, paths));
             break;
         }
     }
-    for (conf, root) in &paths.apache_confs {
-        if let Ok(text) = std::fs::read_to_string(conf) {
-            let env = apache_envvars(&paths.apache_envvars);
-            found.extend(apache(&text, conf, root, &env));
+    for (conf, server_root) in &paths.apache_confs {
+        if let Some(text) = read_in(root, conf) {
+            let env = apache_envvars(read_in(root, &paths.apache_envvars));
+            found.extend(apache(&text, conf, server_root, &env, paths));
             break;
         }
+    }
+    let editable = paths.container.is_none();
+    for host in &mut found {
+        host.container = paths.container.clone();
+        host.editable = editable;
     }
     found
+}
+
+/// Where a log's lines can be read, from the path its config names, and
+/// None when they can't (a host server's own output goes to the journal).
+pub fn target_of(paths: &Paths, path: &Path) -> Option<LogTarget> {
+    match (resolve_in(&paths.root, path), &paths.container) {
+        (Resolved::File(file), _) => Some(LogTarget::File(file)),
+        (Resolved::Stdout, Some(c)) => Some(LogTarget::Container {
+            id: c.id.clone(),
+            stderr: false,
+        }),
+        (Resolved::Stderr, Some(c)) => Some(LogTarget::Container {
+            id: c.id.clone(),
+            stderr: true,
+        }),
+        (_, None) => None,
+    }
 }
 
 #[derive(Debug, Clone)]
 enum RawLog {
     Off,
-    File { path: String, format: String },
+    /// Somewhere that can't be read: syslog, memory, a compressed file.
+    Elsewhere,
+    File {
+        path: String,
+        format: String,
+    },
 }
 
 fn nginx_access_log(args: &[String]) -> Option<RawLog> {
@@ -126,10 +270,9 @@ fn nginx_access_log(args: &[String]) -> Option<RawLog> {
     let unreadable = first.starts_with("syslog:")
         || first.starts_with("memory:")
         || first.contains('$')
-        || first.starts_with("/dev/")
         || args.iter().skip(1).any(|a| a.starts_with("gzip"));
     if unreadable {
-        return None;
+        return Some(RawLog::Elsewhere);
     }
     let format = args
         .get(1)
@@ -151,6 +294,7 @@ struct Server {
 
 #[derive(Default)]
 struct NginxWalk {
+    root: PathBuf,
     budget: usize,
     formats: HashMap<String, String>,
     http: Vec<RawLog>,
@@ -206,8 +350,9 @@ impl NginxWalk {
         match name {
             "include" => {
                 for pattern in args {
-                    for file in expand_include(pattern, prefix, &mut self.budget) {
-                        let Ok(inner) = std::fs::read_to_string(&file) else {
+                    let pattern = resolve(prefix, pattern);
+                    for file in glob_in(&self.root, &pattern, &mut self.budget) {
+                        let Some(inner) = read_in(&self.root, &file) else {
                             continue;
                         };
                         match open {
@@ -267,6 +412,13 @@ impl NginxWalk {
                 let Some((index, _)) = open else { return };
                 let host = &mut self.servers[index].host;
                 match name {
+                    "root" => {
+                        if let Some(root) = args.first().filter(|r| !r.contains('$')) {
+                            if !host.roots.contains(root) {
+                                host.roots.push(root.clone());
+                            }
+                        }
+                    }
                     "server_name" => {
                         for a in args {
                             if a != "_" && !a.is_empty() && !host.names.contains(a) {
@@ -288,10 +440,15 @@ impl NginxWalk {
                             host.default_server = true;
                         }
                     }
-                    "proxy_pass" | "fastcgi_pass" | "uwsgi_pass" => {
-                        if let Some(port) = args.first().and_then(|t| local_port(t)) {
+                    "proxy_pass" | "fastcgi_pass" | "uwsgi_pass" | "grpc_pass" => {
+                        let Some(target) = args.first() else { return };
+                        if let Some(port) = local_port(target) {
                             if !host.upstream_ports.contains(&port) {
                                 host.upstream_ports.push(port);
+                            }
+                        } else if let Some(socket) = unix_socket(target) {
+                            if !host.sockets.contains(&socket) {
+                                host.sockets.push(socket);
                             }
                         }
                     }
@@ -313,6 +470,25 @@ fn local_port(target: &str) -> Option<u16> {
         .flatten()
 }
 
+/// The path of a unix socket upstream: `unix:/run/php/php8.3-fpm.sock`,
+/// `http://unix:/run/app.sock:/`, Apache's `unix:/run/php.sock|fcgi://x`,
+/// Caddy's `unix//run/php.sock`.
+pub fn unix_socket(target: &str) -> Option<String> {
+    let at = target
+        .find("unix:")
+        .map(|i| i + 5)
+        .or_else(|| target.strip_prefix("unix/").map(|_| 5))?;
+    let rest = &target[at..];
+    let path: String = rest
+        .split(['|', ' '])
+        .next()?
+        .split(":/")
+        .next()?
+        .trim_end_matches(':')
+        .to_string();
+    (path.starts_with('/') && path.len() > 1).then_some(path)
+}
+
 fn resolve(base: &Path, path: &str) -> PathBuf {
     if path.starts_with('/') {
         PathBuf::from(path)
@@ -321,8 +497,9 @@ fn resolve(base: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn nginx(text: &str, conf: &Path, prefix: &Path) -> Vec<VhostLogs> {
+fn nginx(text: &str, conf: &Path, prefix: &Path, paths: &Paths) -> Vec<VhostLogs> {
     let mut walk = NginxWalk {
+        root: paths.root.clone(),
         budget: MAX_FILES,
         ..Default::default()
     };
@@ -340,14 +517,25 @@ fn nginx(text: &str, conf: &Path, prefix: &Path) -> Vec<VhostLogs> {
         }
         logs.iter()
             .filter_map(|log| match log {
-                RawLog::File { path, format } => Some(LogFile {
-                    path: resolve(prefix, path),
-                    format: format_of(format)?,
-                    format_name: Some(format.clone()),
-                }),
-                RawLog::Off => None,
+                RawLog::File { path, format } => {
+                    let path = resolve(prefix, path);
+                    Some(LogFile {
+                        target: target_of(paths, &path)?,
+                        path,
+                        format: format_of(format)?,
+                        format_name: Some(format.clone()),
+                    })
+                }
+                RawLog::Off | RawLog::Elsewhere => None,
             })
             .collect()
+    };
+    let why = |logs: &[RawLog]| -> &'static str {
+        if logs.is_empty() || logs.iter().any(|l| matches!(l, RawLog::Off)) {
+            "off"
+        } else {
+            "elsewhere"
+        }
     };
     // With no access_log at all, nginx writes its built-in log.
     let http = if walk.http.is_empty() {
@@ -371,6 +559,9 @@ fn nginx(text: &str, conf: &Path, prefix: &Path) -> Vec<VhostLogs> {
                 }
             }
             host.inherited = inherited;
+            if host.logs.is_empty() {
+                host.unlogged = Some(why(if inherited { &http } else { &server.own }).to_string());
+            }
             host
         })
         .collect()
@@ -378,9 +569,9 @@ fn nginx(text: &str, conf: &Path, prefix: &Path) -> Vec<VhostLogs> {
 
 /// The variables Debian's apache2ctl sets from /etc/apache2/envvars
 /// (`APACHE_LOG_DIR` most of all).
-fn apache_envvars(path: &Path) -> HashMap<String, String> {
+fn apache_envvars(text: Option<String>) -> HashMap<String, String> {
     let mut env = HashMap::from([("APACHE_LOG_DIR".to_string(), "/var/log/apache2".to_string())]);
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = text else {
         return env;
     };
     for line in text.lines() {
@@ -458,6 +649,7 @@ fn substitute(text: &str, env: &HashMap<String, String>) -> Option<String> {
 }
 
 struct ApacheWalk<'a> {
+    fs_root: PathBuf,
     budget: usize,
     env: &'a HashMap<String, String>,
     root: PathBuf,
@@ -532,24 +724,14 @@ impl ApacheWalk<'_> {
             "include" | "includeoptional" => {
                 for pattern in args {
                     let full = resolve(&self.root, pattern);
-                    let files = if full.is_dir() {
-                        let mut files: Vec<PathBuf> = std::fs::read_dir(&full)
-                            .map(|entries| entries.flatten().map(|e| e.path()).collect())
-                            .unwrap_or_default();
-                        files.retain(|f| f.is_file());
-                        files.sort();
-                        files
+                    let is_dir = matches!(resolve_in(&self.fs_root, &full), Resolved::File(ref d) if d.is_dir());
+                    let files = if is_dir {
+                        glob_in(&self.fs_root, &full.join("*"), &mut self.budget)
                     } else {
-                        expand_include(&full.to_string_lossy(), &self.root, &mut self.budget)
+                        glob_in(&self.fs_root, &full, &mut self.budget)
                     };
                     for file in files {
-                        if self.budget == 0 && full.is_dir() {
-                            break;
-                        }
-                        if full.is_dir() {
-                            self.budget -= 1;
-                        }
-                        if let Ok(text) = std::fs::read_to_string(&file) {
+                        if let Some(text) = read_in(&self.fs_root, &file) {
                             self.walk(&text, &file.to_string_lossy(), open);
                         }
                     }
@@ -562,10 +744,11 @@ impl ApacheWalk<'_> {
             }
             "customlog" => {
                 let [target, format, ..] = args else { return };
-                if target.starts_with('|') || target.contains("syslog:") {
-                    return;
-                }
-                let log = (target.clone(), format.clone());
+                let log = if target.starts_with('|') || target.contains("syslog:") {
+                    ("|".to_string(), String::new())
+                } else {
+                    (target.clone(), format.clone())
+                };
                 match open {
                     Some(index) => self.hosts[*index].1.push(log),
                     None => self.main.push(log),
@@ -590,10 +773,24 @@ impl ApacheWalk<'_> {
                             }
                         }
                     }
-                    "proxypass" => {
-                        if let Some(port) = args.get(1).and_then(|t| local_port(t)) {
-                            if !host.upstream_ports.contains(&port) {
-                                host.upstream_ports.push(port);
+                    "proxypass" | "proxypassmatch" | "sethandler" => {
+                        for target in args.iter().skip(usize::from(key != "sethandler")).take(1) {
+                            if let Some(port) = local_port(target) {
+                                if !host.upstream_ports.contains(&port) {
+                                    host.upstream_ports.push(port);
+                                }
+                            } else if let Some(socket) = unix_socket(target) {
+                                if !host.sockets.contains(&socket) {
+                                    host.sockets.push(socket);
+                                }
+                            }
+                        }
+                    }
+                    "documentroot" => {
+                        if let Some(root) = args.first() {
+                            let root = root.trim_end_matches('/').to_string();
+                            if !root.is_empty() && !host.roots.contains(&root) {
+                                host.roots.push(root);
                             }
                         }
                     }
@@ -604,8 +801,15 @@ impl ApacheWalk<'_> {
     }
 }
 
-fn apache(text: &str, conf: &Path, root: &Path, env: &HashMap<String, String>) -> Vec<VhostLogs> {
+fn apache(
+    text: &str,
+    conf: &Path,
+    root: &Path,
+    env: &HashMap<String, String>,
+    paths: &Paths,
+) -> Vec<VhostLogs> {
     let mut walk = ApacheWalk {
+        fs_root: paths.root.clone(),
         budget: MAX_FILES,
         env,
         root: root.to_path_buf(),
@@ -629,10 +833,13 @@ fn apache(text: &str, conf: &Path, root: &Path, env: &HashMap<String, String>) -
     };
     let files = |logs: &[(String, String)]| -> Vec<LogFile> {
         logs.iter()
+            .filter(|(path, _)| path != "|")
             .filter_map(|(path, format)| {
                 let (format, format_name) = format_of(format)?;
+                let path = resolve(&root, path);
                 Some(LogFile {
-                    path: resolve(&root, path),
+                    target: target_of(paths, &path)?,
+                    path,
                     format,
                     format_name,
                 })
@@ -645,7 +852,11 @@ fn apache(text: &str, conf: &Path, root: &Path, env: &HashMap<String, String>) -
         .map(|(host, own)| {
             let mut host = host.clone();
             host.inherited = own.is_empty();
-            host.logs = files(if host.inherited { &walk.main } else { own });
+            let logs = if host.inherited { &walk.main } else { own };
+            host.logs = files(logs);
+            if host.logs.is_empty() {
+                host.unlogged = Some(if logs.is_empty() { "off" } else { "elsewhere" }.to_string());
+            }
             host
         })
         .collect()
@@ -666,6 +877,7 @@ mod tests {
             nginx_confs: vec![(dir.join("nginx/nginx.conf"), dir.join("nginx"))],
             apache_confs: vec![(dir.join("apache2/apache2.conf"), dir.join("apache2"))],
             apache_envvars: dir.join("apache2/envvars"),
+            ..Paths::default()
         }
     }
 
@@ -700,6 +912,8 @@ mod tests {
         // sites-enabled is read in name order: quiet, then shop.
         assert_eq!(found[0].names, vec!["quiet.test"]);
         assert!(found[0].logs.is_empty());
+        assert_eq!(found[0].unlogged.as_deref(), Some("off"));
+        assert!(found[0].editable);
 
         let plain = &found[1];
         assert_eq!(plain.names, vec!["shop.test", "www.shop.test"]);
@@ -707,11 +921,11 @@ mod tests {
         assert_eq!(plain.block, 0);
         assert_eq!(
             plain.logs,
-            vec![LogFile {
-                path: "/var/log/nginx/access.log".into(),
-                format: NGINX_COMBINED.into(),
-                format_name: Some("combined".into()),
-            }]
+            vec![LogFile::file(
+                "/var/log/nginx/access.log",
+                NGINX_COMBINED,
+                Some("combined")
+            )]
         );
 
         let tls = &found[2];
@@ -727,6 +941,75 @@ mod tests {
             ]
         );
         assert!(tls.logs[0].format.ends_with("$request_time"));
+        assert_eq!(plain.roots, vec!["/var/www/shop/public"]);
+        assert_eq!(plain.unlogged, None);
+    }
+
+    #[test]
+    fn sockets_are_read_from_every_way_of_writing_them() {
+        assert_eq!(
+            unix_socket("unix:/run/php/php8.3-fpm.sock").as_deref(),
+            Some("/run/php/php8.3-fpm.sock")
+        );
+        assert_eq!(
+            unix_socket("http://unix:/run/app.sock:/").as_deref(),
+            Some("/run/app.sock")
+        );
+        assert_eq!(
+            unix_socket("proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost").as_deref(),
+            Some("/run/php/php8.2-fpm.sock")
+        );
+        assert_eq!(
+            unix_socket("unix//run/php/php8.4-fpm.sock").as_deref(),
+            Some("/run/php/php8.4-fpm.sock")
+        );
+        assert_eq!(unix_socket("http://127.0.0.1:3000"), None);
+    }
+
+    /// nginx's official image, seen through a container's root: its log
+    /// is the container's output, its config is read inside the root.
+    #[test]
+    fn nginx_in_a_container_logs_to_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "etc/nginx/nginx.conf",
+            "events {}\nhttp {\n  access_log /var/log/nginx/access.log main;\n  log_format main '$remote_addr - $remote_user [$time_local] \"$request\" $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\"';\n  include /etc/nginx/conf.d/*.conf;\n}\n",
+        );
+        write(
+            root,
+            "etc/nginx/conf.d/default.conf",
+            "server {\n  listen 80;\n  server_name shop.test;\n  location / { root /usr/share/nginx/html; }\n  location /api { fastcgi_pass unix:/run/php/php-fpm.sock; }\n}\nserver { server_name quiet.test; access_log off; }\n",
+        );
+        std::fs::create_dir_all(root.join("var/log/nginx")).unwrap();
+        std::os::unix::fs::symlink("/dev/stdout", root.join("var/log/nginx/access.log")).unwrap();
+        let container = Container {
+            id: "c".repeat(64),
+            name: "web".into(),
+        };
+        let paths = Paths::in_container(root.to_path_buf(), container.clone(), "nginx", None);
+        let found = discover_in(&paths);
+        assert_eq!(found.len(), 2, "{found:#?}");
+        let shop = &found[0];
+        assert_eq!(shop.names, vec!["shop.test"]);
+        assert_eq!(shop.config_path, "/etc/nginx/conf.d/default.conf");
+        assert_eq!(shop.container.as_ref(), Some(&container));
+        assert!(!shop.editable);
+        assert_eq!(
+            shop.logs[0].path,
+            PathBuf::from("/var/log/nginx/access.log")
+        );
+        assert_eq!(
+            shop.logs[0].target,
+            LogTarget::Container {
+                id: "c".repeat(64),
+                stderr: false
+            }
+        );
+        assert_eq!(shop.roots, vec!["/usr/share/nginx/html"]);
+        assert_eq!(shop.sockets, vec!["/run/php/php-fpm.sock"]);
+        assert_eq!(found[1].unlogged.as_deref(), Some("off"));
     }
 
     #[test]
@@ -759,11 +1042,11 @@ mod tests {
         assert_eq!(found[0].names, vec!["blog.test", "www.blog.test"]);
         assert_eq!(
             found[0].logs,
-            vec![LogFile {
-                path: "/var/log/apache2/access.log".into(),
-                format: "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"".into(),
-                format_name: Some("combined".into()),
-            }]
+            vec![LogFile::file(
+                "/var/log/apache2/access.log",
+                "%h %l %u %t \"%r\" %>s %O \"%{Referer}i\" \"%{User-Agent}i\"",
+                Some("combined")
+            )]
         );
         assert!(found[1].inherited);
         assert_eq!(found[1].upstream_ports, vec![4000]);

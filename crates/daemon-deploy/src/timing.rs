@@ -30,10 +30,15 @@ pub const NGINX_FORMAT: &str = "serveros_timed";
 /// a log format defined before an access_log names it.
 pub const NGINX_FORMAT_FILE: &str = "/etc/nginx/conf.d/00-serveros-timing.conf";
 const FORMAT_FILE_TEXT: &str = "# Written by ServerOS: the format of the copies of access logs it reads\n# for response times. Used by lines it added to your server blocks, each\n# marked \"Added by ServerOS\".\nlog_format serveros_timed escape=json '{\"t\":$msec,\"host\":\"$host\",\"ip\":\"$remote_addr\",\"uri\":\"$request_uri\",\"status\":$status,\"bytes\":$body_bytes_sent,\"time\":$request_time,\"referer\":\"$http_referer\",\"ua\":\"$http_user_agent\"}';\n";
-const COPY_COMMENT: &str =
+pub(crate) const COPY_COMMENT: &str =
     "# Added by ServerOS: a copy of this site's access log with response times.";
-const KEPT_COMMENT: &str =
+pub(crate) const KEPT_COMMENT: &str =
     "# Added by ServerOS: the access log this block already wrote, so it still does.";
+/// Put above a block's own `access_log off;`, which is commented out while
+/// ServerOS logs the site (nginx writes no log at all on that level while
+/// it's there), and put back when it stops.
+pub(crate) const OFF_COMMENT: &str =
+    "# Added by ServerOS: the next line was access_log off; it comes back when ServerOS stops logging this site.";
 
 /// Where things are. The real paths in production; folders in tests.
 #[derive(Debug, Clone)]
@@ -72,6 +77,13 @@ pub struct TimingFix {
     pub copies: Vec<PathBuf>,
     pub check: Vec<String>,
     pub reload: Vec<String>,
+    /// Run after the reload until it succeeds (a few tries): for a server
+    /// with no config check, that it came back up.
+    pub verify: Vec<String>,
+    /// The user the server writes its logs as, when that isn't root.
+    pub owner: Option<String>,
+    /// Takes ServerOS's lines out rather than adding them.
+    pub remove: bool,
 }
 
 impl TimingFix {
@@ -94,23 +106,25 @@ impl TimingFix {
         json!({
             "site": self.site,
             "server": self.server,
+            "action": if self.remove { "remove" } else { "add" },
             "applied": applied,
             "changes": places,
             "copies": self.copies.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
             "check": self.check.join(" "),
             "reload": self.reload.join(" "),
+            "verify": self.verify.join(" "),
         })
     }
 }
 
-fn refuse(message: impl Into<String>) -> Failure {
+pub(crate) fn refuse(message: impl Into<String>) -> Failure {
     Failure::new("traffic", message.into())
 }
 
 /// The byte ranges of the server blocks in an nginx file whose parent is
 /// the http block (or the file itself, for an included site file): the
 /// index of `{` and of its `}`.
-fn nginx_server_blocks(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn nginx_server_blocks(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut blocks = Vec::new();
     let mut stack: Vec<(String, Option<usize>)> = Vec::new();
@@ -171,7 +185,7 @@ fn nginx_server_blocks(text: &str) -> Vec<(usize, usize)> {
 
 /// The line ranges of an Apache file's VirtualHosts: the index of the line
 /// that opens each and the one that closes it.
-fn apache_vhosts(text: &str) -> Vec<(usize, usize)> {
+pub(crate) fn apache_vhosts(text: &str) -> Vec<(usize, usize)> {
     let mut found = Vec::new();
     let mut open = None;
     for (n, line) in text.lines().enumerate() {
@@ -187,12 +201,12 @@ fn apache_vhosts(text: &str) -> Vec<(usize, usize)> {
     found
 }
 
-fn indent_of(line: &str) -> &str {
+pub(crate) fn indent_of(line: &str) -> &str {
     &line[..line.len() - line.trim_start().len()]
 }
 
 /// `lines` put before the `}` at `close`, indented one step in from it.
-fn insert_before_brace(text: &str, close: usize, lines: &[String]) -> String {
+pub(crate) fn insert_before_brace(text: &str, close: usize, lines: &[String]) -> String {
     let line_start = text[..close].rfind('\n').map_or(0, |n| n + 1);
     let before_brace = &text[line_start..close];
     let mut out = String::with_capacity(text.len() + 200);
@@ -217,7 +231,7 @@ fn insert_before_brace(text: &str, close: usize, lines: &[String]) -> String {
     out
 }
 
-fn insert_before_line(text: &str, line_index: usize, lines: &[String]) -> String {
+pub(crate) fn insert_before_line(text: &str, line_index: usize, lines: &[String]) -> String {
     let mut out = String::with_capacity(text.len() + 200);
     for (n, line) in text.split_inclusive('\n').enumerate() {
         if n == line_index {
@@ -283,6 +297,16 @@ pub fn plan_fix(site: &Site, places: &Places) -> Result<TimingFix, Failure> {
     }
     if site.info.copy {
         return Err(refuse("this site already records response times"));
+    }
+    if site.info.unlogged.as_deref() == Some("elsewhere") {
+        return Err(refuse(
+            "this site's log goes to syslog or a pipe, and a log of ServerOS's own here would stop that, so ServerOS won't change it",
+        ));
+    }
+    if !site.info.editable {
+        return Err(refuse(
+            "this site's config is inside a container, so ServerOS won't change it",
+        ));
     }
     let mut edits: Vec<Edit> = Vec::new();
     let mut copies = Vec::new();
@@ -354,6 +378,26 @@ pub fn plan_fix(site: &Site, places: &Places) -> Result<TimingFix, Failure> {
                 if after[open..close].contains(&copy.display().to_string()) {
                     continue;
                 }
+                let mut lines = lines;
+                // Its own `access_log off;` would stop every log on its
+                // level, ServerOS's too: commented out, and noted.
+                let offs = block_level_off(&after, open, close);
+                if !offs.is_empty() {
+                    lines.retain(|l| l != KEPT_COMMENT);
+                    after = insert_before_brace(&after, close, &lines);
+                    for at in offs.into_iter().rev() {
+                        after = comment_out_off(&after, at);
+                    }
+                    inserts.push(Insert {
+                        at: label("server block"),
+                        lines: [
+                            vec![OFF_COMMENT.to_string(), "# access_log off;".to_string()],
+                            lines,
+                        ]
+                        .concat(),
+                    });
+                    continue;
+                }
                 after = insert_before_brace(&after, close, &lines);
                 inserts.push(Insert {
                     at: label("server block"),
@@ -397,10 +441,60 @@ pub fn plan_fix(site: &Site, places: &Places) -> Result<TimingFix, Failure> {
         copies,
         check,
         reload,
+        verify: Vec::new(),
+        owner: None,
+        remove: false,
     })
 }
 
-fn commands(server: &str) -> (Vec<String>, Vec<String>) {
+/// Where each `access_log off;` sits directly in a server block (not in
+/// its locations): the byte index of its line's start.
+fn block_level_off(text: &str, open: usize, close: usize) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut line_start = open + 1;
+    let bytes = text.as_bytes();
+    let mut i = open + 1;
+    while i < close {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => depth = depth.saturating_sub(1),
+            b'#' => {
+                while i < close && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'\n' => line_start = i + 1,
+            _ => {}
+        }
+        if depth == 0 && text[i..].starts_with("access_log") {
+            let rest = &text[i + "access_log".len()..];
+            let statement = rest.split(';').next().unwrap_or("");
+            if statement.trim() == "off" && text[line_start..i].trim().is_empty() {
+                found.push(line_start);
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// The `access_log off;` line at `at` commented out, with ServerOS's note
+/// above it.
+fn comment_out_off(text: &str, at: usize) -> String {
+    let end = text[at..].find('\n').map_or(text.len(), |n| at + n);
+    let line = &text[at..end];
+    let indent = indent_of(line);
+    format!(
+        "{}{indent}{OFF_COMMENT}\n{indent}# {}{}",
+        &text[..at],
+        line.trim_start(),
+        &text[end..]
+    )
+}
+
+pub(crate) fn commands(server: &str) -> (Vec<String>, Vec<String>) {
     let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if server == "nginx" {
         (words(&["nginx", "-t"]), words(&["nginx", "-s", "reload"]))
@@ -419,7 +513,7 @@ fn commands(server: &str) -> (Vec<String>, Vec<String>) {
     }
 }
 
-async fn run(
+pub(crate) async fn run(
     command: &[String],
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -446,7 +540,7 @@ async fn run(
     }
 }
 
-fn put_back(edits: &[Edit]) {
+pub(crate) fn put_back(edits: &[Edit]) {
     for edit in edits {
         match &edit.before {
             Some(before) => {
@@ -504,6 +598,17 @@ pub async fn apply_fix(
         })
         .and_then(|_| std::fs::set_permissions(&copies, std::fs::Permissions::from_mode(0o750)))
         .map_err(|e| refuse(format!("could not make {}: {e}", copies.display())))?;
+    let owner = fix.owner.as_deref().and_then(crate::proxy::system_user);
+    if let Some((uid, gid)) = owner {
+        // The server writes as its own user: it needs into the folder.
+        let _ = std::os::unix::fs::chown(&places.traffic_dir, None, Some(gid));
+        std::os::unix::fs::chown(&copies, Some(uid), Some(gid)).map_err(|e| {
+            refuse(format!(
+                "could not hand {} to its server: {e}",
+                copies.display()
+            ))
+        })?;
+    }
     for copy in &fix.copies {
         std::fs::OpenOptions::new()
             .create(true)
@@ -511,6 +616,9 @@ pub async fn apply_fix(
             .open(copy)
             .and_then(|_| std::fs::set_permissions(copy, std::fs::Permissions::from_mode(0o640)))
             .map_err(|e| refuse(format!("could not make {}: {e}", copy.display())))?;
+        if let Some((uid, gid)) = owner {
+            let _ = std::os::unix::fs::chown(copy, Some(uid), Some(gid));
+        }
     }
 
     for (n, edit) in fix.edits.iter().enumerate() {
@@ -523,8 +631,10 @@ pub async fn apply_fix(
         }
         progress
             .line(format!(
-                "Added {} line(s) to {}",
+                "{} {} line(s) {} {}",
+                if fix.remove { "Took" } else { "Added" },
                 edit.inserts.iter().map(|i| i.lines.len()).sum::<usize>(),
+                if fix.remove { "out of" } else { "to" },
                 edit.file.display()
             ))
             .await;
@@ -546,8 +656,36 @@ pub async fn apply_fix(
         ))
         .with_output(output));
     }
+    if !fix.verify.is_empty() {
+        let mut up = Err(Vec::new());
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            up = run(&fix.verify, cancel, progress).await;
+            if up.is_ok() {
+                break;
+            }
+        }
+        if let Err(output) = up {
+            put_back(&fix.edits);
+            let _ = run(&fix.reload, cancel, progress).await;
+            return Err(refuse(format!(
+                "{} didn't come back up after the change, so every file is back as it was and it was restarted again",
+                fix.server
+            ))
+            .with_output(output));
+        }
+    }
+    if fix.remove {
+        for copy in &fix.copies {
+            let _ = std::fs::remove_file(copy);
+        }
+    }
     progress
-        .line("Response times show up for new requests within a couple of minutes".to_string())
+        .line(if fix.remove {
+            "ServerOS's lines are out, and the server is back to its own config".to_string()
+        } else {
+            "New requests show up within a couple of minutes".to_string()
+        })
         .await;
     Ok(fix.describe(true))
 }
@@ -597,6 +735,7 @@ mod tests {
                 nginx_confs: vec![(nginx.join("nginx.conf"), nginx.clone())],
                 apache_confs: vec![(apache.join("apache2.conf"), apache.clone())],
                 apache_envvars: apache.join("envvars"),
+                ..Paths::default()
             },
         )
     }

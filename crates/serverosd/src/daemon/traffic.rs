@@ -1,14 +1,16 @@
 //! Reads the access logs of the sites ServerOS runs, and of the sites the
-//! machine's own nginx and Apache serve, while traffic is on, and reports
-//! each finished minute's rollup with telemetry. Raw lines are read and
-//! counted here; only the rollups leave the machine (see
-//! daemon_deploy::traffic and daemon_deploy::existing). ServerOS's own logs
-//! are emptied as they're read; the user's are only ever read.
+//! machine's own web servers serve (nginx, Apache, Caddy and Traefik, on
+//! the machine or in containers), while traffic is on, and reports each
+//! finished minute's rollup with telemetry. Raw lines are read and counted
+//! here; only the rollups leave the machine (see daemon_deploy::traffic and
+//! daemon_deploy::existing). ServerOS's own logs are emptied as they're
+//! read; the user's files and containers' output are only ever read.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon_deploy::existing::{self, Plan, Tailer};
+use daemon_deploy::existing::{self, Manual, Plan, Streams, Tailer, DOCKER_SOCKET};
 use daemon_deploy::proxy::Proxy;
 use daemon_deploy::traffic::{self, Rollups};
 use daemon_protocol::driver::Outbound;
@@ -34,6 +36,12 @@ const RESEND_SITES_EVERY: u64 = 30;
 pub const EXISTING_KEY: &str = "traffic.existing";
 /// Where the daemon has read each of their logs to.
 const MARKS_KEY: &str = "traffic.existing.marks";
+/// The time of the last line read from each container's output.
+const STREAMS_KEY: &str = "traffic.existing.streams";
+/// Log files set by hand (`TrafficSource`), as JSON.
+pub const MANUAL_KEY: &str = "traffic.manual";
+/// The longest a look at the machine's web servers may take.
+const DISCOVER_FOR: Duration = Duration::from_secs(30);
 
 /// Whether sites ServerOS didn't write are counted. Daemons that predate
 /// the setting count them whenever traffic is on for ServerOS's sites.
@@ -45,12 +53,34 @@ pub fn existing_on(app: &App, proxy: &Proxy) -> bool {
     }
 }
 
-/// The sites in the web server configs on this machine, counted or not.
-pub fn existing_plan(proxy: &Proxy) -> Plan {
-    existing::plan(
-        &daemon_inventory::access_logs::discover(),
-        &proxy.traffic_dir,
+/// The log files set by hand.
+pub fn manual(app: &App) -> Vec<Manual> {
+    app.state
+        .kv_get(MANUAL_KEY)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// The sites of the web servers on this machine, counted or not.
+pub async fn existing_plan(app: &App, proxy: &Proxy) -> Plan {
+    let vhosts = tokio::time::timeout(
+        DISCOVER_FOR,
+        daemon_inventory::sites::discover(Path::new(DOCKER_SOCKET)),
     )
+    .await
+    .unwrap_or_default();
+    let ours: Vec<String> = proxy
+        .our_sites()
+        .into_iter()
+        .flat_map(|(_, site)| site.domains)
+        .collect();
+    let manual = manual(app);
+    let dir = proxy.traffic_dir.clone();
+    tokio::task::spawn_blocking(move || existing::plan_with(&vhosts, &dir, &ours, &manual))
+        .await
+        .unwrap_or_default()
 }
 
 pub async fn run(app: Arc<App>) {
@@ -59,6 +89,8 @@ pub async fn run(app: Arc<App>) {
     let mut pending: Vec<TrafficRollup> = Vec::new();
     let saved = app.state.kv_get(MARKS_KEY).ok().flatten();
     let mut tailer = Tailer::restore(saved.as_deref());
+    let saved = app.state.kv_get(STREAMS_KEY).ok().flatten();
+    let mut streams = Streams::restore(saved.as_deref());
     let mut plan: Option<Plan> = None;
     let mut ticks: u64 = 0;
     // The site list last sent, and when.
@@ -75,10 +107,12 @@ pub async fn run(app: Arc<App>) {
         let mut sites_out: Option<Vec<TrafficSite>> = None;
 
         if !existing_on {
-            if plan.take().is_some() || !tailer.is_empty() {
+            if plan.take().is_some() || !tailer.is_empty() || !streams.is_empty() {
                 // Next time it's on, every file starts at its end again.
                 tailer = Tailer::default();
+                streams = Streams::default();
                 let _ = app.state.kv_set(MARKS_KEY, "{}");
+                let _ = app.state.kv_set(STREAMS_KEY, "{}");
             }
             let dir = proxy.traffic_dir.clone();
             let _ = tokio::task::spawn_blocking(move || existing::empty_copies(&dir)).await;
@@ -104,21 +138,25 @@ pub async fn run(app: Arc<App>) {
             .map(|(stem, _)| stem)
             .collect();
         let replan = existing_on && (plan.is_none() || ticks.is_multiple_of(REPLAN_EVERY));
-        let traffic_dir = proxy.traffic_dir.clone();
+        if replan {
+            plan = Some(existing_plan(&app, &proxy).await);
+        }
         let now = daemon_state::State::now();
+        // Containers' output comes through Docker, before the files.
+        let lines = match (&plan, existing_on) {
+            (Some(plan), true) => streams.read(Path::new(DOCKER_SOCKET), plan, now).await,
+            _ => Default::default(),
+        };
+        if let Some(saved) = streams.saved() {
+            let _ = app.state.kv_set(STREAMS_KEY, &saved);
+        }
         let read = tokio::task::spawn_blocking(move || {
             if let Some((format, dir)) = &ours {
                 traffic::collect(dir, *format, &sites, &mut rollups);
             }
             if existing_on {
-                if replan {
-                    plan = Some(existing::plan(
-                        &daemon_inventory::access_logs::discover(),
-                        &traffic_dir,
-                    ));
-                }
                 if let Some(plan) = &plan {
-                    existing::collect(plan, &mut tailer, &mut rollups, now);
+                    existing::collect(plan, &mut tailer, &lines, &mut rollups, now);
                 }
             }
             (rollups, tailer, plan)

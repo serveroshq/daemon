@@ -437,6 +437,7 @@ dependencies = [
  "daemon-protocol",
  "daemon-state",
  "hex",
+ "miniz_oxide",
  "serde",
  "serde_json",
  "sha2",
@@ -534,6 +535,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "toml",
  "tracing",
  "x509-parser",
 ]

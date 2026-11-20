@@ -393,6 +393,8 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::SiteOptions { .. } => "site_options",
         Job::Traffic { .. } => "traffic",
         Job::TrafficTiming { .. } => "traffic_timing",
+        Job::TrafficLogging { .. } => "traffic_logging",
+        Job::TrafficSource { .. } => "traffic_source",
     }
 }
 
@@ -408,6 +410,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::TailLogs { .. }
             | Job::PackageUpdates { apply: false, .. }
             | Job::TrafficTiming { apply: false, .. }
+            | Job::TrafficLogging { apply: false, .. }
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
             | Job::ResolveRef { .. }
@@ -577,6 +580,30 @@ mod tests {
             apply: false,
         }));
         runner.submit(Uuid::new_v4(), command(timing)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
+
+        // So is starting or stopping a site's log, and counting a file by
+        // hand; a dry run of the first is not.
+        let logging = Job::TrafficLogging {
+            site: "caddy.shop.test".into(),
+            action: daemon_protocol::TrafficLoggingAction::Add,
+            apply: true,
+        };
+        assert!(mutates(&logging));
+        assert!(!mutates(&Job::TrafficLogging {
+            site: "caddy.shop.test".into(),
+            action: daemon_protocol::TrafficLoggingAction::Remove,
+            apply: false,
+        }));
+        assert!(mutates(&Job::TrafficSource {
+            action: daemon_protocol::TrafficLoggingAction::Add,
+            name: "api".into(),
+            path: Some("/srv/api/access.log".into()),
+        }));
+        runner.submit(Uuid::new_v4(), command(logging)).await;
         assert_eq!(
             collect_until_terminal(&mut rx).await.last().unwrap().state,
             JobState::Refused

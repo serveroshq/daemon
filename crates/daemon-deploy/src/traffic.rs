@@ -163,6 +163,129 @@ pub fn parse_line(format: Format, line: &str) -> Option<Hit> {
     }
 }
 
+/// A Caddy access log line in either of its encoders: JSON, or console
+/// (time, level, logger and message, tab-separated, then the JSON fields,
+/// which carry no time: `now` stands in).
+pub fn parse_caddy(line: &str, now: i64) -> Option<Hit> {
+    let line = line.trim();
+    if line.starts_with('{') {
+        return parse_line(Format::Caddy, line);
+    }
+    let json = &line[line.find("\t{")? + 1..];
+    let mut value: Value = serde_json::from_str(json).ok()?;
+    if value.get("ts").is_none() {
+        value["ts"] = Value::from(now);
+    }
+    caddy_hit(&value)
+}
+
+/// A JSON access line an app writes itself, with whichever of the usual
+/// key names it uses. `now` stands in for a line with no time.
+pub fn parse_any_json(line: &str, now: i64) -> Option<Hit> {
+    let line = line.trim();
+    if !line.starts_with('{') {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    // Nested shapes: pino's {req, res}, Caddy-like {request}.
+    let find = |keys: &[&str]| -> Option<&Value> {
+        keys.iter().find_map(|k| {
+            let mut at = &v;
+            for part in k.split('.') {
+                at = at.get(part)?;
+            }
+            Some(at)
+        })
+    };
+    let text = |keys: &[&str]| find(keys).and_then(Value::as_str).unwrap_or_default();
+    let status = find(&[
+        "status",
+        "status_code",
+        "statusCode",
+        "res.statusCode",
+        "response.status",
+        "http.status_code",
+    ])
+    .and_then(|s| s.as_u64().or_else(|| s.as_str()?.parse().ok()))
+    .filter(|s| (100..600).contains(s))? as u16;
+    let path = text(&[
+        "path",
+        "uri",
+        "url",
+        "request_uri",
+        "req.url",
+        "request.uri",
+        "http.target",
+    ]);
+    if path.is_empty() {
+        return None;
+    }
+    let ts = find(&["ts", "time", "timestamp", "@timestamp", "t"]).and_then(|t| match t {
+        Value::Number(n) => {
+            let n = n.as_f64()?;
+            Some(if n > 1e14 {
+                n / 1e6
+            } else if n > 1e11 {
+                n / 1e3
+            } else {
+                n
+            } as i64)
+        }
+        Value::String(s) => time::OffsetDateTime::parse(s, &Rfc3339)
+            .ok()
+            .map(|t| t.unix_timestamp()),
+        _ => None,
+    });
+    let ms = find(&[
+        "duration_ms",
+        "response_time",
+        "responseTime",
+        "ms",
+        "latency_ms",
+        "elapsed_ms",
+    ])
+    .and_then(Value::as_f64)
+    .or_else(|| {
+        find(&["duration", "request_time", "latency"])
+            .and_then(Value::as_f64)
+            .map(|s| s * 1000.0)
+    })
+    .map(|ms| ms as f32);
+    let host = strip_port(text(&[
+        "host",
+        "hostname",
+        "req.headers.host",
+        "request.host",
+    ]));
+    Some(Hit {
+        ts: ts.unwrap_or(now),
+        referrer: referrer_host(text(&["referer", "referrer", "req.headers.referer"]), &host),
+        ip: text(&[
+            "ip",
+            "remote_addr",
+            "client_ip",
+            "remoteAddress",
+            "req.remoteAddress",
+        ])
+        .to_string(),
+        user_agent: text(&["ua", "user_agent", "userAgent", "req.headers.user-agent"]).to_string(),
+        path: clean_path(path),
+        status,
+        bytes: find(&[
+            "bytes",
+            "size",
+            "body_bytes_sent",
+            "content_length",
+            "res.contentLength",
+        ])
+        .and_then(Value::as_u64)
+        .unwrap_or(0),
+        ms,
+        host,
+        router: None,
+    })
+}
+
 fn caddy_hit(v: &Value) -> Option<Hit> {
     let request = v.get("request")?;
     let header = |name: &str| {
@@ -680,6 +803,31 @@ mod tests {
         assert_eq!(referrer_host("-", "acme.io"), None);
         assert_eq!(referrer_host("not a url", "acme.io"), None);
         assert_eq!(referrer_host("https://ev<il>.io/", "acme.io"), None);
+    }
+
+    #[test]
+    fn caddy_console_lines_and_apps_own_json() {
+        let console = "2026/11/20 12:00:05.512\tINFO\thttp.log.access.log0\thandled request\t{\"request\":{\"remote_ip\":\"1.2.3.4\",\"host\":\"shop.test\",\"uri\":\"/x?y\",\"headers\":{}},\"duration\":0.002,\"size\":5,\"status\":201}";
+        let hit = parse_caddy(console, 1763640005).unwrap();
+        assert_eq!(
+            (hit.ts, hit.status, hit.path.as_str()),
+            (1763640005, 201, "/x")
+        );
+        assert_eq!(hit.host, "shop.test");
+        assert!(parse_caddy(CADDY, 0).is_some());
+        assert!(parse_caddy("2026/11/20 INFO started", 0).is_none());
+
+        let pino = r#"{"level":30,"time":1763640005123,"req":{"method":"GET","url":"/api/a?b","headers":{"host":"api.test","user-agent":"curl"}},"res":{"statusCode":404},"responseTime":12.5}"#;
+        let hit = parse_any_json(pino, 0).unwrap();
+        assert_eq!(
+            (hit.ts, hit.status, hit.path.as_str()),
+            (1763640005, 404, "/api/a")
+        );
+        assert_eq!((hit.host.as_str(), hit.ms), ("api.test", Some(12.5)));
+        let plain = r#"{"time":"2026-11-20T12:00:05Z","status":200,"path":"/","duration":0.25,"ip":"9.9.9.9"}"#;
+        let hit = parse_any_json(plain, 0).unwrap();
+        assert_eq!((hit.ts, hit.ms), (1795176005, Some(250.0)));
+        assert!(parse_any_json(r#"{"msg":"started"}"#, 0).is_none());
     }
 
     #[test]

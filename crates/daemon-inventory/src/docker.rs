@@ -33,25 +33,35 @@ impl Container {
     }
 }
 
+/// Docker 29 sends `null` for some empty lists (`"Ports": null` on a
+/// container that publishes none): read as empty.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct RawContainer {
     #[serde(rename = "Id")]
     id: String,
-    #[serde(rename = "Names", default)]
+    #[serde(rename = "Names", default, deserialize_with = "null_default")]
     names: Vec<String>,
-    #[serde(rename = "Image", default)]
+    #[serde(rename = "Image", default, deserialize_with = "null_default")]
     image: String,
-    #[serde(rename = "State", default)]
+    #[serde(rename = "State", default, deserialize_with = "null_default")]
     state: String,
-    #[serde(rename = "Status", default)]
+    #[serde(rename = "Status", default, deserialize_with = "null_default")]
     status: String,
-    #[serde(rename = "Ports", default)]
+    #[serde(rename = "Ports", default, deserialize_with = "null_default")]
     ports: Vec<RawPort>,
-    #[serde(rename = "Labels", default)]
+    #[serde(rename = "Labels", default, deserialize_with = "null_default")]
     labels: std::collections::BTreeMap<String, String>,
-    #[serde(rename = "Mounts", default)]
+    #[serde(rename = "Mounts", default, deserialize_with = "null_default")]
     mounts: Vec<RawMount>,
-    #[serde(rename = "Created", default)]
+    #[serde(rename = "Created", default, deserialize_with = "null_default")]
     created: i64,
 }
 
@@ -186,6 +196,84 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// A container's output since `since` (Unix seconds, with a fraction), one
+/// stream of it, each line with the time Docker took it down
+/// (RFC 3339). At most `max` bytes are read; `truncated` says there was
+/// more, which the next read picks up from the last line's time.
+pub async fn logs_since(
+    socket: &Path,
+    id: &str,
+    stderr: bool,
+    since: &str,
+    max: usize,
+    timeout: Duration,
+) -> Option<(Vec<(String, String)>, bool)> {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let path = format!(
+        "/containers/{id}/logs?stdout={}&stderr={}&timestamps=1&since={since}",
+        u8::from(!stderr),
+        u8::from(stderr)
+    );
+    let body = crate::local_http::get(
+        &crate::local_http::Target::Unix(socket.to_path_buf()),
+        "docker",
+        &path,
+        timeout,
+        max,
+    )
+    .await?;
+    let text = demux(&body.bytes);
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let complete = if body.truncated {
+        text.rfind('\n').map_or("", |end| &text[..end])
+    } else {
+        text.as_str()
+    };
+    for line in complete.lines() {
+        let Some((stamp, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        lines.push((stamp.to_string(), rest.to_string()));
+    }
+    Some((lines, body.truncated))
+}
+
+/// Docker's framed log stream (8-byte headers) as text; output from a
+/// container with a TTY isn't framed and passes through.
+pub fn demux(raw: &[u8]) -> String {
+    let framed = raw.len() >= 8 && matches!(raw[0], 0..=2) && raw[1..4] == [0, 0, 0];
+    if !framed {
+        return String::from_utf8_lossy(raw).into_owned();
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    let mut cursor = 0;
+    while cursor + 8 <= raw.len() {
+        let len = u32::from_be_bytes([
+            raw[cursor + 4],
+            raw[cursor + 5],
+            raw[cursor + 6],
+            raw[cursor + 7],
+        ]) as usize;
+        let start = cursor + 8;
+        if start + len > raw.len() {
+            // Cut off by the read cap: the whole lines in it still count.
+            let part = &raw[start..];
+            if let Some(end) = part.iter().rposition(|b| *b == b'\n') {
+                out.extend_from_slice(&part[..=end]);
+            }
+            break;
+        }
+        out.extend_from_slice(&raw[start..start + len]);
+        cursor = start + len;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub async fn discover(
     socket: &Path,
     timeout: Duration,
@@ -248,6 +336,30 @@ mod tests {
             ..Default::default()
         };
         assert!(manual.will_not_survive_reboot());
+    }
+
+    #[test]
+    fn null_lists_from_docker_29_read_as_empty() {
+        let body = r#"[{"Id":"abcdef1234567890","Names":["/app"],"Image":"python","State":"running","Status":"Up","Ports":null,"Labels":{"traefik.enable":"true"},"Mounts":null,"Created":1}]"#;
+        let containers = parse_containers(body).unwrap();
+        assert!(containers[0].ports.is_empty() && containers[0].mounts.is_empty());
+        assert_eq!(
+            containers[0]
+                .labels
+                .get("traefik.enable")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn framed_output_reads_as_lines_even_when_cut_off() {
+        let mut raw = vec![1, 0, 0, 0, 0, 0, 0, 6];
+        raw.extend_from_slice(b"a\nbcd\n");
+        raw.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 20]);
+        raw.extend_from_slice(b"whole\npart");
+        assert_eq!(demux(&raw), "a\nbcd\nwhole\n");
+        assert_eq!(demux(b"tty\n"), "tty\n");
     }
 
     #[test]

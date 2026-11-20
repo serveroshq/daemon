@@ -1291,24 +1291,31 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                         .map_err(|e| {
                             Failure::new("traffic", format!("could not save the setting: {e}"))
                         })?;
-                    let existing = if enabled {
-                        let proxy = proxy.clone();
-                        tokio::task::spawn_blocking(move || {
-                            super::traffic::existing_plan(&proxy).sites.len()
-                        })
-                        .await
-                        .unwrap_or(0)
+                    let (existing, unlogged) = if enabled {
+                        let planned = super::traffic::existing_plan(&app, &proxy).await;
+                        let unlogged = planned
+                            .sites
+                            .iter()
+                            .filter(|s| s.info.unlogged.is_some())
+                            .count();
+                        (planned.sites.len() - unlogged, unlogged)
                     } else {
-                        0
+                        (0, 0)
                     };
                     if enabled {
                         ctx.progress
                             .line(format!(
-                                "Counting {existing} site(s) from the access logs the web server's own config writes, read only"
+                                "Counting {existing} site(s) from the access logs the machine's own web servers already write, read only"
                             ))
                             .await;
+                        if unlogged > 0 {
+                            ctx.progress
+                                .line(format!("{unlogged} site(s) write no access log, so there's nothing to count for them yet"))
+                                .await;
+                        }
                     }
                     value["existing"] = json!(existing);
+                    value["unlogged"] = json!(unlogged);
                     Ok(value)
                 }
                 Err(failure) => Err(failure),
@@ -1322,25 +1329,8 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
         Job::TrafficTiming { site, apply } => {
             let proxy = app.deployer.proxy();
-            let places = daemon_deploy::timing::Places {
-                traffic_dir: proxy.traffic_dir.clone(),
-                nginx_conf: ["/etc/nginx/nginx.conf", "/usr/local/nginx/conf/nginx.conf"]
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .find(|p| p.exists())
-                    .unwrap_or_else(|| PathBuf::from("/etc/nginx/nginx.conf")),
-                nginx_format_file: daemon_deploy::timing::NGINX_FORMAT_FILE.into(),
-                backups: app.paths.state_dir.join("backups").join("traffic-timing"),
-            };
-            let planned =
-                tokio::task::spawn_blocking(move || super::traffic::existing_plan(&proxy))
-                    .await
-                    .map_err(|e| {
-                        Failure::new(
-                            "traffic",
-                            format!("could not read the web server config: {e}"),
-                        )
-                    })?;
+            let places = timing_places(&app, &proxy);
+            let planned = super::traffic::existing_plan(&app, &proxy).await;
             let found = planned.site(&site).ok_or_else(|| {
                 Failure::new(
                     "traffic",
@@ -1358,6 +1348,56 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let result =
                 daemon_deploy::timing::apply_fix(&fix, &places, &mut cancel, &ctx.progress).await;
             grant.finish(&result.as_ref().map(|_| ()), Some("response times"));
+            result
+        }
+
+        Job::TrafficLogging {
+            site,
+            action,
+            apply,
+        } => {
+            let proxy = app.deployer.proxy();
+            let places = timing_places(&app, &proxy);
+            let planned = super::traffic::existing_plan(&app, &proxy).await;
+            let found = planned.site(&site).ok_or_else(|| {
+                Failure::new(
+                    "traffic",
+                    format!("{site} isn't a site of this machine's own web servers"),
+                )
+            })?;
+            let fix = match action {
+                daemon_protocol::TrafficLoggingAction::Add => {
+                    daemon_deploy::logging::plan_add(found, &places)?
+                }
+                daemon_protocol::TrafficLoggingAction::Remove => {
+                    daemon_deploy::logging::plan_remove(found, &places)?
+                }
+            };
+            if !apply {
+                return Ok(fix.describe(false));
+            }
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: format!("traffic-logging:{site}"),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result =
+                daemon_deploy::timing::apply_fix(&fix, &places, &mut cancel, &ctx.progress).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(match action {
+                    daemon_protocol::TrafficLoggingAction::Add => "logging on",
+                    daemon_protocol::TrafficLoggingAction::Remove => "logging off",
+                }),
+            );
+            result
+        }
+
+        Job::TrafficSource { action, name, path } => {
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: format!("traffic-source:{name}"),
+            }))?;
+            let result = set_manual(&app, action, &name, path.as_deref());
+            grant.finish(&result.as_ref().map(|_| ()), Some("log file"));
             result
         }
 
@@ -1473,6 +1513,83 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
 #[allow(dead_code)]
 fn _keep(_: &Path) {}
+
+/// Where the logging and timing changes put things.
+fn timing_places(app: &App, proxy: &daemon_deploy::proxy::Proxy) -> daemon_deploy::timing::Places {
+    daemon_deploy::timing::Places {
+        traffic_dir: proxy.traffic_dir.clone(),
+        nginx_conf: ["/etc/nginx/nginx.conf", "/usr/local/nginx/conf/nginx.conf"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+            .unwrap_or_else(|| PathBuf::from("/etc/nginx/nginx.conf")),
+        nginx_format_file: daemon_deploy::timing::NGINX_FORMAT_FILE.into(),
+        backups: app.paths.state_dir.join("backups").join("traffic-timing"),
+    }
+}
+
+/// The most log files that can be set by hand.
+const MAX_MANUAL: usize = 20;
+
+/// Adds or removes a log file set by hand. Only ever read, like the web
+/// servers' own logs.
+fn set_manual(
+    app: &App,
+    action: daemon_protocol::TrafficLoggingAction,
+    name: &str,
+    path: Option<&str>,
+) -> Result<Value, Failure> {
+    let refuse = |message: String| Failure::new("traffic", message);
+    let mut list = super::traffic::manual(app);
+    let key = match action {
+        daemon_protocol::TrafficLoggingAction::Add => {
+            let name = name.trim();
+            if name.is_empty() || name.len() > 60 {
+                return Err(refuse("give the log a name of up to 60 characters".into()));
+            }
+            let path = PathBuf::from(path.unwrap_or_default().trim());
+            let forbidden = ["/proc", "/sys", "/dev", "/run/secrets"];
+            if !path.is_absolute() || forbidden.iter().any(|f| path.starts_with(f)) {
+                return Err(refuse(format!(
+                    "{} isn't a log file ServerOS can read",
+                    path.display()
+                )));
+            }
+            if !std::fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+                return Err(refuse(format!("there's no file at {}", path.display()))
+                    .with_next_step(
+                        "Check the path, and that the app has written to it at least once.",
+                    ));
+            }
+            let key = daemon_deploy::existing::manual_key(name);
+            list.retain(|m| m.key != key);
+            if list.len() >= MAX_MANUAL {
+                return Err(refuse(format!(
+                    "ServerOS reads at most {MAX_MANUAL} log files set by hand"
+                )));
+            }
+            list.push(daemon_deploy::existing::Manual {
+                key: key.clone(),
+                name: name.to_string(),
+                path,
+            });
+            key
+        }
+        daemon_protocol::TrafficLoggingAction::Remove => {
+            let before = list.len();
+            list.retain(|m| m.key != name && m.name != name);
+            if list.len() == before {
+                return Err(refuse(format!("{name} isn't a log file set by hand")));
+            }
+            name.to_string()
+        }
+    };
+    let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".into());
+    app.state
+        .kv_set(super::traffic::MANUAL_KEY, &json)
+        .map_err(|e| refuse(format!("could not save the setting: {e}")))?;
+    Ok(json!({ "site": key, "files": list.len() }))
+}
 
 #[cfg(test)]
 mod secret_tests {
