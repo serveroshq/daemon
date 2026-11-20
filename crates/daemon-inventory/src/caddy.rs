@@ -189,8 +189,37 @@ async fn from_api(address: &str) -> Option<Value> {
     value.is_object().then_some(value)
 }
 
+/// The last `caddy adapt`, kept while the Caddyfile is unchanged (same
+/// path, size and modified time), so a machine whose Caddy has no admin API
+/// or saved config doesn't start a Caddy process every minute. Imported
+/// files aren't watched: a change only there is picked up when the
+/// Caddyfile itself changes or the daemon restarts.
+/// A Caddyfile's path, size and modified time, with what it adapted to.
+type Adapted = (
+    std::path::PathBuf,
+    u64,
+    Option<std::time::SystemTime>,
+    Value,
+);
+static ADAPTED: std::sync::Mutex<Option<Adapted>> = std::sync::Mutex::new(None);
+
 /// `caddy adapt`: Caddy turns its Caddyfile into JSON, changing nothing.
 async fn adapt(caddyfile: &Path) -> Option<Value> {
+    let meta = std::fs::metadata(caddyfile).ok()?;
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    if let Some((path, l, m, value)) = ADAPTED.lock().ok()?.as_ref() {
+        if path == caddyfile && *l == len && *m == modified && modified.is_some() {
+            return Some(value.clone());
+        }
+    }
+    let value = adapt_now(caddyfile).await?;
+    if let Ok(mut cache) = ADAPTED.lock() {
+        *cache = Some((caddyfile.to_path_buf(), len, modified, value.clone()));
+    }
+    Some(value)
+}
+
+async fn adapt_now(caddyfile: &Path) -> Option<Value> {
     let mut command = tokio::process::Command::new("caddy");
     command
         .args(["adapt", "--adapter", "caddyfile", "--config"])
