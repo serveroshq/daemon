@@ -797,7 +797,22 @@ pub fn plan(vhosts: &[VhostLogs], traffic_dir: &Path) -> Plan {
                 route: Route::One(key.clone()),
             });
             plan.sites.push(Site {
-                info: info(key, group, vec![copy.display().to_string()], true),
+                // The copy it reads first, then the site's own logs, so the
+                // panel can name the file the person knows.
+                info: info(
+                    key,
+                    group,
+                    std::iter::once(copy.display().to_string())
+                        .chain(
+                            group
+                                .logs
+                                .iter()
+                                .filter(|log| log.path != *copy)
+                                .map(|log| log.path.display().to_string()),
+                        )
+                        .collect(),
+                    true,
+                ),
                 blocks: group.blocks.clone(),
             });
             continue;
