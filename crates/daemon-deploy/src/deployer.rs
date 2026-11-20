@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use daemon_core::Paths;
 use daemon_jobs::{Failure, JobContext, Progress};
-use daemon_protocol::DeploySpec;
+use daemon_protocol::{DeploySpec, ResourceLimits};
 use daemon_state::State;
 use serde::Serialize;
 use tokio::sync::watch;
 
 use crate::container::{self, BuildLimits};
 use crate::proxy::Proxy;
+use crate::registry::DockerConfig;
 use crate::releases::{self, Release, ReleaseLedger};
 use crate::{git, health, RETAINED_RELEASES};
 
@@ -23,6 +24,10 @@ pub struct DeployResult {
     pub domains: Vec<String>,
     pub previous: Option<String>,
     pub restart_note: Option<String>,
+    /// The CPU and memory limits the container runs with, when it has any.
+    /// Missing from older daemons, so the panel knows not to claim them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ResourceLimits>,
 }
 
 pub struct Deployer {
@@ -144,10 +149,46 @@ impl Deployer {
         std::fs::create_dir_all(&workspace)
             .map_err(|e| Failure::new("prepare", format!("could not create workspace: {e}")))?;
 
+        // Outside the workspace, which is the build context: a Dockerfile's
+        // COPY . must never be able to pick the logins up.
+        let docker_config = if spec.registries.is_empty() {
+            None
+        } else {
+            let config = match DockerConfig::write(
+                &self.paths.run_dir,
+                &ctx.id.to_string(),
+                &spec.registries,
+            ) {
+                Ok(config) => config,
+                Err(failure) => {
+                    let _ = std::fs::remove_dir_all(&workspace);
+                    return Err(failure);
+                }
+            };
+            let hosts: Vec<&str> = spec.registries.iter().map(|r| r.host.as_str()).collect();
+            progress
+                .line(format!(
+                    "pulling with the registry logins for {} (for this deploy only)",
+                    hosts.join(", ")
+                ))
+                .await;
+            Some(config)
+        };
+        let docker_env: Vec<(&str, &str)> = docker_config.iter().map(DockerConfig::env).collect();
+
         let result = self
-            .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &slot, &mut cancel)
+            .deploy_inner(
+                ctx,
+                spec,
+                &workspace,
+                previous.as_ref(),
+                &slot,
+                &docker_env,
+                &mut cancel,
+            )
             .await;
 
+        drop(docker_config);
         let _ = std::fs::remove_dir_all(&workspace);
 
         match result {
@@ -175,6 +216,7 @@ impl Deployer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn deploy_inner(
         &self,
         ctx: &JobContext,
@@ -182,6 +224,7 @@ impl Deployer {
         workspace: &Path,
         previous: Option<&Release>,
         slot: &Slot,
+        docker_env: &[(&str, &str)],
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<DeployResult, Failure> {
         let progress = &ctx.progress;
@@ -254,11 +297,17 @@ impl Deployer {
             let project = format!("serveros-{}", git::sanitise(service));
             let dir = self.compose_dir(service);
             replace_dir(workspace, &dir)?;
+            if spec.limits.as_ref().is_some_and(|l| !l.is_empty()) {
+                progress
+                    .line("CPU and memory limits apply to single-container apps, so this Compose stack runs without them")
+                    .await;
+            }
             container::compose_up(
                 &dir,
                 compose,
                 &project,
                 env_file.as_deref(),
+                docker_env,
                 step_timeout,
                 cancel,
                 progress,
@@ -304,6 +353,7 @@ impl Deployer {
                 domains: spec.domains.clone(),
                 previous: previous.map(|p| p.commit.clone()),
                 restart_note: Some("Compose projects are recreated in place, so the service restarted briefly during this deploy.".into()),
+                limits: None,
             });
         }
 
@@ -315,6 +365,7 @@ impl Deployer {
                 &tag,
                 &fingerprint,
                 &self.build_limits,
+                docker_env,
                 step_timeout,
                 cancel,
                 progress,
@@ -354,6 +405,16 @@ impl Deployer {
                 .await;
         }
 
+        let limits = spec.limits.clone().filter(|l| !l.is_empty());
+        if let Some(limits) = &limits {
+            progress
+                .line(format!(
+                    "limited to {}",
+                    container::limit_args(limits)?.join(" ")
+                ))
+                .await;
+        }
+
         container::remove(&name, progress).await;
         container::run(
             &name,
@@ -363,6 +424,7 @@ impl Deployer {
             container_port,
             env_file.as_deref(),
             &volumes,
+            limits.as_ref(),
             Duration::from_secs(120),
             cancel,
             progress,
@@ -441,6 +503,7 @@ impl Deployer {
             domains: spec.domains.clone(),
             previous: previous.map(|p| p.commit.clone()),
             restart_note: None,
+            limits,
         })
     }
 
@@ -557,6 +620,7 @@ impl Deployer {
             domains: domains.to_vec(),
             previous: current.map(|c| c.commit),
             restart_note: None,
+            limits: None,
         })
     }
 }
@@ -792,7 +856,7 @@ fn write_files(
     Ok(())
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 

@@ -123,6 +123,9 @@ impl App {
         let networks =
             daemon_network::Networks::new(Arc::clone(&state), paths.state_dir.join("networks"));
 
+        // Registry logins a deploy left when the daemon stopped mid-way.
+        daemon_deploy::registry::sweep(&paths.run_dir);
+
         Self {
             deployer: Deployer {
                 paths: paths.clone(),

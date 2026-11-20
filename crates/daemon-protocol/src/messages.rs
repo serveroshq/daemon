@@ -1133,6 +1133,53 @@ pub struct DeploySpec {
     /// `compose_file` is a path already. Missing builds from the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_dir: Option<String>,
+    /// CPU and memory limits for the app's container (docker run --cpus
+    /// and --memory). Missing runs it without limits, as before. Compose
+    /// deploys don't apply them; the result's `limits` says what was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ResourceLimits>,
+    /// Registry logins for pulling private images during this deploy only
+    /// (a Dockerfile's FROM, a Compose file's images). They're written to a
+    /// Docker config made for the job and removed with it, never to the
+    /// machine's own, and never stored or logged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<RegistryLogin>,
+}
+
+/// Limits on what an app's container may use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Thousandths of a CPU: 500 is half a CPU, 2000 is two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+}
+
+impl ResourceLimits {
+    pub fn is_empty(&self) -> bool {
+        self.cpu_millis.is_none() && self.memory_mb.is_none()
+    }
+}
+
+/// A login for a container registry: Docker Hub (`docker.io`), GitHub's
+/// (`ghcr.io`) or a self-hosted one (`registry.example.com:5000`). Its
+/// Debug leaves the password out, so a logged spec doesn't leak it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryLogin {
+    pub host: String,
+    pub username: String,
+    pub password: RepoToken,
+}
+
+impl std::fmt::Debug for RegistryLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryLogin")
+            .field("host", &self.host)
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1493,6 +1540,41 @@ mod tests {
             panic!("not a deploy");
         };
         assert_eq!(spec.base_dir.as_deref(), Some("apps/web"));
+    }
+
+    #[test]
+    fn deploy_jobs_carry_limits_and_registry_logins_only_when_given() {
+        let raw = serde_json::json!({"type": "deploy", "service": "web", "commit": "abc"});
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(spec.limits, None);
+        assert!(spec.registries.is_empty());
+        let json = serde_json::to_value(&*spec).unwrap();
+        assert!(json.get("limits").is_none() && json.get("registries").is_none());
+
+        let raw = serde_json::json!({
+            "type": "deploy",
+            "service": "web",
+            "commit": "abc",
+            "limits": {"cpu_millis": 500, "memory_mb": 512},
+            "registries": [{"host": "ghcr.io", "username": "acme", "password": "ghp_secret"}],
+        });
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(
+            spec.limits,
+            Some(ResourceLimits {
+                cpu_millis: Some(500),
+                memory_mb: Some(512)
+            })
+        );
+        assert_eq!(spec.registries[0].host, "ghcr.io");
+        assert_eq!(spec.registries[0].password.0, "ghp_secret");
+        let logged = format!("{spec:?}");
+        assert!(logged.contains("ghcr.io") && !logged.contains("ghp_secret"));
+        assert!(ResourceLimits::default().is_empty());
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use daemon_jobs::{capture_child, run_child, ChildOutcome, Failure, Progress};
+use daemon_protocol::ResourceLimits;
 use tokio::sync::watch;
 
 pub struct BuildLimits {
@@ -258,6 +259,8 @@ fn build_args(buildkit: bool, dockerfile: &str, tag: &str, fingerprint: &str) ->
     args
 }
 
+/// `extra_env` goes to docker as it is: DOCKER_CONFIG, for a deploy that
+/// pulls from a private registry.
 #[allow(clippy::too_many_arguments)]
 pub async fn build(
     workspace: &Path,
@@ -265,6 +268,7 @@ pub async fn build(
     tag: &str,
     fingerprint: &str,
     limits: &BuildLimits,
+    extra_env: &[(&str, &str)],
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -291,7 +295,7 @@ pub async fn build(
     }
     let docker_args = build_args(buildkit, dockerfile, tag, fingerprint);
     let docker_args: Vec<&str> = docker_args.iter().map(String::as_str).collect();
-    let env = builder_env(buildkit);
+    let env = [builder_env(buildkit), extra_env].concat();
 
     let scoped = scopes_work(cancel).await;
     if !scoped {
@@ -306,7 +310,7 @@ pub async fn build(
             "systemd-run",
             &args,
             Some(workspace),
-            env,
+            &env,
             timeout,
             cancel,
             progress,
@@ -318,7 +322,7 @@ pub async fn build(
             "docker",
             &docker_args,
             Some(workspace),
-            env,
+            &env,
             timeout,
             cancel,
             progress,
@@ -334,6 +338,30 @@ pub async fn build(
     }
 }
 
+/// The docker run flags for an app's CPU and memory limits.
+pub fn limit_args(limits: &ResourceLimits) -> Result<Vec<String>, Failure> {
+    let mut args = Vec::new();
+    if let Some(millis) = limits.cpu_millis {
+        if millis == 0 {
+            return Err(Failure::new("limits", "a CPU limit has to be more than 0"));
+        }
+        let cpus = format!("{}.{:03}", millis / 1000, millis % 1000);
+        let cpus = cpus.trim_end_matches('0').trim_end_matches('.');
+        args.push(format!("--cpus={cpus}"));
+    }
+    if let Some(mb) = limits.memory_mb {
+        // Docker's own floor.
+        if mb < 6 {
+            return Err(Failure::new(
+                "limits",
+                "a memory limit has to be at least 6 MB",
+            ));
+        }
+        args.push(format!("--memory={mb}m"));
+    }
+    Ok(args)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     name: &str,
@@ -343,6 +371,7 @@ pub async fn run(
     container_port: u16,
     env_file: Option<&Path>,
     volumes: &[(String, String)],
+    limits: Option<&ResourceLimits>,
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -371,6 +400,10 @@ pub async fn run(
     if let Some(env) = env_file {
         args.push("--env-file".into());
         args.push(env.to_string_lossy().into_owned());
+    }
+
+    if let Some(limits) = limits {
+        args.extend(limit_args(limits)?);
     }
 
     args.push(tag.into());
@@ -475,11 +508,13 @@ pub async fn remove_image(tag: &str, progress: &Progress) {
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn compose_up(
     dir: &Path,
     file: &str,
     project: &str,
     env_file: Option<&Path>,
+    extra_env: &[(&str, &str)],
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -499,12 +534,12 @@ pub async fn compose_up(
 
     args.extend(["up", "-d", "--build", "--remove-orphans"].map(String::from));
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let env = builder_env(has_buildx(cancel).await);
+    let env = [builder_env(has_buildx(cancel).await), extra_env].concat();
     let outcome = run_child(
         "docker",
         &arg_refs,
         Some(dir),
-        env,
+        &env,
         timeout,
         cancel,
         progress,
@@ -664,6 +699,40 @@ mod tests {
         assert_eq!(parse_label("null\n", BUILD_LABEL), None);
         assert_eq!(parse_label(r#"{"x":"y"}"#, BUILD_LABEL), None);
         assert_eq!(parse_label("", BUILD_LABEL), None);
+    }
+
+    #[test]
+    fn limits_become_docker_run_flags() {
+        let limits = |cpu_millis, memory_mb| ResourceLimits {
+            cpu_millis,
+            memory_mb,
+        };
+        assert_eq!(
+            limit_args(&limits(Some(500), Some(512))).unwrap(),
+            ["--cpus=0.5", "--memory=512m"]
+        );
+        assert_eq!(limit_args(&limits(Some(2000), None)).unwrap(), ["--cpus=2"]);
+        assert_eq!(
+            limit_args(&limits(Some(1250), None)).unwrap(),
+            ["--cpus=1.25"]
+        );
+        assert_eq!(
+            limit_args(&limits(Some(10), None)).unwrap(),
+            ["--cpus=0.01"]
+        );
+        assert_eq!(
+            limit_args(&limits(None, Some(2048))).unwrap(),
+            ["--memory=2048m"]
+        );
+        assert!(limit_args(&limits(None, None)).unwrap().is_empty());
+        assert_eq!(
+            limit_args(&limits(Some(0), None)).unwrap_err().phase,
+            "limits"
+        );
+        assert_eq!(
+            limit_args(&limits(None, Some(4))).unwrap_err().phase,
+            "limits"
+        );
     }
 
     #[test]
