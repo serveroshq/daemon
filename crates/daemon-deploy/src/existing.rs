@@ -582,6 +582,13 @@ impl Tailer {
             return lines;
         };
         let mut offset = if len < start { 0 } else { start };
+        if len < start && inode == mark.inode {
+            // Shorter than where reading stopped, under the same inode:
+            // truncated in place, or deleted and a new file given the old
+            // inode number (Linux reuses them). Either way, what was left
+            // unread went into a rotated copy if it was compressed.
+            lines.extend(compressed_rest(path, &mark));
+        }
         if len - offset > MAX_BEHIND {
             offset = len;
         }
