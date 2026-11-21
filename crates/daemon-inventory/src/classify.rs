@@ -421,6 +421,12 @@ pub fn classify(findings: &Findings) -> Classified {
             .and_then(|d| app_fingerprint(Path::new(d)));
         let mut details = BTreeMap::new();
         details.insert("image".into(), container.image.clone());
+        if !container.image_id.is_empty() {
+            details.insert("image_id".into(), container.image_id.clone());
+        }
+        if !container.image_digests.is_empty() {
+            details.insert("image_digests".into(), container.image_digests.join(","));
+        }
         if let Some(policy) = &container.restart_policy {
             details.insert("restart_policy".into(), policy.clone());
         }

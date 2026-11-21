@@ -1058,6 +1058,40 @@ pub enum Job {
         #[serde(default)]
         path: Option<String>,
     },
+    /// Docker's images, volumes and build cache on this machine: what each
+    /// takes on disk and which containers use it. Read-only.
+    DockerResources,
+    /// Removes the images and volumes named, and the build cache when
+    /// asked. Only ones no container uses, running or stopped: the daemon
+    /// checks, and Docker refuses the rest anyway. A job of its own, so an
+    /// older daemon refuses it.
+    DockerPrune {
+        /// Image ids (`sha256:…`).
+        #[serde(default)]
+        images: Vec<String>,
+        /// Volume names.
+        #[serde(default)]
+        volumes: Vec<String>,
+        #[serde(default)]
+        build_cache: bool,
+    },
+    /// Pulls a container's image again and, when there's a newer one,
+    /// recreates the container on it with the same settings. If the new
+    /// container doesn't stay up, the old one is put back. Any container
+    /// on the machine (`docker:<id>`), adopted or not.
+    ImageUpdate {
+        service: String,
+        /// Logins for pulling a private image, used for this pull only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        registries: Vec<RegistryLogin>,
+    },
+    /// The OS release and installed packages of an image (dpkg or apk), read
+    /// from a container made from it without running anything inside, so
+    /// the panel can look them up for known vulnerabilities. Read-only.
+    ImagePackages {
+        /// The image id (`sha256:…`).
+        image: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1762,6 +1796,42 @@ mod tests {
             Job::PackageHold {
                 packages: vec!["nginx".into()],
                 hold: true,
+            }
+        );
+    }
+
+    #[test]
+    fn docker_jobs_read_the_panel_s_json() {
+        let raw = serde_json::json!({"type": "docker_resources"});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::DockerResources
+        );
+
+        let raw = serde_json::json!({"type": "docker_prune", "images": ["sha256:ab"], "build_cache": true});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::DockerPrune {
+                images: vec!["sha256:ab".into()],
+                volumes: vec![],
+                build_cache: true,
+            }
+        );
+
+        let raw = serde_json::json!({"type": "image_update", "service": "docker:abc123"});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::ImageUpdate {
+                service: "docker:abc123".into(),
+                registries: vec![],
+            }
+        );
+
+        let raw = serde_json::json!({"type": "image_packages", "image": "sha256:ab"});
+        assert_eq!(
+            serde_json::from_value::<Job>(raw).unwrap(),
+            Job::ImagePackages {
+                image: "sha256:ab".into()
             }
         );
     }

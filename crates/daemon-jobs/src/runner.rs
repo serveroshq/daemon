@@ -395,6 +395,10 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::TrafficTiming { .. } => "traffic_timing",
         Job::TrafficLogging { .. } => "traffic_logging",
         Job::TrafficSource { .. } => "traffic_source",
+        Job::DockerResources => "docker_resources",
+        Job::DockerPrune { .. } => "docker_prune",
+        Job::ImageUpdate { .. } => "image_update",
+        Job::ImagePackages { .. } => "image_packages",
     }
 }
 
@@ -414,6 +418,8 @@ pub fn mutates(job: &Job) -> bool {
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
             | Job::ResolveRef { .. }
+            | Job::DockerResources
+            | Job::ImagePackages { .. }
     )
 }
 

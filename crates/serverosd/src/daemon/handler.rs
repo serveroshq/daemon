@@ -33,6 +33,11 @@ impl Handler for JobHandler {
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
+            Job::ImageUpdate { registries, .. } => registries
+                .iter()
+                .map(|r| r.password.0.clone())
+                .filter(|s| !s.is_empty())
+                .collect(),
             // Only ever a hash, but there's no reason to keep it in logs.
             Job::SiteOptions { options, .. } => options
                 .basic_auth
@@ -990,6 +995,141 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let result = super::disk_usage::report(&path).await;
             grant.finish(&result.as_ref().map(|_| ()), Some(&path));
             Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::DockerResources => {
+            let grant = authorize(Operation::Machine(MachineOp::ListContainers))?;
+            ctx.progress.phase("reading", Some(10)).await;
+            let result = DockerAdapter::default()
+                .resources()
+                .await
+                .map_err(|e| Failure::new("docker", e.to_string()));
+            grant.finish(&result.as_ref().map(|_| ()), None);
+            result
+        }
+
+        Job::DockerPrune {
+            images,
+            volumes,
+            build_cache,
+        } => {
+            let grant = authorize(Operation::Machine(MachineOp::PruneDocker))?;
+            ctx.progress.phase("removing", Some(10)).await;
+            let result = DockerAdapter::default()
+                .prune(&images, &volumes, build_cache)
+                .await
+                .map_err(|e| Failure::new("prune", e.to_string()));
+            if let Ok(done) = &result {
+                for skipped in done["skipped"].as_array().into_iter().flatten() {
+                    let what = skipped
+                        .get("image")
+                        .or_else(|| skipped.get("volume"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let why = skipped.get("reason").and_then(Value::as_str).unwrap_or("");
+                    ctx.progress.line(format!("kept {what}: {why}")).await;
+                }
+            }
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(&format!(
+                    "{} images, {} volumes{}",
+                    images.len(),
+                    volumes.len(),
+                    if build_cache { ", build cache" } else { "" }
+                )),
+            );
+            result
+        }
+
+        Job::ImageUpdate {
+            service,
+            registries,
+        } => {
+            let container = service
+                .strip_prefix("docker:")
+                .filter(|c| daemon_services::docker::valid_container_ref(c))
+                .ok_or_else(|| {
+                    Failure::new(
+                        "update",
+                        format!("{service:?} isn't a container, so there's no image to update"),
+                    )
+                })?
+                .to_string();
+            let grant = authorize(Operation::Machine(MachineOp::UpdateImage {
+                container: container.clone(),
+            }))?;
+            let docker = DockerAdapter::default();
+            ctx.progress.phase("pulling", Some(10)).await;
+            let pulled = match docker.pull_for(&container, &registries).await {
+                Ok(pulled) => pulled,
+                Err(e) => {
+                    let failure = Failure::new("pull", e.to_string());
+                    grant.finish(&Err::<(), _>(&failure), None);
+                    return Err(failure);
+                }
+            };
+            if pulled.new_image == pulled.old_image {
+                ctx.progress
+                    .line(format!("{} is already the newest image", pulled.reference))
+                    .await;
+                grant.finish::<String>(&Ok(()), Some("already up to date"));
+                return Ok(json!({
+                    "service": service,
+                    "updated": false,
+                    "image": pulled.reference,
+                    "image_id": pulled.old_image,
+                }));
+            }
+            ctx.progress
+                .line(format!("pulled a newer {}", pulled.reference))
+                .await;
+            ctx.progress.phase("recreating", Some(60)).await;
+            let result = docker
+                .recreate_on_new_image(&container, &pulled.old_image)
+                .await
+                .map_err(|e| Failure::new("recreate", e.to_string()));
+            grant.finish(&result.as_ref().map(|_| ()), Some(&pulled.reference));
+            let updated = result?;
+            let short = &updated.new_id[..updated.new_id.len().min(12)];
+            let old_short = &updated.old_id[..updated.old_id.len().min(12)];
+            if Registry::new(&app.state)
+                .rekey(
+                    &format!("docker:{old_short}"),
+                    &format!("docker:{short}"),
+                    short,
+                )
+                .unwrap_or(false)
+            {
+                app.sync_adopted();
+            }
+            if updated.old_kept {
+                ctx.progress
+                    .line(format!(
+                        "the old container is still there as {}-before-update",
+                        updated.name
+                    ))
+                    .await;
+            }
+            Ok(json!({
+                "service": format!("docker:{short}"),
+                "previous": service,
+                "updated": true,
+                "image": pulled.reference,
+                "image_id": pulled.new_image,
+                "previous_image_id": pulled.old_image,
+                "old_kept": updated.old_kept,
+            }))
+        }
+
+        Job::ImagePackages { image } => {
+            let grant = authorize(Operation::Machine(MachineOp::ListContainers))?;
+            let result = DockerAdapter::default()
+                .image_packages(&image)
+                .await
+                .map_err(|e| Failure::new("packages", e.to_string()));
+            grant.finish(&result.as_ref().map(|_| ()), Some(&image));
+            result
         }
 
         Job::Snapshots { service } => {

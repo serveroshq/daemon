@@ -613,6 +613,7 @@ dependencies = [
 name = "daemon-services"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "daemon-core",
  "daemon-jobs",
  "daemon-protocol",

@@ -28,9 +28,9 @@ pub fn valid_container_ref(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
-struct Reply {
-    status: u16,
-    body: Vec<u8>,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Vec<u8>,
 }
 
 async fn request(socket: &Path, method: &str, path: &str, timeout: Duration) -> Result<Reply> {
@@ -44,6 +44,19 @@ async fn request_with(
     body: Option<&serde_json::Value>,
     timeout: Duration,
 ) -> Result<Reply> {
+    request_full(socket, method, path, &[], body, timeout).await
+}
+
+/// One request to Docker's API, with any extra headers (a registry login
+/// for a pull, say) and an optional JSON body.
+pub(crate) async fn request_full(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    extra_headers: &[(&str, String)],
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<Reply> {
     let work = async {
         let mut stream = tokio::net::UnixStream::connect(socket)
             .await
@@ -54,8 +67,13 @@ async fn request_with(
         } else {
             ""
         };
+        let extra: String = extra_headers
+            .iter()
+            .filter(|(name, value)| !name.contains(['\r', '\n']) && !value.contains(['\r', '\n']))
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         let request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: docker\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+            "{method} {path} HTTP/1.1\r\nHost: docker\r\n{content_type}{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
             payload.len()
         );
         stream
@@ -118,7 +136,7 @@ fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-fn docker_error(reply: &Reply, what: &str) -> ServiceError {
+pub(crate) fn docker_error(reply: &Reply, what: &str) -> ServiceError {
     let message = serde_json::from_slice::<serde_json::Value>(&reply.body)
         .ok()
         .and_then(|v| {
@@ -461,7 +479,7 @@ impl DockerAdapter {
         Ok(id)
     }
 
-    async fn call(
+    pub(crate) async fn call(
         &self,
         method: &str,
         path: &str,

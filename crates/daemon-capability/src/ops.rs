@@ -15,17 +15,40 @@ pub enum MachineOp {
     ListUnits,
     ListContainers,
     QueryPackageUpdates,
-    ApplyPackageUpdates { security_only: bool },
-    HoldPackages { hold: bool, packages: Vec<String> },
-    AddPackages { packages: Vec<String> },
+    ApplyPackageUpdates {
+        security_only: bool,
+    },
+    HoldPackages {
+        hold: bool,
+        packages: Vec<String>,
+    },
+    AddPackages {
+        packages: Vec<String>,
+    },
     Reboot,
     ReadFirewall,
-    WriteFirewall { rule: String },
-    ManageSshKeys { user: String },
-    WriteNetwork { network: String },
+    WriteFirewall {
+        rule: String,
+    },
+    ManageSshKeys {
+        user: String,
+    },
+    WriteNetwork {
+        network: String,
+    },
     WriteTunnel,
-    ReadJournal { unit: Option<String> },
-    ReadNamedLog { path: PathBuf },
+    ReadJournal {
+        unit: Option<String>,
+    },
+    ReadNamedLog {
+        path: PathBuf,
+    },
+    /// Pull a container's image again and recreate it on a newer one.
+    UpdateImage {
+        container: String,
+    },
+    /// Remove images, volumes and build cache no container uses.
+    PruneDocker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +117,8 @@ impl Operation {
                 MachineOp::WriteTunnel => "tunnel.write",
                 MachineOp::ReadJournal { .. } => "journal.read",
                 MachineOp::ReadNamedLog { .. } => "log.read",
+                MachineOp::UpdateImage { .. } => "container.update_image",
+                MachineOp::PruneDocker => "docker.prune",
             },
             Operation::Service(s) => match s {
                 ServiceOp::Start { .. } => "service.start",
@@ -158,6 +183,8 @@ impl Operation {
                 MachineOp::WriteTunnel => "cloudflare".into(),
                 MachineOp::ReadJournal { unit } => unit.clone().unwrap_or_else(|| "system".into()),
                 MachineOp::ReadNamedLog { path } => path.display().to_string(),
+                MachineOp::UpdateImage { container } => container.clone(),
+                MachineOp::PruneDocker => "docker".into(),
                 _ => "machine".into(),
             },
             Operation::Service(s) => match s {
@@ -216,6 +243,8 @@ impl Operation {
                     | MachineOp::ManageSshKeys { .. }
                     | MachineOp::WriteNetwork { .. }
                     | MachineOp::WriteTunnel
+                    | MachineOp::UpdateImage { .. }
+                    | MachineOp::PruneDocker
             ),
             Operation::Service(s) => !matches!(
                 s,
@@ -236,6 +265,8 @@ impl Operation {
                 | Operation::Machine(MachineOp::HoldPackages { .. })
                 | Operation::Machine(MachineOp::AddPackages { .. })
                 | Operation::Machine(MachineOp::Reboot)
+                | Operation::Machine(MachineOp::UpdateImage { .. })
+                | Operation::Machine(MachineOp::PruneDocker)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })
                 | Operation::Service(ServiceOp::Repair { .. })

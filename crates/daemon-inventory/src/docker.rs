@@ -11,6 +11,11 @@ pub struct Container {
     pub id: String,
     pub name: String,
     pub image: String,
+    /// The image the container runs (`sha256:…`), and the registry digests
+    /// Docker has for it (`postgres@sha256:…`), to tell whether the
+    /// registry has a newer one. No digests means a local build.
+    pub image_id: String,
+    pub image_digests: Vec<String>,
     pub state: String,
     pub status: String,
     pub ports: Vec<u16>,
@@ -51,6 +56,8 @@ struct RawContainer {
     names: Vec<String>,
     #[serde(rename = "Image", default, deserialize_with = "null_default")]
     image: String,
+    #[serde(rename = "ImageID", default, deserialize_with = "null_default")]
+    image_id: String,
     #[serde(rename = "State", default, deserialize_with = "null_default")]
     state: String,
     #[serde(rename = "Status", default, deserialize_with = "null_default")]
@@ -108,6 +115,8 @@ pub fn parse_containers(body: &str) -> Result<Vec<Container>, serde_json::Error>
                     .collect(),
                 id: c.id,
                 image: c.image,
+                image_id: c.image_id,
+                image_digests: Vec::new(),
                 state: c.state,
                 status: c.status,
                 ports,
@@ -117,6 +126,23 @@ pub fn parse_containers(body: &str) -> Result<Vec<Container>, serde_json::Error>
             }
         })
         .collect())
+}
+
+#[derive(Deserialize)]
+struct RawImage {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "RepoDigests", default, deserialize_with = "null_default")]
+    repo_digests: Vec<String>,
+}
+
+/// `/images/json` as image id => its registry digests.
+pub fn parse_image_digests(
+    body: &str,
+) -> Result<std::collections::HashMap<String, Vec<String>>, serde_json::Error> {
+    let raw: Vec<RawImage> = serde_json::from_str(body)?;
+
+    Ok(raw.into_iter().map(|i| (i.id, i.repo_digests)).collect())
 }
 
 pub fn parse_restart_policy(body: &str) -> Option<String> {
@@ -293,6 +319,17 @@ pub async fn discover(
         }
     }
 
+    if let Some(digests) = get(socket, "/images/json", timeout)
+        .await
+        .and_then(|b| parse_image_digests(&b).ok())
+    {
+        for container in containers.iter_mut() {
+            if let Some(list) = digests.get(&container.image_id) {
+                container.image_digests = list.clone();
+            }
+        }
+    }
+
     let version = get(socket, "/version", timeout)
         .await
         .and_then(|b| parse_version(&b));
@@ -317,6 +354,17 @@ mod tests {
         assert_eq!(c.compose_dir.as_deref(), Some("/srv/shop"));
         assert_eq!(c.mounts, vec!["/srv/shop/html:/usr/share/nginx/html"]);
         assert_eq!(c.short_id(), "abcdef123456");
+    }
+
+    #[test]
+    fn image_ids_and_their_registry_digests() {
+        let body = r#"[{"Id":"abcdef1234567890","Names":["/db"],"Image":"postgres:16","ImageID":"sha256:111","State":"running","Status":"Up","Ports":null,"Labels":null,"Mounts":null,"Created":1}]"#;
+        assert_eq!(parse_containers(body).unwrap()[0].image_id, "sha256:111");
+
+        let images = r#"[{"Id":"sha256:111","RepoDigests":["postgres@sha256:aaa"]},{"Id":"sha256:222","RepoDigests":null}]"#;
+        let digests = parse_image_digests(images).unwrap();
+        assert_eq!(digests["sha256:111"], vec!["postgres@sha256:aaa"]);
+        assert!(digests["sha256:222"].is_empty());
     }
 
     #[test]

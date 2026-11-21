@@ -17,6 +17,7 @@ tokio.workspace = true
 time.workspace = true
 tracing.workspace = true
 httparse.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
