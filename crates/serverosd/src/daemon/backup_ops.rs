@@ -681,6 +681,268 @@ fn entries_to_move(names: &[String]) -> Vec<String> {
     moving
 }
 
+/// Puts a snapshot another machine sent to this one's receiver under this
+/// machine's own snapshots of `service`, so it restores like one taken here,
+/// and returns the folder it was sent to. Whoever holds a receiver key could
+/// have written it, so it's checked first: a plain path in the receiver's
+/// folder with no links on the way, a manifest for this snapshot made the
+/// way this service restores, plain files only (read without following
+/// links), and for files, nothing outside the folders the service keeps its
+/// data in here. The restore then checks every file against its checksum.
+pub async fn take_received(
+    app: &App,
+    service: &ManagedService,
+    strategy: &Strategy,
+    received: &str,
+    snapshot: &str,
+) -> Result<PathBuf, Failure> {
+    let data = Path::new(RECEIVER_HOME).join(RECEIVER_DATA);
+    let from = received_dir(&data, received, snapshot)?;
+    let to = app
+        .snapshotter
+        .service_dir(&service.name)
+        .join(sanitise_part(snapshot));
+    let label = strategy.label().to_string();
+    let name = service.name.clone();
+
+    let (from, to) = tokio::task::spawn_blocking(move || {
+        copy_received(&from, &to, &label, &name).map(|()| (from, to))
+    })
+    .await
+    .map_err(|e| Failure::new("receive", e.to_string()))??;
+
+    if let Strategy::Files { paths } = strategy {
+        if let Err(e) = archive_within(&to.join("files.tar.gz"), paths).await {
+            let _ = std::fs::remove_dir_all(&to);
+            return Err(e);
+        }
+    }
+    Ok(from)
+}
+
+/// The folder a received snapshot is in: `received` must be a relative path
+/// of plain names ending in the snapshot's id, with no links on the way.
+fn received_dir(data: &Path, received: &str, snapshot: &str) -> Result<PathBuf, Failure> {
+    let refuse = || {
+        Failure::new(
+            "receive",
+            format!("{received} isn't a snapshot this machine received"),
+        )
+    };
+    let parts: Vec<&str> = received.split('/').collect();
+    if parts.len() > 16 || parts.last() != Some(&snapshot) || !parts.iter().all(|p| plain_name(p)) {
+        return Err(refuse());
+    }
+
+    let mut path = data.to_path_buf();
+    for part in parts {
+        path.push(part);
+        // symlink_metadata doesn't follow a link, so a link isn't a dir here.
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return Err(refuse()),
+        }
+    }
+    Ok(path)
+}
+
+/// A file or folder name a sender may use: no separators, no `..`, no
+/// hidden names, nothing a shell or tar would read specially.
+fn plain_name(part: &str) -> bool {
+    !part.is_empty()
+        && part.len() <= 128
+        && !part.starts_with('.')
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+fn sanitise_part(part: &str) -> String {
+    part.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+fn copy_received(from: &Path, to: &Path, label: &str, service: &str) -> Result<(), Failure> {
+    let fail = |message: String| Failure::new("receive", message);
+
+    let manifest_bytes = read_plain(&from.join("manifest.json"), MAX_MANIFEST_BYTES)
+        .map_err(|e| fail(format!("its manifest couldn't be read: {e}")))?;
+    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| fail(format!("its manifest isn't one ServerOS wrote: {e}")))?;
+    check_received(&manifest, from, label, service)?;
+
+    if to.exists() {
+        // A retry: the same snapshot was put here before and not restored yet.
+        let same = std::fs::read(to.join("manifest.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Manifest>(&b).ok())
+            .is_some_and(|m| m == manifest);
+        return if same {
+            Ok(())
+        } else {
+            Err(fail(format!(
+                "{service} already has a snapshot called {}",
+                manifest.id
+            )))
+        };
+    }
+
+    std::fs::create_dir_all(to).map_err(|e| fail(e.to_string()))?;
+    let _ = std::fs::set_permissions(to, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    let copied = manifest
+        .files
+        .iter()
+        .map(|f| f.name.as_str())
+        .chain(["manifest.json"])
+        .try_for_each(|name| copy_plain(&from.join(name), &to.join(name)).map(|_| ()))
+        .map_err(|e| fail(format!("it couldn't be copied: {e}")));
+    if copied.is_err() {
+        let _ = std::fs::remove_dir_all(to);
+    }
+    copied
+}
+
+/// A received manifest is for the snapshot it claims, made the way this
+/// service restores, and names only plain files beside it.
+fn check_received(
+    manifest: &Manifest,
+    from: &Path,
+    label: &str,
+    service: &str,
+) -> Result<(), Failure> {
+    let fail = |message: String| Failure::new("receive", message);
+    if from.file_name().and_then(|n| n.to_str()) != Some(manifest.id.as_str()) {
+        return Err(fail("its manifest is for a different snapshot".into()));
+    }
+    if manifest.strategy != label {
+        return Err(fail(format!(
+            "it was made with {}, and {service} restores with {label}",
+            manifest.strategy
+        )));
+    }
+    if manifest.files.is_empty()
+        || manifest
+            .files
+            .iter()
+            .any(|f| !plain_name(&f.name) || f.name == "manifest.json")
+    {
+        return Err(fail(
+            "its manifest names files ServerOS doesn't write".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Opens a regular file without following a link to it.
+fn open_plain(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} isn't a plain file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn read_plain(path: &Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    open_plain(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "it's too big",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn copy_plain(from: &Path, to: &Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut source = open_plain(from)?;
+    let mut target = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)?;
+    std::io::copy(&mut source, &mut target)
+}
+
+/// Refuses a files snapshot with anything outside `paths`, the folders the
+/// service keeps its data in on this machine: it's put back from /, so an
+/// entry anywhere else would land where the sender chose.
+async fn archive_within(archive: &Path, paths: &[PathBuf]) -> Result<(), Failure> {
+    use tokio::io::AsyncBufReadExt;
+
+    let roots: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().trim_matches('/').to_string())
+        .filter(|r| !r.is_empty())
+        .collect();
+    let mut child = Command::new("tar")
+        .args(["-tzf", &archive.to_string_lossy()])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| Failure::new("receive", format!("could not run tar: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Failure::new("receive", "tar gave no listing"))?;
+
+    let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut outside = None;
+    while let Ok(Some(entry)) = lines.next_line().await {
+        if outside.is_none() && !entry_within(&entry, &roots) {
+            outside = Some(entry);
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| Failure::new("receive", e.to_string()))?;
+
+    match outside {
+        Some(entry) => Err(Failure::new(
+            "receive",
+            format!("{entry} in the snapshot is outside the service's folders here, so nothing was restored"),
+        )
+        .with_next_step(
+            "The service keeps its data in different folders on this machine. Copy it by hand.",
+        )),
+        None if !status.success() => Err(Failure::new("receive", "the snapshot's files couldn't be listed")),
+        None => Ok(()),
+    }
+}
+
+/// Whether a tar entry is one of `roots` or inside one, with no `..`.
+fn entry_within(entry: &str, roots: &[String]) -> bool {
+    let entry = entry
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .trim_end_matches('/');
+    if entry.is_empty() || entry.split('/').any(|p| p == "..") {
+        return false;
+    }
+    roots
+        .iter()
+        .any(|root| entry == root || entry.starts_with(&format!("{root}/")))
+}
+
 fn no_login() -> &'static str {
     NO_LOGIN
         .iter()
@@ -734,6 +996,177 @@ async fn run(program: &str, args: &[&str]) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sent(dir: &Path, id: &str, strategy: &str, files: &[(&str, &str)]) -> PathBuf {
+        let folder = dir.join("moves/7/shop-db-1").join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        for (name, body) in files {
+            std::fs::write(folder.join(name), body).unwrap();
+        }
+        let manifest = Manifest {
+            service: "shop-db-1".into(),
+            id: id.into(),
+            created_at: 1_700_000_000,
+            reason: "move".into(),
+            strategy: strategy.into(),
+            files: files
+                .iter()
+                .map(|(name, body)| daemon_backup::snapshot::ManifestFile {
+                    name: (*name).into(),
+                    bytes: body.len() as u64,
+                    sha256: String::new(),
+                })
+                .collect(),
+            total_bytes: 0,
+            uploaded_to: None,
+        };
+        std::fs::write(
+            folder.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        folder
+    }
+
+    #[test]
+    fn a_received_snapshot_is_a_plain_path_in_the_receivers_folder() {
+        let data = tempfile::tempdir().unwrap();
+        let folder = sent(
+            data.path(),
+            "1700-move",
+            "pg_dumpall",
+            &[("postgres.sql", "")],
+        );
+
+        assert_eq!(
+            received_dir(data.path(), "moves/7/shop-db-1/1700-move", "1700-move").unwrap(),
+            folder
+        );
+        for bad in [
+            "moves/7/shop-db-1/1700-other",
+            "../etc/1700-move",
+            "/moves/7/shop-db-1/1700-move",
+            "moves//1700-move",
+            "moves/.hidden/1700-move",
+            "moves/7/missing/1700-move",
+        ] {
+            assert!(
+                received_dir(data.path(), bad, "1700-move").is_err(),
+                "{bad}"
+            );
+        }
+
+        std::os::unix::fs::symlink(data.path().join("moves"), data.path().join("link")).unwrap();
+        assert!(received_dir(data.path(), "link/7/shop-db-1/1700-move", "1700-move").is_err());
+    }
+
+    #[test]
+    fn a_received_snapshot_is_copied_once_and_checked_first() {
+        let data = tempfile::tempdir().unwrap();
+        let own = tempfile::tempdir().unwrap();
+        let from = sent(
+            data.path(),
+            "1700-move",
+            "pg_dumpall",
+            &[("postgres.sql", "select 1;")],
+        );
+        let to = own.path().join("1700-move");
+
+        copy_received(&from, &to, "pg_dumpall", "shop-db-1").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(to.join("postgres.sql")).unwrap(),
+            "select 1;"
+        );
+        // A retry finds it already there.
+        copy_received(&from, &to, "pg_dumpall", "shop-db-1").unwrap();
+
+        let other = own.path().join("other");
+        let wrong = copy_received(&from, &other, "tar", "shop-db-1").unwrap_err();
+        assert!(wrong.message.contains("made with pg_dumpall"));
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn a_received_snapshot_with_links_or_strange_names_is_refused() {
+        let data = tempfile::tempdir().unwrap();
+        let own = tempfile::tempdir().unwrap();
+
+        let from = sent(data.path(), "1700-a", "tar", &[("files.tar.gz", "")]);
+        std::fs::remove_file(from.join("files.tar.gz")).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", from.join("files.tar.gz")).unwrap();
+        assert!(copy_received(&from, &own.path().join("a"), "tar", "s").is_err());
+        assert!(!own.path().join("a").exists());
+
+        let from = sent(data.path(), "1700-b", "tar", &[("files.tar.gz", "")]);
+        let mut manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(from.join("manifest.json")).unwrap()).unwrap();
+        manifest.files[0].name = "../../etc/passwd".into();
+        std::fs::write(
+            from.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(copy_received(&from, &own.path().join("b"), "tar", "s").is_err());
+
+        let from = sent(data.path(), "1700-c", "tar", &[("files.tar.gz", "")]);
+        let mut manifest: Manifest =
+            serde_json::from_slice(&std::fs::read(from.join("manifest.json")).unwrap()).unwrap();
+        manifest.id = "1700-other".into();
+        std::fs::write(
+            from.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(copy_received(&from, &own.path().join("c"), "tar", "s").is_err());
+    }
+
+    #[test]
+    fn a_files_snapshot_stays_inside_the_services_folders() {
+        let roots = vec!["var/lib/docker/volumes/serveros-shop_data/_data".to_string()];
+        assert!(entry_within(
+            "var/lib/docker/volumes/serveros-shop_data/_data/",
+            &roots
+        ));
+        assert!(entry_within(
+            "var/lib/docker/volumes/serveros-shop_data/_data/a/b.txt",
+            &roots
+        ));
+        assert!(!entry_within(
+            "var/lib/docker/volumes/serveros-shop_data/_data2/x",
+            &roots
+        ));
+        assert!(!entry_within("etc/cron.d/evil", &roots));
+        assert!(!entry_within(
+            "var/lib/docker/volumes/serveros-shop_data/_data/../../../x",
+            &roots
+        ));
+        assert!(!entry_within("", &roots));
+    }
+
+    #[tokio::test]
+    async fn a_files_archive_is_listed_before_it_is_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let inside = dir.path().join("data");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::write(inside.join("a.txt"), "a").unwrap();
+        let archive = dir.path().join("files.tar.gz");
+        let made = std::process::Command::new("tar")
+            .args([
+                "-czf",
+                &archive.to_string_lossy(),
+                &inside.to_string_lossy(),
+            ])
+            .status()
+            .unwrap();
+        assert!(made.success());
+
+        assert!(archive_within(&archive, std::slice::from_ref(&inside))
+            .await
+            .is_ok());
+        let elsewhere = dir.path().join("elsewhere");
+        let refused = archive_within(&archive, &[elsewhere]).await.unwrap_err();
+        assert!(refused.message.contains("outside the service's folders"));
+    }
 
     const KEY_A: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

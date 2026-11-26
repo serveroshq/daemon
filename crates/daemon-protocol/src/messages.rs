@@ -864,6 +864,13 @@ pub enum Job {
     Restore {
         service: String,
         snapshot: String,
+        /// A snapshot another machine sent to this one's backup receiver, to
+        /// restore here instead of one of this machine's own: the path it was
+        /// sent to inside the receiver's folder, ending in `snapshot` (what
+        /// the sender's `backup_to` reported as its location). Used to move
+        /// a service's data to a new machine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received: Option<String>,
     },
     PackageUpdates {
         apply: bool,
@@ -1619,6 +1626,34 @@ mod tests {
 
         assert_eq!(json["type"], "service_action");
         assert_eq!(json["action"], "reload");
+    }
+
+    #[test]
+    fn a_restore_names_a_received_snapshot_only_when_it_is_one() {
+        let own: Job = serde_json::from_str(
+            r#"{"type":"restore","service":"docker:abc","snapshot":"1700-daily"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            own,
+            Job::Restore {
+                service: "docker:abc".into(),
+                snapshot: "1700-daily".into(),
+                received: None
+            }
+        );
+        assert!(serde_json::to_value(&own)
+            .unwrap()
+            .get("received")
+            .is_none());
+
+        let sent: Job = serde_json::from_str(
+            r#"{"type":"restore","service":"docker:abc","snapshot":"1700-move","received":"moves/7/shop-db-1/1700-move"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(sent, Job::Restore { received: Some(r), .. } if r == "moves/7/shop-db-1/1700-move")
+        );
     }
 
     #[test]

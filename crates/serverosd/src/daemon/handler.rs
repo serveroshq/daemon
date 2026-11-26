@@ -1213,7 +1213,11 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
-        Job::Restore { service, snapshot } => {
+        Job::Restore {
+            service,
+            snapshot,
+            received,
+        } => {
             let managed = managed(&app, &service).await?;
             // Containers' data is in what they mount, which only inspecting
             // them now tells; the same way the backup found it.
@@ -1222,13 +1226,41 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 service: managed.name.clone(),
                 snapshot: snapshot.clone(),
             }))?;
-            let result = restore_one(&app, &ctx, &managed, &strategy, &snapshot).await;
+            let result = async {
+                let sent_from = match &received {
+                    Some(received) => {
+                        ctx.progress.phase("receive", Some(2)).await;
+                        Some(
+                            super::backup_ops::take_received(
+                                &app, &managed, &strategy, received, &snapshot,
+                            )
+                            .await?,
+                        )
+                    }
+                    None => None,
+                };
+                let restored = restore_one(&app, &ctx, &managed, &strategy, &snapshot).await?;
+                // Restored, and kept with this machine's own snapshots: the
+                // copy sent here isn't needed any more.
+                if let Some(folder) = sent_from {
+                    let _ = std::fs::remove_dir_all(folder);
+                }
+                Ok::<_, Failure>(restored)
+            }
+            .await;
             grant.finish(
                 &result.as_ref().map(|_| ()),
                 result
                     .as_ref()
                     .ok()
-                    .map(|(safety, _)| format!("pre-restore snapshot {safety}"))
+                    .map(|(safety, _)| {
+                        let from = if received.is_some() {
+                            ", sent from another machine"
+                        } else {
+                            ""
+                        };
+                        format!("pre-restore snapshot {safety}{from}")
+                    })
                     .as_deref(),
             );
             let (safety, restored) = result?;
