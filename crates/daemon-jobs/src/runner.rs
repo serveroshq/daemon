@@ -26,8 +26,16 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, F
 pub trait Handler: Send + Sync + 'static {
     fn handle(&self, ctx: JobContext) -> HandlerFuture;
 
+    /// Values to keep out of the job as state.db records it: each is
+    /// replaced wherever it is a whole value, and scrubbed from longer text.
     fn known_secrets(&self, _job: &Job) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Values to scrub from the job's log wherever they turn up. Without
+    /// a list of its own, a job's known secrets of 8 characters or more.
+    fn log_secrets(&self, job: &Job) -> Vec<String> {
+        daemon_core::redact::long_values(self.known_secrets(job))
     }
 }
 
@@ -67,6 +75,7 @@ impl Runner {
 
     pub async fn submit(&self, id: Uuid, command: Command) {
         let secrets = self.handler.known_secrets(&command.job);
+        let log_secrets = self.handler.log_secrets(&command.job);
         let payload = recorded_payload(&command.job, &secrets);
         let actor = format!("{:?} {}", command.actor.kind, command.actor.name).to_lowercase();
         let kind = job_kind(&command.job);
@@ -136,7 +145,13 @@ impl Runner {
             .unwrap_or_else(|p| p.into_inner())
             .insert(id, cancel_tx);
 
-        let progress = Progress::new(id, Arc::clone(&self.state), self.updates.clone(), secrets);
+        let progress = Progress::new(
+            id,
+            Arc::clone(&self.state),
+            self.updates.clone(),
+            log_secrets,
+        );
+        let held = progress.clone();
         let ctx = JobContext {
             id,
             command,
@@ -166,6 +181,7 @@ impl Runner {
                 Err(_) => (JobState::TimedOut, None, Some(Failure::new("timeout", format!("gave up after {timeout:?}")).with_next_step("Retry; if it keeps timing out, raise limits.job_timeout_secs in daemon.toml."))),
             };
 
+            held.flush().await;
             finish(&state, &updates, id, status, result, error).await;
         });
     }
@@ -281,24 +297,31 @@ impl Runner {
 /// knows of is replaced wherever it is a whole value, and scrubbed from
 /// longer text as the log is, so it never rests on disk.
 fn recorded_payload(job: &Job, secrets: &[String]) -> String {
-    fn scrub(value: &mut serde_json::Value, secrets: &[&str]) {
+    fn scrub(value: &mut serde_json::Value, whole: &[&str], within: &[&str]) {
         match value {
             serde_json::Value::String(s) => {
-                *s = if !s.is_empty() && secrets.contains(&s.as_str()) {
+                *s = if !s.is_empty() && whole.contains(&s.as_str()) {
                     daemon_core::redact::REDACTED.to_string()
                 } else {
-                    daemon_core::redact::redact_known(s, secrets)
+                    daemon_core::redact::redact_known(s, within)
                 };
             }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(|v| scrub(v, secrets)),
-            serde_json::Value::Object(map) => map.values_mut().for_each(|v| scrub(v, secrets)),
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|v| scrub(v, whole, within))
+            }
+            serde_json::Value::Object(map) => {
+                map.values_mut().for_each(|v| scrub(v, whole, within))
+            }
             _ => {}
         }
     }
 
     let mut value = serde_json::to_value(job).unwrap_or_default();
-    let secrets: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    scrub(&mut value, &secrets);
+    let whole: Vec<&str> = secrets.iter().map(String::as_str).collect();
+    // Inside longer text only the longer ones: a short value (a port) is
+    // too likely to be part of something else.
+    let within: Vec<&str> = whole.iter().copied().filter(|s| s.len() >= 8).collect();
+    scrub(&mut value, &whole, &within);
     value.to_string()
 }
 

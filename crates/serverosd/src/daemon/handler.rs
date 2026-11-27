@@ -55,14 +55,41 @@ impl Handler for JobHandler {
             _ => Vec::new(),
         }
     }
+
+    fn log_secrets(&self, job: &Job) -> Vec<String> {
+        match job {
+            Job::Deploy(spec) => deploy_log_secrets(spec),
+            _ => daemon_core::redact::long_values(self.known_secrets(job)),
+        }
+    }
 }
 
-/// A deploy's settings, repository token and registry passwords: scrubbed
-/// from the job kept in state.db and from its log.
+/// A deploy's settings, build settings, repository token and registry
+/// passwords: none of them is kept in the job state.db records.
 fn deploy_secrets(spec: &daemon_protocol::DeploySpec) -> Vec<String> {
+    let build_args = spec.build.iter().flat_map(|b| b.args.values());
     spec.env
         .values()
+        .chain(build_args)
         .cloned()
+        .chain(spec.repo_token.iter().map(|t| t.0.clone()))
+        .chain(spec.registries.iter().map(|r| r.password.0.clone()))
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// What's scrubbed from a deploy's log: the token and registry passwords
+/// always, and the settings and build settings that look secret, so
+/// `APP_ENV=production` or a domain still reads as itself.
+fn deploy_log_secrets(spec: &daemon_protocol::DeploySpec) -> Vec<String> {
+    let build_args = spec.build.iter().flat_map(|b| b.args.iter());
+    let settings = spec
+        .env
+        .iter()
+        .chain(build_args)
+        .map(|(k, v)| (k.as_str(), v.as_str()));
+    daemon_core::redact::env_secrets(settings)
+        .into_iter()
         .chain(spec.repo_token.iter().map(|t| t.0.clone()))
         .chain(spec.registries.iter().map(|r| r.password.0.clone()))
         .filter(|s| !s.is_empty())
@@ -1755,5 +1782,42 @@ mod secret_tests {
         let mut secrets = deploy_secrets(&spec);
         secrets.sort();
         assert_eq!(secrets, ["base64:k", "ghp_secret", "ghs_token"]);
+    }
+
+    #[test]
+    fn deploy_logs_keep_plain_settings_and_lose_secret_ones() {
+        let spec: daemon_protocol::DeploySpec = serde_json::from_value(serde_json::json!({
+            "service": "web",
+            "commit": "abc",
+            "env": {
+                "APP_ENV": "production",
+                "APP_URL": "https://shop.example.com",
+                "APP_KEY": "base64:k",
+                "SIGNING_PEM": "-----BEGIN X-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldY\n-----END X-----",
+            },
+            "build": {"args": {"NPM_TOKEN": "npm_abc", "NODE_VERSION": "22"}},
+            "repo_token": "ghs_token",
+            "registries": [{"host": "ghcr.io", "username": "acme", "password": "ghp_secret"}],
+        }))
+        .unwrap();
+        let logged = super::deploy_log_secrets(&spec);
+        for scrubbed in [
+            "base64:k",
+            "npm_abc",
+            "ghs_token",
+            "ghp_secret",
+            "QUJDREVGR0hJSktMTU5PUFFSU1RVVldY",
+        ] {
+            assert!(logged.iter().any(|s| s == scrubbed), "{scrubbed}");
+        }
+        for kept in ["production", "https://shop.example.com", "22"] {
+            assert!(!logged.iter().any(|s| s == kept), "{kept}");
+        }
+
+        // The job state.db keeps has none of them, build settings included.
+        let all = deploy_secrets(&spec);
+        for value in ["production", "npm_abc", "22"] {
+            assert!(all.iter().any(|s| s == value), "{value}");
+        }
     }
 }
