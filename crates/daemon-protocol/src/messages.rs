@@ -972,7 +972,32 @@ pub enum Job {
         repo: String,
         #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
+        /// A token for a private HTTPS repository, as a deploy sends it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_token: Option<RepoToken>,
     },
+    /// A repository's files at a commit, without building anything, so the
+    /// panel can tell what kind of app it is on any git host: the commit,
+    /// its files up to three folders deep, and the small files that say how
+    /// an app is built. An SSH address uses the service's deploy key; an
+    /// HTTPS one is read as public or with `repo_token`. Missing `ref`
+    /// means the default branch. Read-only.
+    RepoInspect {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+        repo: String,
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+        git_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_token: Option<RepoToken>,
+    },
+    /// Install Docker Engine with its Compose and Buildx plugins from
+    /// Docker's own package repository (apt on Debian and Ubuntu, dnf on
+    /// Fedora and the RHEL family). Does nothing when Docker already runs
+    /// with both plugins. Needs confirmation; refused in read-only mode.
+    DockerInstall,
     Snapshots {
         service: String,
     },
@@ -1811,6 +1836,7 @@ mod tests {
                 service: "web".into(),
                 repo: "git@gitlab.com:acme/web.git".into(),
                 git_ref: Some("main".into()),
+                repo_token: None,
             }
         );
         assert_eq!(serde_json::to_value(&job).unwrap(), raw);
@@ -1818,8 +1844,98 @@ mod tests {
         let raw = serde_json::json!({"type": "resolve_ref", "service": "web", "repo": "x"});
         assert!(matches!(
             serde_json::from_value::<Job>(raw).unwrap(),
-            Job::ResolveRef { git_ref: None, .. }
+            Job::ResolveRef {
+                git_ref: None,
+                repo_token: None,
+                ..
+            }
         ));
+
+        let raw = serde_json::json!({
+            "type": "resolve_ref",
+            "service": "web",
+            "repo": "https://github.com/acme/private.git",
+            "repo_token": "ghs_abc",
+        });
+        let Job::ResolveRef { repo_token, .. } = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a resolve_ref");
+        };
+        assert_eq!(repo_token, Some(RepoToken("ghs_abc".into())));
+    }
+
+    #[test]
+    fn repo_inspect_jobs_need_only_the_repository() {
+        let raw =
+            serde_json::json!({"type": "repo_inspect", "repo": "https://github.com/acme/web.git"});
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        assert_eq!(
+            job,
+            Job::RepoInspect {
+                service: None,
+                repo: "https://github.com/acme/web.git".into(),
+                git_ref: None,
+                base_dir: None,
+                repo_token: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
+
+        let raw = serde_json::json!({
+            "type": "repo_inspect",
+            "service": "web",
+            "repo": "git@gitlab.com:acme/web.git",
+            "ref": "release/2",
+            "base_dir": "apps/web",
+            "repo_token": "glpat-x",
+        });
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        let Job::RepoInspect {
+            service,
+            git_ref,
+            base_dir,
+            repo_token,
+            ..
+        } = &job
+        else {
+            panic!("not a repo_inspect");
+        };
+        assert_eq!(service.as_deref(), Some("web"));
+        assert_eq!(git_ref.as_deref(), Some("release/2"));
+        assert_eq!(base_dir.as_deref(), Some("apps/web"));
+        assert_eq!(repo_token, &Some(RepoToken("glpat-x".into())));
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
+    }
+
+    #[test]
+    fn build_settings_fetch_submodules_and_lfs_unless_told_not_to() {
+        let raw = serde_json::json!({
+            "type": "deploy", "service": "web", "commit": "abc",
+            "build": {"method": "railpack", "start_command": "node server.js"},
+        });
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        let build = spec.build.unwrap();
+        assert_eq!(build.method, BuildMethod::Railpack);
+        assert!(build.submodules && build.lfs && !build.no_cache);
+        assert_eq!(build.start_command.as_deref(), Some("node server.js"));
+        assert_eq!(BuildSpec::default().method, BuildMethod::Dockerfile);
+        assert!(BuildSpec::default().submodules && BuildSpec::default().lfs);
+
+        let build: BuildSpec = serde_json::from_value(serde_json::json!({
+            "method": "image", "image": "nginx:alpine", "submodules": false, "lfs": false,
+        }))
+        .unwrap();
+        assert_eq!(build.method, BuildMethod::Image);
+        assert!(!build.submodules && !build.lfs);
+    }
+
+    #[test]
+    fn docker_install_is_a_job_with_no_fields() {
+        let raw = serde_json::json!({"type": "docker_install"});
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        assert_eq!(job, Job::DockerInstall);
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
     }
 
     #[test]

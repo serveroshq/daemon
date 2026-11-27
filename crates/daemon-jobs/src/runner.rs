@@ -385,6 +385,8 @@ pub fn job_kind(job: &Job) -> &'static str {
         Job::TailLogs { .. } => "tail_logs",
         Job::DeployKey { .. } => "deploy_key",
         Job::ResolveRef { .. } => "resolve_ref",
+        Job::RepoInspect { .. } => "repo_inspect",
+        Job::DockerInstall => "docker_install",
         Job::Snapshots { .. } => "snapshots",
         Job::DiskUsage { .. } => "disk_usage",
         Job::ServiceClone { .. } => "service_clone",
@@ -418,6 +420,7 @@ pub fn mutates(job: &Job) -> bool {
             | Job::Snapshots { .. }
             | Job::DiskUsage { .. }
             | Job::ResolveRef { .. }
+            | Job::RepoInspect { .. }
             | Job::DockerResources
             | Job::ImagePackages { .. }
     )
@@ -613,6 +616,32 @@ mod tests {
         assert_eq!(
             collect_until_terminal(&mut rx).await.last().unwrap().state,
             JobState::Refused
+        );
+
+        // Installing Docker changes the machine; reading a repository
+        // doesn't.
+        assert_eq!(job_kind(&Job::DockerInstall), "docker_install");
+        assert!(mutates(&Job::DockerInstall));
+        runner
+            .submit(Uuid::new_v4(), command(Job::DockerInstall))
+            .await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Refused
+        );
+        let inspect = Job::RepoInspect {
+            service: None,
+            repo: "https://github.com/acme/web.git".into(),
+            git_ref: None,
+            base_dir: None,
+            repo_token: None,
+        };
+        assert_eq!(job_kind(&inspect), "repo_inspect");
+        assert!(!mutates(&inspect));
+        runner.submit(Uuid::new_v4(), command(inspect)).await;
+        assert_eq!(
+            collect_until_terminal(&mut rx).await.last().unwrap().state,
+            JobState::Succeeded
         );
 
         runner.submit(Uuid::new_v4(), command(Job::Discover)).await;

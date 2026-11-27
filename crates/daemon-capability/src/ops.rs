@@ -49,6 +49,9 @@ pub enum MachineOp {
     },
     /// Remove images, volumes and build cache no container uses.
     PruneDocker,
+    /// Install Docker Engine and its Compose and Buildx plugins from
+    /// Docker's own package repository.
+    InstallDocker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,14 +75,40 @@ pub enum ServiceOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeployOp {
-    FetchSource { service: String, workspace: PathBuf },
-    Build { service: String, workspace: PathBuf },
-    SwapContainers { service: String },
-    WriteProxyConfig { service: String },
-    ObtainCertificate { domains: Vec<String> },
-    WriteEnvFile { service: String, path: PathBuf },
-    Rollback { service: String },
-    Release { service: String, path: PathBuf },
+    FetchSource {
+        service: String,
+        workspace: PathBuf,
+    },
+    /// Read a repository's files into a throwaway folder, to tell what
+    /// kind of app it is. Nothing is built or kept.
+    InspectSource {
+        service: String,
+        workspace: PathBuf,
+    },
+    Build {
+        service: String,
+        workspace: PathBuf,
+    },
+    SwapContainers {
+        service: String,
+    },
+    WriteProxyConfig {
+        service: String,
+    },
+    ObtainCertificate {
+        domains: Vec<String>,
+    },
+    WriteEnvFile {
+        service: String,
+        path: PathBuf,
+    },
+    Rollback {
+        service: String,
+    },
+    Release {
+        service: String,
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +148,7 @@ impl Operation {
                 MachineOp::ReadNamedLog { .. } => "log.read",
                 MachineOp::UpdateImage { .. } => "container.update_image",
                 MachineOp::PruneDocker => "docker.prune",
+                MachineOp::InstallDocker => "docker.install",
             },
             Operation::Service(s) => match s {
                 ServiceOp::Start { .. } => "service.start",
@@ -139,6 +169,7 @@ impl Operation {
             },
             Operation::Deploy(d) => match d {
                 DeployOp::FetchSource { .. } => "deploy.fetch",
+                DeployOp::InspectSource { .. } => "deploy.inspect",
                 DeployOp::Build { .. } => "deploy.build",
                 DeployOp::SwapContainers { .. } => "deploy.swap",
                 DeployOp::WriteProxyConfig { .. } => "deploy.proxy",
@@ -184,7 +215,7 @@ impl Operation {
                 MachineOp::ReadJournal { unit } => unit.clone().unwrap_or_else(|| "system".into()),
                 MachineOp::ReadNamedLog { path } => path.display().to_string(),
                 MachineOp::UpdateImage { container } => container.clone(),
-                MachineOp::PruneDocker => "docker".into(),
+                MachineOp::PruneDocker | MachineOp::InstallDocker => "docker".into(),
                 _ => "machine".into(),
             },
             Operation::Service(s) => match s {
@@ -206,6 +237,7 @@ impl Operation {
             },
             Operation::Deploy(d) => match d {
                 DeployOp::FetchSource { service, .. }
+                | DeployOp::InspectSource { service, .. }
                 | DeployOp::Build { service, .. }
                 | DeployOp::SwapContainers { service }
                 | DeployOp::WriteProxyConfig { service }
@@ -245,6 +277,7 @@ impl Operation {
                     | MachineOp::WriteTunnel
                     | MachineOp::UpdateImage { .. }
                     | MachineOp::PruneDocker
+                    | MachineOp::InstallDocker
             ),
             Operation::Service(s) => !matches!(
                 s,
@@ -253,7 +286,7 @@ impl Operation {
                     | ServiceOp::ReadUsage { .. }
                     | ServiceOp::ReadConfig { .. }
             ),
-            Operation::Deploy(_) => true,
+            Operation::Deploy(d) => !matches!(d, DeployOp::InspectSource { .. }),
             Operation::Data(d) => !matches!(d, DataOp::Browse { .. } | DataOp::ReadFile { .. }),
         }
     }
@@ -267,6 +300,7 @@ impl Operation {
                 | Operation::Machine(MachineOp::Reboot)
                 | Operation::Machine(MachineOp::UpdateImage { .. })
                 | Operation::Machine(MachineOp::PruneDocker)
+                | Operation::Machine(MachineOp::InstallDocker)
                 | Operation::Data(DataOp::Restore { .. })
                 | Operation::Service(ServiceOp::Remove { .. })
                 | Operation::Service(ServiceOp::Repair { .. })
@@ -280,6 +314,7 @@ impl Operation {
             Operation::Machine(MachineOp::ReadNamedLog { path }) => Some(path),
             Operation::Service(ServiceOp::ReadConfig { path, .. }) => Some(path),
             Operation::Deploy(DeployOp::FetchSource { workspace, .. }) => Some(workspace),
+            Operation::Deploy(DeployOp::InspectSource { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::Build { workspace, .. }) => Some(workspace),
             Operation::Deploy(DeployOp::WriteEnvFile { path, .. }) => Some(path),
             Operation::Deploy(DeployOp::Release { path, .. }) => Some(path),
