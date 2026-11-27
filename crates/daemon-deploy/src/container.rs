@@ -143,6 +143,13 @@ fn parse_image_volumes(json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether there's a local image called `tag`.
+pub async fn image_exists(tag: &str) -> bool {
+    docker_output(&["image", "inspect", "--format", "{{.Id}}", tag])
+        .await
+        .is_ok()
+}
+
 /// The value of `label` on a local image, or None when there's no such
 /// image or it hasn't got the label (images built before it was added).
 pub async fn image_label(tag: &str, label: &str) -> Option<String> {
@@ -242,10 +249,133 @@ fn failure_from(phase: &str, outcome: ChildOutcome, what: &str) -> Failure {
     }
 }
 
-fn build_args(buildkit: bool, dockerfile: &str, tag: &str, fingerprint: &str) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--pull".into()];
+/// A Dockerfile build's settings beyond the file itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DockerfileOptions<'a> {
+    /// The stage to build (`--target`).
+    pub target: Option<&'a str>,
+    /// No layer cache.
+    pub no_cache: bool,
+    /// The build's settings (`--build-arg`), by name; values go to docker
+    /// through its environment, never its command line.
+    pub settings: Option<&'a BuildSettings>,
+}
+
+/// Names the docker client and the daemon's children run by themselves, so
+/// a build setting can't take their place in the client's environment.
+const RESERVED_NAMES: &[&str] = &["PATH", "HOME", "LC_ALL", "TMPDIR", "USER", "SHELL"];
+const RESERVED_PREFIXES: &[&str] = &["DOCKER_", "BUILDKIT_", "BUILDX_", "SERVEROS_"];
+
+/// A build's settings (`BuildSpec::args`), ready to hand to docker or
+/// Railpack by name, with their values in the child's environment only.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct BuildSettings {
+    pub names: Vec<String>,
+    pub env: Vec<(String, String)>,
+    /// Names the build tools use themselves, left out of the build.
+    pub skipped: Vec<String>,
+}
+
+impl std::fmt::Debug for BuildSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuildSettings")
+            .field("names", &self.names)
+            .field("skipped", &self.skipped)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BuildSettings {
+    pub fn from_args(args: &BTreeMap<String, String>) -> Result<Self, Failure> {
+        let mut settings = Self::default();
+        for (name, value) in args {
+            let valid = name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.len() <= 128
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(Failure::new(
+                    "build",
+                    format!("{name:?} is not a valid build setting name"),
+                )
+                .with_next_step(
+                    "Use letters, digits and underscores, starting with a letter, like NODE_ENV.",
+                ));
+            }
+            let upper = name.to_ascii_uppercase();
+            if RESERVED_NAMES.contains(&upper.as_str())
+                || RESERVED_PREFIXES.iter().any(|p| upper.starts_with(p))
+            {
+                settings.skipped.push(name.clone());
+                continue;
+            }
+            settings.names.push(name.clone());
+            settings.env.push((name.clone(), value.clone()));
+        }
+        Ok(settings)
+    }
+
+    pub fn env_refs(&self) -> Vec<(&str, &str)> {
+        self.env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+
+    /// Says which settings the build gets, by name, and which it doesn't.
+    pub async fn log(&self, progress: &Progress) {
+        if !self.names.is_empty() {
+            progress
+                .line(format!("build settings: {}", self.names.join(", ")))
+                .await;
+        }
+        if !self.skipped.is_empty() {
+            progress
+                .line(format!(
+                    "{} left out of the build: the build tools use these names themselves",
+                    self.skipped.join(", ")
+                ))
+                .await;
+        }
+    }
+}
+
+/// A build stage's name, as `--target` takes it.
+pub fn valid_target(target: &str) -> bool {
+    (1..=128).contains(&target.len())
+        && !target.starts_with('-')
+        && target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn build_args(
+    buildkit: bool,
+    dockerfile: &str,
+    tag: &str,
+    fingerprint: &str,
+    pull: bool,
+    options: &DockerfileOptions<'_>,
+) -> Vec<String> {
+    let mut args = vec!["build".to_string()];
+    if pull {
+        args.push("--pull".into());
+    }
     if buildkit {
         args.push("--progress=plain".into());
+    }
+    if let Some(target) = options.target {
+        args.extend(["--target".into(), target.into()]);
+    }
+    if options.no_cache {
+        args.push("--no-cache".into());
+    }
+    // `--build-arg NAME` with no value: docker reads it from its own
+    // environment, so the value is never on a command line.
+    for name in options.settings.map(|s| s.names.as_slice()).unwrap_or(&[]) {
+        args.extend(["--build-arg".into(), name.clone()]);
     }
     args.extend([
         "--label".into(),
@@ -267,6 +397,7 @@ pub async fn build(
     dockerfile: Option<&str>,
     tag: &str,
     fingerprint: &str,
+    options: &DockerfileOptions<'_>,
     limits: &BuildLimits,
     extra_env: &[(&str, &str)],
     timeout: Duration,
@@ -280,11 +411,20 @@ pub async fn build(
             "build",
             format!("no {dockerfile} in the repository at this commit"),
         )
-        .with_next_step("Add a Dockerfile, or point the service at a Compose file."));
+        .with_next_step(
+            "Add a Dockerfile, point the app at a Compose file, or let ServerOS work out how to build it (Railpack) in the app's build settings.",
+        ));
+    }
+    if let Some(target) = options.target {
+        if !valid_target(target) {
+            return Err(Failure::new(
+                "build",
+                format!("{target:?} is not a Dockerfile stage name"),
+            )
+            .with_next_step("Use the name after AS in the Dockerfile's FROM line."));
+        }
     }
 
-    let cpu = format!("CPUQuota={}%", limits.cpu_percent);
-    let mem = format!("MemoryMax={}M", limits.memory_mb);
     // BuildKit needs Docker's buildx plugin, which distro packages (Ubuntu's
     // docker.io) often leave out; without it, the classic builder.
     let buildkit = has_buildx(cancel).await;
@@ -293,9 +433,20 @@ pub async fn build(
             .line("buildx isn't installed, so building with Docker's classic builder")
             .await;
     }
-    let docker_args = build_args(buildkit, dockerfile, tag, fingerprint);
-    let docker_args: Vec<&str> = docker_args.iter().map(String::as_str).collect();
-    let env = [builder_env(buildkit), extra_env].concat();
+    if let Some(settings) = options.settings {
+        settings.log(progress).await;
+    }
+    if options.no_cache {
+        progress
+            .line("building from scratch, without the layer cache")
+            .await;
+    }
+
+    let settings_env = options
+        .settings
+        .map(BuildSettings::env_refs)
+        .unwrap_or_default();
+    let env = [builder_env(buildkit), extra_env, &settings_env].concat();
 
     let scoped = scopes_work(cancel).await;
     if !scoped {
@@ -303,38 +454,87 @@ pub async fn build(
             .line("systemd can't put the build in a scope here, so it runs without CPU and memory limits")
             .await;
     }
-    let outcome = if scoped {
-        let mut args: Vec<&str> = vec!["--scope", "--quiet", "-p", &cpu, "-p", &mem, "docker"];
-        args.extend(docker_args.iter());
-        run_child(
-            "systemd-run",
-            &args,
-            Some(workspace),
-            &env,
-            timeout,
-            cancel,
-            progress,
-            None,
-        )
-        .await
-    } else {
-        run_child(
+
+    let mut pull = true;
+    loop {
+        let docker_args = build_args(buildkit, dockerfile, tag, fingerprint, pull, options);
+        let docker_args: Vec<&str> = docker_args.iter().map(String::as_str).collect();
+        let outcome = run_scoped(
             "docker",
             &docker_args,
-            Some(workspace),
+            workspace,
             &env,
+            limits,
+            scoped,
+            timeout,
+            cancel,
+            progress,
+        )
+        .await;
+
+        if outcome.success() {
+            return Ok(());
+        }
+        // `--pull` asks Docker Hub for the newest base image every time;
+        // when it's over its limit, the ones already here will do.
+        if pull && crate::buildlog::rate_limited(outcome.tail()) {
+            pull = false;
+            progress
+                .line("Docker Hub's pull limit was reached; building again with the base images already on this machine")
+                .await;
+            continue;
+        }
+        return Err(crate::buildlog::build_failure(
+            "build",
+            outcome,
+            "docker build",
+        ));
+    }
+}
+
+/// Runs a build command in a systemd scope with the build's CPU and memory
+/// limits when `scoped`, or as it is. The command's environment passes
+/// through the scope untouched and never shows in its unit's properties.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_scoped(
+    program: &str,
+    args: &[&str],
+    dir: &Path,
+    env: &[(&str, &str)],
+    limits: &BuildLimits,
+    scoped: bool,
+    timeout: Duration,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> ChildOutcome {
+    if scoped {
+        let cpu = format!("CPUQuota={}%", limits.cpu_percent);
+        let mem = format!("MemoryMax={}M", limits.memory_mb);
+        let mut scope: Vec<&str> = vec!["--scope", "--quiet", "-p", &cpu, "-p", &mem, program];
+        scope.extend(args.iter());
+        run_child(
+            "systemd-run",
+            &scope,
+            Some(dir),
+            env,
             timeout,
             cancel,
             progress,
             None,
         )
         .await
-    };
-
-    if outcome.success() {
-        Ok(())
     } else {
-        Err(failure_from("build", outcome, "docker build"))
+        run_child(
+            program,
+            args,
+            Some(dir),
+            env,
+            timeout,
+            cancel,
+            progress,
+            None,
+        )
+        .await
     }
 }
 
@@ -580,33 +780,39 @@ pub async fn logs_tail(container: &str, lines: usize, progress: &Progress) -> Ve
         .collect()
 }
 
-static HAS_BUILDX: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+static HAS_BUILDX: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SCOPES_WORK: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
 
 /// Whether this machine's Docker has the buildx plugin BuildKit needs.
-/// Asked once per daemon run: it doesn't change while the daemon runs
-/// (installing buildx is followed by a restart, like any package).
+/// Once it has, that's remembered for the daemon's run; until then it's
+/// asked each build, since installing Docker from the panel adds it
+/// without restarting the daemon.
 async fn has_buildx(_cancel: &mut watch::Receiver<bool>) -> bool {
-    *HAS_BUILDX
-        .get_or_init(|| async {
-            // Its own cancel: a job's cancel mustn't decide the answer for every later build.
-            let (_tx, mut never) = watch::channel(false);
-            capture_child(
-                "docker",
-                &["buildx", "version"],
-                &[],
-                Duration::from_secs(15),
-                &mut never,
-                5,
-            )
-            .await
-            .code()
-                == Some(0)
-        })
-        .await
+    use std::sync::atomic::Ordering;
+
+    if HAS_BUILDX.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Its own cancel: a job's cancel mustn't decide the answer.
+    let (_tx, mut never) = watch::channel(false);
+    let found = capture_child(
+        "docker",
+        &["buildx", "version"],
+        &[],
+        Duration::from_secs(15),
+        &mut never,
+        5,
+    )
+    .await
+    .code()
+        == Some(0);
+    if found {
+        HAS_BUILDX.store(true, Ordering::Relaxed);
+    }
+    found
 }
 
-fn builder_env(buildkit: bool) -> &'static [(&'static str, &'static str)] {
+pub(crate) fn builder_env(buildkit: bool) -> &'static [(&'static str, &'static str)] {
     if buildkit {
         &[("DOCKER_BUILDKIT", "1")]
     } else {
@@ -618,7 +824,7 @@ fn builder_env(buildkit: bool) -> &'static [(&'static str, &'static str)] {
 /// limits). Having systemd isn't enough: inside containers and some LXC
 /// hosts `systemd-run --scope` can't create one and the build never starts,
 /// so it's tried first, and without one the build runs as it is.
-async fn scopes_work(_cancel: &mut watch::Receiver<bool>) -> bool {
+pub(crate) async fn scopes_work(_cancel: &mut watch::Receiver<bool>) -> bool {
     *SCOPES_WORK
         .get_or_init(|| async {
             let (_tx, mut never) = watch::channel(false);
@@ -672,7 +878,8 @@ mod tests {
 
     #[test]
     fn builds_are_labelled_with_what_they_were_built_from() {
-        let args = build_args(true, "Dockerfile", "serveros/shop:abc", "f00d");
+        let none = DockerfileOptions::default();
+        let args = build_args(true, "Dockerfile", "serveros/shop:abc", "f00d", true, &none);
         assert_eq!(
             args,
             [
@@ -688,8 +895,10 @@ mod tests {
                 "."
             ]
         );
+        assert!(!build_args(false, "Dockerfile", "t", "f", true, &none)
+            .contains(&"--progress=plain".to_string()));
         assert!(
-            !build_args(false, "Dockerfile", "t", "f").contains(&"--progress=plain".to_string())
+            !build_args(true, "Dockerfile", "t", "f", false, &none).contains(&"--pull".to_string())
         );
 
         assert_eq!(
@@ -733,6 +942,58 @@ mod tests {
             limit_args(&limits(None, Some(4))).unwrap_err().phase,
             "limits"
         );
+    }
+
+    #[test]
+    fn build_settings_go_by_name_and_their_values_never_on_the_command_line() {
+        let args: BTreeMap<String, String> = [
+            ("NPM_TOKEN", "npm_s3cret"),
+            ("NODE_ENV", "production"),
+            ("PATH", "/evil"),
+            ("DOCKER_HOST", "tcp://x"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let settings = BuildSettings::from_args(&args).unwrap();
+        assert_eq!(settings.names, ["NODE_ENV", "NPM_TOKEN"]);
+        assert_eq!(settings.skipped, ["DOCKER_HOST", "PATH"]);
+        assert_eq!(
+            settings.env_refs(),
+            [("NODE_ENV", "production"), ("NPM_TOKEN", "npm_s3cret")]
+        );
+        assert!(!format!("{settings:?}").contains("npm_s3cret"));
+
+        let options = DockerfileOptions {
+            target: Some("web"),
+            no_cache: true,
+            settings: Some(&settings),
+        };
+        let argv = build_args(
+            true,
+            "Dockerfile",
+            "serveros/shop:abc",
+            "f00d",
+            true,
+            &options,
+        );
+        assert!(argv
+            .iter()
+            .all(|a| !a.contains("npm_s3cret") && !a.contains("production")));
+        let joined = argv.join(" ");
+        assert!(joined.contains("--target web"));
+        assert!(joined.contains("--no-cache"));
+        assert!(joined.contains("--build-arg NODE_ENV --build-arg NPM_TOKEN"));
+        assert!(joined.ends_with("-t serveros/shop:abc ."));
+
+        for bad in ["", "1X", "MY-VAR", "a.b", "X Y"] {
+            let args = BTreeMap::from([(bad.to_string(), "v".to_string())]);
+            assert!(BuildSettings::from_args(&args).is_err(), "{bad:?}");
+        }
+        assert!(valid_target("web-prod_1.2"));
+        for bad in ["", "-x", "a b", "a;b"] {
+            assert!(!valid_target(bad), "{bad:?}");
+        }
     }
 
     #[test]

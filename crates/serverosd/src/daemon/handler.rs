@@ -31,6 +31,11 @@ impl Handler for JobHandler {
         match job {
             Job::Deploy(spec) => deploy_secrets(spec),
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
+            Job::ResolveRef { repo_token, .. } => repo_token
+                .iter()
+                .map(|t| t.0.clone())
+                .filter(|s| !s.is_empty())
+                .collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
             Job::ImageUpdate { registries, .. } => registries
@@ -57,12 +62,14 @@ impl Handler for JobHandler {
     }
 }
 
-/// A deploy's settings, repository token and registry passwords: scrubbed
-/// from the job kept in state.db and from its log.
+/// A deploy's settings (the app's and its build's), repository token and
+/// registry passwords: scrubbed from the job kept in state.db and from its
+/// log.
 fn deploy_secrets(spec: &daemon_protocol::DeploySpec) -> Vec<String> {
     spec.env
         .values()
         .cloned()
+        .chain(spec.build.iter().flat_map(|b| b.args.values().cloned()))
         .chain(spec.repo_token.iter().map(|t| t.0.clone()))
         .chain(spec.registries.iter().map(|r| r.password.0.clone()))
         .filter(|s| !s.is_empty())
@@ -671,6 +678,7 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             service,
             repo,
             git_ref,
+            repo_token,
         } => {
             let grant = authorize(Operation::Deploy(DeployOp::FetchSource {
                 service: service.clone(),
@@ -679,7 +687,13 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             let mut cancel = ctx.cancel.clone();
             let result = app
                 .deployer
-                .resolve_ref(&service, &repo, git_ref.as_deref(), &mut cancel)
+                .resolve_ref(
+                    &service,
+                    &repo,
+                    git_ref.as_deref(),
+                    repo_token.as_ref().map(|t| t.0.as_str()),
+                    &mut cancel,
+                )
                 .await;
             grant.finish(&result.as_ref().map(|_| ()), Some("resolve ref"));
             Ok(json!(result?))
