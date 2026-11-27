@@ -98,6 +98,7 @@ make test           # the whole suite
 make clippy         # lints, warnings denied
 make linux-check    # type-check for Linux from macOS via Docker
 make e2e-networks   # project networks and data copies on real WireGuard, in Docker
+make e2e-deploys    # Docker installs and deploys (Dockerfile, Railpack, images), in Docker
 make release        # static musl binaries in dist/ (needs cargo-zigbuild on macOS)
 ```
 
@@ -190,6 +191,15 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   and kept stopped for a rollback. Ports, settings, volumes, the shared
   network, release commands, timeouts and what happens when a deploy
   fails are in [docs/running-apps.md](docs/running-apps.md).
+- **Deploys**: an app's image is built from its Dockerfile, by
+  [Railpack](https://railpack.com) when it has none (Node, Python, Go, PHP,
+  static sites and more, worked out from its files), or pulled ready-made,
+  and a Compose file runs as it is. Before anything is fetched the daemon
+  checks Docker runs, has the plugins the build needs and has room on
+  disk, and says what to do when it hasn't. The `docker_install` job puts
+  Docker on a machine from Docker's own repository, and `repo_inspect`
+  reads what's in a repository without building it. Build methods,
+  settings and both jobs are in [docs/deploys.md](docs/deploys.md).
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.

@@ -90,6 +90,17 @@ pub struct Auth<'a> {
 /// The environment that gives git an `Authorization` header for the
 /// repository's host, as actions/checkout does.
 pub fn token_env(repo: &str, token: &str) -> Vec<(&'static str, String)> {
+    let (key, value) = token_header(repo, token);
+    vec![
+        ("GIT_CONFIG_COUNT", "1".to_string()),
+        ("GIT_CONFIG_KEY_0", key),
+        ("GIT_CONFIG_VALUE_0", value),
+    ]
+}
+
+/// The git setting that sends a token to the repository's host, and only
+/// there: submodules on the same host get it too, others don't.
+fn token_header(repo: &str, token: &str) -> (String, String) {
     use base64::Engine;
 
     let origin = repo
@@ -98,15 +109,46 @@ pub fn token_env(repo: &str, token: &str) -> Vec<(&'static str, String)> {
         .map(|host| format!("https://{host}/"))
         .unwrap_or_else(|| "https://github.com/".to_string());
     let basic = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    (
+        format!("http.{origin}.extraheader"),
+        format!("AUTHORIZATION: basic {basic}"),
+    )
+}
 
-    vec![
-        ("GIT_CONFIG_COUNT", "1".to_string()),
-        ("GIT_CONFIG_KEY_0", format!("http.{origin}.extraheader")),
-        (
-            "GIT_CONFIG_VALUE_0",
-            format!("AUTHORIZATION: basic {basic}"),
-        ),
-    ]
+/// Everything git is given for a fetch, through its environment so none of
+/// it lands in `.git/config`, a remote URL or the job's output: how to
+/// reach SSH hosts, never to ask anything, and the token for HTTPS ones.
+/// A repository on this machine (`file://`, for tests) may have submodules
+/// on it too, which git refuses by default for remote ones.
+pub(crate) fn git_env(repo: &str, auth: Auth<'_>) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("GIT_SSH_COMMAND".to_string(), ssh_command(auth.deploy_key)),
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        // LFS files are fetched on purpose, after the checkout, when the
+        // build wants them; a machine-wide git-lfs mustn't do it before.
+        ("GIT_LFS_SKIP_SMUDGE".to_string(), "1".to_string()),
+    ];
+    let mut config = Vec::new();
+    if let Some(token) = auth.token.filter(|t| !t.is_empty()) {
+        if repo.starts_with("https://") {
+            config.push(token_header(repo, token));
+        }
+    }
+    if repo.starts_with("file://") {
+        config.push(("protocol.file.allow".to_string(), "always".to_string()));
+    }
+    if !config.is_empty() {
+        env.push(("GIT_CONFIG_COUNT".to_string(), config.len().to_string()));
+        for (i, (key, value)) in config.into_iter().enumerate() {
+            env.push((format!("GIT_CONFIG_KEY_{i}"), key));
+            env.push((format!("GIT_CONFIG_VALUE_{i}"), value));
+        }
+    }
+    env
+}
+
+fn is_ssh(repo: &str) -> bool {
+    repo.starts_with("git@") || repo.starts_with("ssh://")
 }
 
 pub fn valid_commit(sha: &str) -> bool {
@@ -134,13 +176,30 @@ fn ssh_command(deploy_key: Option<&Path>) -> String {
     }
 }
 
-/// What to do about git failing to reach a repository, from what it said.
-fn reach_hint(output: &[String]) -> &'static str {
-    if output
+/// What to do about git failing to reach a repository, from what it said
+/// and how it was asked: a deploy key only opens SSH addresses, and a
+/// token only HTTPS ones.
+pub(crate) fn reach_hint(repo: &str, has_token: bool, output: &[String]) -> &'static str {
+    const REFUSED: &[&str] = &[
+        "Permission denied",
+        "could not read Username",
+        "could not read Password",
+        "Authentication failed",
+        "terminal prompts disabled",
+        "Access denied",
+        "Repository not found",
+        "returned error: 401",
+        "returned error: 403",
+    ];
+    let refused = output
         .iter()
-        .any(|l| l.contains("Permission denied") || l.contains("could not read Username"))
-    {
+        .any(|l| REFUSED.iter().any(|needle| l.contains(needle)));
+    if refused && is_ssh(repo) {
         "Add the machine's deploy key to the repository (Settings → Deploy keys)."
+    } else if refused && has_token {
+        "The git host refused ServerOS's access to this repository. Reconnect the git host in ServerOS, then try again."
+    } else if refused {
+        "If the repository is private, connect its git host in ServerOS, or use its SSH address and add the machine's deploy key."
     } else if output
         .iter()
         .any(|l| l.contains("couldn't find remote ref") || l.contains("not our ref"))
@@ -166,7 +225,7 @@ pub fn valid_ref(name: &str) -> bool {
 }
 
 /// A full commit SHA (SHA-1, or SHA-256 for repositories that use it).
-fn full_sha(name: &str) -> bool {
+pub(crate) fn full_sha(name: &str) -> bool {
     matches!(name.len(), 40 | 64) && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 
@@ -182,7 +241,7 @@ pub struct ResolvedRef {
 /// exactly that name, then the branch, then the commit an annotated tag
 /// points at, then the tag. Without a name, the default branch (HEAD),
 /// named by the branch it points to when git says.
-fn pick_ref(output: &[String], wanted: Option<&str>) -> Option<ResolvedRef> {
+pub(crate) fn pick_ref(output: &[String], wanted: Option<&str>) -> Option<ResolvedRef> {
     let refs: Vec<(&str, &str)> = output
         .iter()
         .filter_map(|line| line.split_once('\t'))
@@ -228,12 +287,13 @@ fn pick_ref(output: &[String], wanted: Option<&str>) -> Option<ResolvedRef> {
 }
 
 /// The commit a branch or tag points at in `repo`, or the default branch
-/// when there's no name, asked with git ls-remote over the deploy key. A
-/// full SHA is already a commit, so it's given back without asking.
+/// when there's no name, asked with git ls-remote over the deploy key (SSH)
+/// or the token (HTTPS). A full SHA is already a commit, so it's given back
+/// without asking.
 pub async fn resolve_ref(
     repo: &str,
     git_ref: Option<&str>,
-    deploy_key: Option<&Path>,
+    auth: Auth<'_>,
     cancel: &mut watch::Receiver<bool>,
 ) -> Result<ResolvedRef, Failure> {
     if !valid_repo(repo) {
@@ -258,11 +318,8 @@ pub async fn resolve_ref(
         }
     }
 
-    let ssh = ssh_command(deploy_key);
-    let env = [
-        ("GIT_SSH_COMMAND", ssh.as_str()),
-        ("GIT_TERMINAL_PROMPT", "0"),
-    ];
+    let env = git_env(repo, auth);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     // `--` ends the options, so neither the URL nor the name can be one.
     // git only lists an annotated tag's commit (`v1^{}`) when asked for it
     // by that name too.
@@ -283,7 +340,7 @@ pub async fn resolve_ref(
                 .with_next_step("Push a commit to the repository first."),
         }),
         Captured::Exited { code, stderr, .. } => {
-            let hint = reach_hint(&stderr);
+            let hint = reach_hint(repo, auth.token.is_some_and(|t| !t.is_empty()), &stderr);
             Err(
                 Failure::new("resolve", format!("git ls-remote exited {code}"))
                     .with_output(stderr)
@@ -302,11 +359,32 @@ pub async fn resolve_ref(
     }
 }
 
+/// What a fetch brings besides the commit's own files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FetchOptions {
+    /// The repository's submodules, recursively, each at the commit the
+    /// repository records, shallow.
+    pub submodules: bool,
+    /// Git LFS files, when the repository's `.gitattributes` uses LFS.
+    pub lfs: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            submodules: true,
+            lfs: true,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch(
     repo: &str,
     commit: &str,
     workspace: &Path,
     auth: Auth<'_>,
+    options: FetchOptions,
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
@@ -328,63 +406,76 @@ pub async fn fetch(
     std::fs::create_dir_all(workspace)
         .map_err(|e| Failure::new("fetch", format!("could not create workspace: {e}")))?;
 
-    let mut env = vec![
-        ("GIT_SSH_COMMAND", ssh_command(auth.deploy_key)),
-        ("GIT_TERMINAL_PROMPT", "0".to_string()),
-    ];
     // A token for a private HTTPS repository goes in as an auth header
     // through git's environment (git 2.31+), so it's never in the remote
-    // URL, .git/config or the job's output.
-    if let Some(token) = auth.token.filter(|t| !t.is_empty()) {
-        env.extend(token_env(repo, token));
-    }
-    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    // URL, .git/config or the job's output. Submodules and LFS are fetched
+    // by child gits that inherit it.
+    let env = git_env(repo, auth);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let has_token = auth.token.is_some_and(|t| !t.is_empty());
+    let git = Git {
+        repo,
+        has_token,
+        workspace,
+        env: &env,
+        timeout,
+    };
 
-    let steps: [(&str, Vec<&str>); 4] = [
-        ("init", vec!["init", "-q"]),
-        ("remote", vec!["remote", "add", "origin", repo]),
-        (
-            "fetch",
-            vec!["fetch", "-q", "--depth", "1", "origin", commit],
-        ),
-        ("checkout", vec!["checkout", "-q", "FETCH_HEAD"]),
-    ];
+    git.run("init", &["init", "-q"], cancel, progress).await?;
+    git.run(
+        "remote",
+        &["remote", "add", "origin", repo],
+        cancel,
+        progress,
+    )
+    .await?;
+    git.run(
+        "fetch",
+        &["fetch", "-q", "--depth", "1", "origin", commit],
+        cancel,
+        progress,
+    )
+    .await?;
+    git.run(
+        "checkout",
+        &["checkout", "-q", "FETCH_HEAD"],
+        cancel,
+        progress,
+    )
+    .await?;
 
-    for (name, args) in steps {
-        let outcome = run_child(
-            "git",
-            &args,
-            Some(workspace),
-            &env,
-            timeout,
+    if options.submodules && workspace.join(".gitmodules").is_file() {
+        progress.line("fetching the repository's submodules").await;
+        git.run(
+            "submodule update",
+            &[
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+                "--depth",
+                "1",
+            ],
             cancel,
             progress,
-            None,
         )
-        .await;
+        .await?;
+    }
 
-        match outcome {
-            ChildOutcome::Exited { code: 0, .. } => {}
-            ChildOutcome::Cancelled { tail } => {
-                return Err(
-                    Failure::new("cancelled", "deploy cancelled during fetch").with_output(tail)
-                )
-            }
-            ChildOutcome::TimedOut { tail } => {
-                return Err(Failure::new("fetch", format!("git {name} timed out"))
-                    .with_output(tail)
-                    .with_next_step("Check the repository is reachable from this machine."))
-            }
-            ChildOutcome::Unstartable(e) => {
-                return Err(Failure::new("fetch", e).with_next_step("Install git on the machine."))
-            }
-            ChildOutcome::Exited { code, tail } => {
-                let hint = reach_hint(&tail);
-                return Err(Failure::new("fetch", format!("git {name} exited {code}"))
-                    .with_output(tail)
-                    .with_next_step(hint));
-            }
-        }
+    if options.lfs && uses_lfs(workspace) {
+        ensure_lfs(cancel, progress).await?;
+        progress
+            .line("fetching the repository's Git LFS files")
+            .await;
+        git.run(
+            "lfs install",
+            &["lfs", "install", "--local"],
+            cancel,
+            progress,
+        )
+        .await?;
+        git.run("lfs pull", &["lfs", "pull"], cancel, progress)
+            .await?;
     }
 
     progress
@@ -392,6 +483,175 @@ pub async fn fetch(
         .await;
 
     Ok(())
+}
+
+/// One fetch's git commands: same repository, folder and settings.
+struct Git<'a> {
+    repo: &'a str,
+    has_token: bool,
+    workspace: &'a Path,
+    env: &'a [(&'a str, &'a str)],
+    timeout: Duration,
+}
+
+impl Git<'_> {
+    async fn run(
+        &self,
+        name: &str,
+        args: &[&str],
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> Result<(), Failure> {
+        let outcome = run_child(
+            "git",
+            args,
+            Some(self.workspace),
+            self.env,
+            self.timeout,
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+
+        match outcome {
+            ChildOutcome::Exited { code: 0, .. } => Ok(()),
+            ChildOutcome::Cancelled { tail } => {
+                Err(Failure::new("cancelled", "deploy cancelled during fetch").with_output(tail))
+            }
+            ChildOutcome::TimedOut { tail } => {
+                Err(Failure::new("fetch", format!("git {name} timed out"))
+                    .with_output(tail)
+                    .with_next_step("Check the repository is reachable from this machine."))
+            }
+            ChildOutcome::Unstartable(e) => {
+                Err(Failure::new("fetch", e).with_next_step("Install git on the machine."))
+            }
+            ChildOutcome::Exited { code, tail } => {
+                let hint = reach_hint(self.repo, self.has_token, &tail);
+                Err(Failure::new("fetch", format!("git {name} exited {code}"))
+                    .with_output(tail)
+                    .with_next_step(hint))
+            }
+        }
+    }
+}
+
+/// How far down a checkout `.gitattributes` files are looked for, and how
+/// many entries are read at most, so a huge repository can't stall it.
+const ATTRIBUTES_DEPTH: usize = 6;
+const ATTRIBUTES_ENTRIES: usize = 20_000;
+
+/// Whether any `.gitattributes` in the checkout hands files to Git LFS.
+pub fn uses_lfs(workspace: &Path) -> bool {
+    let mut dirs = vec![(workspace.to_path_buf(), 0usize)];
+    let mut seen = 0usize;
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > ATTRIBUTES_ENTRIES {
+                return false;
+            }
+            let name = entry.file_name();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if depth < ATTRIBUTES_DEPTH && name != ".git" && name != "node_modules" {
+                    dirs.push((entry.path(), depth + 1));
+                }
+            } else if kind.is_file()
+                && name == ".gitattributes"
+                && std::fs::read_to_string(entry.path()).is_ok_and(|text| attributes_use_lfs(&text))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn attributes_use_lfs(text: &str) -> bool {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .any(|l| l.split_whitespace().skip(1).any(|a| a == "filter=lfs"))
+}
+
+/// git-lfs from the machine's own package manager, as the proxies are
+/// installed, when it isn't there.
+const LFS_INSTALL_SCRIPT: &str = r#"set -eu
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get -o DPkg::Lock::Timeout=300 update -q
+  apt-get -o DPkg::Lock::Timeout=300 install -y -q git-lfs
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y git-lfs
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y git-lfs
+elif command -v apk >/dev/null 2>&1; then
+  apk add --no-cache git-lfs
+else
+  echo "installing git-lfs needs apt, dnf, yum or apk" >&2
+  exit 3
+fi
+"#;
+
+static LFS_INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn ensure_lfs(
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> Result<(), Failure> {
+    let _one_at_a_time = LFS_INSTALL.lock().await;
+    let has_lfs = |cancel: &mut watch::Receiver<bool>| {
+        let mut cancel = cancel.clone();
+        async move {
+            capture_child(
+                "git",
+                &["lfs", "version"],
+                &[],
+                Duration::from_secs(15),
+                &mut cancel,
+                5,
+            )
+            .await
+            .code()
+                == Some(0)
+        }
+    };
+    if has_lfs(cancel).await {
+        return Ok(());
+    }
+
+    progress
+        .line("the repository uses Git LFS and git-lfs is not installed: installing it")
+        .await;
+    let outcome = run_child(
+        "sh",
+        &["-c", LFS_INSTALL_SCRIPT],
+        None,
+        &[],
+        Duration::from_secs(600),
+        cancel,
+        progress,
+        None,
+    )
+    .await;
+    if outcome.success() && has_lfs(cancel).await {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "fetch",
+        "the repository uses Git LFS, and git-lfs couldn't be installed",
+    )
+    .with_output(outcome.tail().to_vec())
+    .with_next_step(
+        "Install git-lfs on the machine (git-lfs.com), or turn off Git LFS in the app's build settings, then deploy again.",
+    ))
 }
 
 #[cfg(test)]
@@ -519,23 +779,30 @@ mod tests {
     async fn a_full_sha_is_its_own_commit_and_bad_input_is_refused() {
         let (_tx, mut cancel) = watch::channel(false);
         let sha = "AB".repeat(20);
-        let resolved = resolve_ref("git@gitlab.com:a/b.git", Some(&sha), None, &mut cancel)
-            .await
-            .unwrap();
+        let resolved = resolve_ref(
+            "git@gitlab.com:a/b.git",
+            Some(&sha),
+            Auth::default(),
+            &mut cancel,
+        )
+        .await
+        .unwrap();
         assert_eq!(resolved.commit, "ab".repeat(20));
 
         let refused = resolve_ref(
             "git@gitlab.com:a/b.git",
             Some("--upload-pack=x"),
-            None,
+            Auth::default(),
             &mut cancel,
         )
         .await
         .unwrap_err();
         assert!(refused.message.contains("not a branch or tag"));
-        assert!(resolve_ref("-oProxyCommand=x", None, None, &mut cancel)
-            .await
-            .is_err());
+        assert!(
+            resolve_ref("-oProxyCommand=x", None, Auth::default(), &mut cancel)
+                .await
+                .is_err()
+        );
 
         assert_eq!(
             serde_json::to_value(&resolved).unwrap(),
@@ -566,26 +833,213 @@ mod tests {
 
         let repo = format!("file://{}", dir.path().display());
         let (_tx, mut cancel) = watch::channel(false);
-        let branch = resolve_ref(&repo, Some("trunk"), None, &mut cancel)
+        let branch = resolve_ref(&repo, Some("trunk"), Auth::default(), &mut cancel)
             .await
             .unwrap();
         assert_eq!(
             (branch.commit.as_str(), branch.git_ref.as_str()),
             (head, "refs/heads/trunk")
         );
-        let tag = resolve_ref(&repo, Some("v1"), None, &mut cancel)
+        let tag = resolve_ref(&repo, Some("v1"), Auth::default(), &mut cancel)
             .await
             .unwrap();
         assert_eq!(
             (tag.commit.as_str(), tag.git_ref.as_str()),
             (head, "refs/tags/v1")
         );
-        let default = resolve_ref(&repo, None, None, &mut cancel).await.unwrap();
+        let default = resolve_ref(&repo, None, Auth::default(), &mut cancel)
+            .await
+            .unwrap();
         assert_eq!(default.commit, head);
-        let missing = resolve_ref(&repo, Some("nope"), None, &mut cancel)
+        let missing = resolve_ref(&repo, Some("nope"), Auth::default(), &mut cancel)
             .await
             .unwrap_err();
         assert_eq!(missing.message, "no branch or tag called nope");
+    }
+
+    fn sh(dir: &Path, script: &str) -> String {
+        let out = std::process::Command::new("sh")
+            .args(["-c", script])
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+            .env("GIT_CONFIG_VALUE_0", "always")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn progress() -> Progress {
+        let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+        Progress::new(uuid::Uuid::new_v4(), state, tx, vec![])
+    }
+
+    #[tokio::test]
+    async fn fetches_submodules_recursively_unless_told_not_to() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        sh(
+            &root.join("lib"),
+            "git init -q -b main && echo lib > lib.txt && git add . && git commit -qm lib",
+        );
+        sh(
+            &root.join("app"),
+            "git init -q -b main && echo app > app.txt && git add app.txt && git submodule -q add ../lib vendor/lib && git commit -qm app",
+        );
+        let commit = sh(&root.join("app"), "git rev-parse HEAD");
+        let repo = format!("file://{}", root.join("app").display());
+        let (_tx, mut cancel) = watch::channel(false);
+
+        let with = root.join("with");
+        fetch(
+            &repo,
+            &commit,
+            &with,
+            Auth::default(),
+            FetchOptions::default(),
+            Duration::from_secs(60),
+            &mut cancel,
+            &progress(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(with.join("app.txt")).unwrap(),
+            "app\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(with.join("vendor/lib/lib.txt")).unwrap(),
+            "lib\n"
+        );
+        // Nothing of how it was fetched is kept in the checkout's config.
+        let config = std::fs::read_to_string(with.join(".git/config")).unwrap();
+        assert!(!config.contains("extraheader") && !config.contains("protocol"));
+
+        let without = root.join("without");
+        fetch(
+            &repo,
+            &commit,
+            &without,
+            Auth::default(),
+            FetchOptions {
+                submodules: false,
+                lfs: false,
+            },
+            Duration::from_secs(60),
+            &mut cancel,
+            &progress(),
+        )
+        .await
+        .unwrap();
+        assert!(without.join("app.txt").is_file());
+        assert!(!without.join("vendor/lib/lib.txt").exists());
+    }
+
+    #[test]
+    fn lfs_is_only_fetched_for_repositories_that_use_it() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!uses_lfs(dir.path()));
+        std::fs::write(dir.path().join(".gitattributes"), "*.sh text eol=lf\n").unwrap();
+        assert!(!uses_lfs(dir.path()));
+        std::fs::create_dir_all(dir.path().join("assets/models")).unwrap();
+        std::fs::write(
+            dir.path().join("assets/models/.gitattributes"),
+            "# big files\n*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        assert!(uses_lfs(dir.path()));
+        // Not in git's own folder, though.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(other.path().join(".git")).unwrap();
+        std::fs::write(
+            other.path().join(".git/.gitattributes"),
+            "*.bin filter=lfs\n",
+        )
+        .unwrap();
+        assert!(!uses_lfs(other.path()));
+        assert!(!attributes_use_lfs("# *.bin filter=lfs\n"));
+    }
+
+    #[test]
+    fn a_failed_reach_says_what_opens_that_kind_of_address() {
+        let denied = vec!["git@github.com: Permission denied (publickey).".to_string()];
+        assert!(reach_hint("git@github.com:acme/app.git", false, &denied).contains("deploy key"));
+
+        let https = vec![
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+                .to_string(),
+        ];
+        let hint = reach_hint("https://github.com/acme/app.git", false, &https);
+        assert!(hint.contains("connect its git host"), "{hint}");
+        assert!(hint.contains("SSH address"));
+        let hint = reach_hint("https://github.com/acme/app.git", true, &https);
+        assert!(hint.contains("Reconnect the git host"), "{hint}");
+
+        let missing = vec!["fatal: couldn't find remote ref deadbeef".to_string()];
+        assert!(reach_hint("https://x/y.git", false, &missing).contains("push it first"));
+        for hint in [
+            reach_hint("git@x:y.git", false, &denied),
+            reach_hint("https://x/y.git", false, &https),
+            reach_hint("https://x/y.git", true, &https),
+        ] {
+            assert!(!hint.contains('\u{2014}'));
+        }
+    }
+
+    #[test]
+    fn fetch_settings_go_through_the_environment_only() {
+        let env = git_env(
+            "https://gitlab.com/acme/app.git",
+            Auth {
+                deploy_key: None,
+                token: Some("glpat-secret"),
+            },
+        );
+        let get = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(get("GIT_CONFIG_COUNT"), Some("1"));
+        assert_eq!(
+            get("GIT_CONFIG_KEY_0"),
+            Some("http.https://gitlab.com/.extraheader")
+        );
+        assert!(env.iter().all(|(_, v)| !v.contains("glpat-secret")));
+        assert_eq!(get("GIT_LFS_SKIP_SMUDGE"), Some("1"));
+        assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
+
+        // A token is for HTTPS hosts; an SSH address doesn't get it.
+        let ssh = git_env(
+            "git@github.com:acme/app.git",
+            Auth {
+                deploy_key: Some(Path::new("/var/lib/serveros/keys/web")),
+                token: Some("ghs_x"),
+            },
+        );
+        assert!(ssh.iter().all(|(k, _)| k != "GIT_CONFIG_COUNT"));
+        assert!(ssh
+            .iter()
+            .any(|(k, v)| k == "GIT_SSH_COMMAND" && v.contains("/var/lib/serveros/keys/web")));
     }
 
     #[test]

@@ -30,6 +30,7 @@ make fmt            # format
 make linux-check    # type-check for Linux from macOS via Docker
 make messy-check    # discovery against a deliberately messy server
 make e2e-networks   # project networks end to end, in Docker
+make e2e-deploys    # Docker installs and deploys end to end, in Docker
 ```
 
 Before you push, `cargo fmt --all -- --check`, `make clippy` and `make test` should pass. CI also runs the tests as root and builds static musl binaries for amd64 and arm64.

@@ -245,6 +245,34 @@ mod tests {
     }
 
     #[test]
+    fn installing_docker_is_a_confirmed_change() {
+        let install = Operation::Machine(MachineOp::InstallDocker);
+        let checks = checks_for(&install);
+
+        assert_eq!(install.verb(), "docker.install");
+        assert_eq!(install.target(), "docker");
+        assert!(install.mutates());
+        assert!(checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::ReadOnlyMode));
+    }
+
+    #[test]
+    fn reading_a_repository_is_allowed_in_read_only_mode_inside_the_jobs_folder() {
+        let inspect = Operation::Deploy(crate::ops::DeployOp::InspectSource {
+            service: "web".into(),
+            workspace: PathBuf::from("/var/lib/serveros/jobs/abc"),
+        });
+        let checks = checks_for(&inspect);
+
+        assert_eq!(inspect.verb(), "deploy.inspect");
+        assert_eq!(inspect.target(), "web");
+        assert!(!inspect.mutates());
+        assert!(!checks.contains(&Check::ReadOnlyMode));
+        assert!(!checks.contains(&Check::Confirmation));
+        assert!(checks.contains(&Check::PermittedRoots));
+    }
+
+    #[test]
     fn removing_is_confirmed_and_limited_to_created_or_adopted_services() {
         let remove = Operation::Service(ServiceOp::Remove {
             service: "docker:abc123def456".into(),

@@ -35,6 +35,10 @@ pub struct DeployResult {
     /// the image's EXPOSE, or 80. Missing for Compose apps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_port: Option<u16>,
+    /// How the release's image was made: dockerfile, railpack, image or
+    /// compose. Missing from older daemons, and on a rollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_method: Option<String>,
 }
 
 pub struct Deployer {
@@ -256,22 +260,85 @@ impl Deployer {
     }
 
     /// The commit `git_ref` (a branch or tag, or the default branch when
-    /// missing) points at in `repo`, asked over the service's deploy key.
+    /// missing) points at in `repo`, asked over the service's deploy key,
+    /// or with `token` for a private HTTPS repository.
     pub async fn resolve_ref(
         &self,
         service: &str,
         repo: &str,
         git_ref: Option<&str>,
+        token: Option<&str>,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<git::ResolvedRef, Failure> {
         let (private_key, _) = git::key_paths(&self.keys_dir(), service);
         git::resolve_ref(
             repo,
             git_ref,
-            private_key.exists().then_some(private_key.as_path()),
+            git::Auth {
+                deploy_key: private_key.exists().then_some(private_key.as_path()),
+                token,
+            },
             cancel,
         )
         .await
+    }
+
+    /// A repository's files at a commit (the `repo_inspect` job), read in
+    /// a folder of the job's own that's removed after. An SSH address uses
+    /// `service`'s deploy key when it has one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inspect_repo(
+        &self,
+        job: &str,
+        service: Option<&str>,
+        repo: &str,
+        git_ref: Option<&str>,
+        base_dir: Option<&str>,
+        token: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<crate::inspect::RepoFiles, Failure> {
+        let key = service
+            .map(|s| git::key_paths(&self.keys_dir(), s).0)
+            .filter(|k| k.exists());
+        crate::inspect::inspect(
+            &self.paths.jobs_dir().join(job),
+            crate::inspect::Request {
+                repo,
+                git_ref,
+                base_dir,
+                auth: git::Auth {
+                    deploy_key: key.as_deref(),
+                    token,
+                },
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// The key in state.db holding the last Railpack build of an app, as
+    /// `<image tag> <fingerprint>`: Railpack's frontend doesn't take image
+    /// labels, so this is how a redeploy of the same files knows it can use
+    /// the image as it is.
+    fn railpack_key(service: &str) -> String {
+        format!("deploy.{}.railpack_build", git::sanitise(service))
+    }
+
+    async fn railpack_built(&self, service: &str, tag: &str, fingerprint: &str) -> bool {
+        let remembered = self
+            .state
+            .kv_get(&Self::railpack_key(service))
+            .ok()
+            .flatten();
+        remembered.as_deref() == Some(format!("{tag} {fingerprint}").as_str())
+            && container::image_exists(tag).await
+    }
+
+    fn remember_railpack_build(&self, service: &str, tag: &str, fingerprint: &str) {
+        let _ = self.state.kv_set(
+            &Self::railpack_key(service),
+            &format!("{tag} {fingerprint}"),
+        );
     }
 
     /// Writes a release's env file, root-only: every setting in Compose's
@@ -740,6 +807,8 @@ impl Deployer {
         let service = &spec.service;
         let commit = &spec.commit;
         let step_timeout = left(until);
+        let method = BuildMethod::of(spec)?;
+        let build = spec.build.clone().unwrap_or_default();
         // Settings that can't work are refused before anything is fetched.
         container::plan_env(&spec.env)?;
         container::check_volumes(&spec.volumes)?;
@@ -752,15 +821,35 @@ impl Deployer {
             (None, Some(dir)) => Some(base_dir_path(dir)?),
             _ => None,
         };
+        let settings = container::BuildSettings::from_args(&build.args)?;
 
         // An image already built from these same files (the live commit
-        // redeployed for an env change, say) is used as it is.
+        // redeployed for an env change, say) is used as it is, unless the
+        // build is asked to start from scratch.
         let tag = container::image_tag(service, commit);
         let fingerprint = build_fingerprint(spec);
-        let built = spec.compose_file.is_none()
-            && container::image_label(&tag, container::BUILD_LABEL)
-                .await
-                .is_some_and(|label| label == fingerprint);
+        let built = !build.no_cache
+            && match method {
+                BuildMethod::Dockerfile => container::image_label(&tag, container::BUILD_LABEL)
+                    .await
+                    .is_some_and(|label| label == fingerprint),
+                BuildMethod::Railpack => self.railpack_built(service, &tag, &fingerprint).await,
+                BuildMethod::Image | BuildMethod::Compose => false,
+            };
+
+        // What the build needs from the machine, before anything is fetched.
+        crate::preflight::check(
+            crate::preflight::Needs {
+                compose: method == BuildMethod::Compose,
+                buildx: method == BuildMethod::Railpack && !built,
+                image_space: !built,
+                fetch_space: !built && method != BuildMethod::Image && !spec.repo.is_empty(),
+            },
+            &self.paths.jobs_dir(),
+            cancel,
+            progress,
+        )
+        .await?;
 
         progress.phase("fetch", Some(15)).await;
         if built {
@@ -769,6 +858,10 @@ impl Deployer {
                     "image for {} is already built with the same files; skipping the build",
                     &commit[..7.min(commit.len())]
                 ))
+                .await;
+        } else if method == BuildMethod::Image {
+            progress
+                .line("deploying a prebuilt image: nothing to fetch or build".to_string())
                 .await;
         } else if spec.repo.is_empty() {
             if spec.files.is_empty() {
@@ -790,13 +883,17 @@ impl Deployer {
                     deploy_key: private_key.exists().then_some(private_key.as_path()),
                     token: spec.repo_token.as_ref().map(|t| t.0.as_str()),
                 },
+                git::FetchOptions {
+                    submodules: build.submodules,
+                    lfs: build.lfs,
+                },
                 step_timeout,
                 cancel,
                 progress,
             )
             .await?;
         }
-        let context = if built {
+        let context = if built || method == BuildMethod::Image {
             None
         } else {
             let context = build_context(workspace, base_dir, commit, !spec.repo.is_empty())?;
@@ -817,19 +914,55 @@ impl Deployer {
         let env_file = self.write_env(service, commit, &docker_env_file(&env.file))?;
 
         progress.phase("build", Some(40)).await;
-        if let Some(context) = &context {
-            container::build(
-                context,
-                spec.dockerfile.as_deref(),
-                &tag,
-                &fingerprint,
-                &self.build_limits,
-                docker_env,
-                step_timeout,
-                cancel,
-                progress,
-            )
-            .await?;
+        match (method, &context) {
+            (BuildMethod::Image, _) => {
+                crate::image::pull(
+                    build.image.as_deref().unwrap_or_default(),
+                    &tag,
+                    docker_env,
+                    step_timeout,
+                    cancel,
+                    progress,
+                )
+                .await?;
+            }
+            (BuildMethod::Railpack, Some(context)) => {
+                crate::railpack::RailpackBuild {
+                    state_dir: &self.paths.state_dir,
+                    plan_dir: &self.paths.jobs_dir().join(format!("{}-railpack", ctx.id)),
+                    service,
+                    context,
+                    tag: &tag,
+                    build: &build,
+                    settings: &settings,
+                    limits: &self.build_limits,
+                    docker_env,
+                    timeout: step_timeout,
+                }
+                .run(cancel, progress)
+                .await?;
+                self.remember_railpack_build(service, &tag, &fingerprint);
+            }
+            (_, Some(context)) => {
+                container::build(
+                    context,
+                    spec.dockerfile.as_deref(),
+                    &tag,
+                    &fingerprint,
+                    &container::DockerfileOptions {
+                        target: build.target.as_deref().filter(|t| !t.is_empty()),
+                        no_cache: build.no_cache,
+                        settings: Some(&settings),
+                    },
+                    &self.build_limits,
+                    docker_env,
+                    step_timeout,
+                    cancel,
+                    progress,
+                )
+                .await?;
+            }
+            (_, None) => {}
         }
 
         progress.phase("start", Some(60)).await;
@@ -1017,6 +1150,7 @@ impl Deployer {
             restart_note: None,
             limits,
             container_port: Some(container_port),
+            build_method: Some(method.name().into()),
         };
         *touched.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
 
@@ -1204,6 +1338,7 @@ impl Deployer {
             restart_note: Some("Compose projects are recreated in place, so the service restarted briefly during this deploy.".into()),
             limits: None,
             container_port: None,
+            build_method: Some("compose".into()),
         };
         *touched.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
         Ok(result)
@@ -1378,6 +1513,7 @@ impl Deployer {
             restart_note: None,
             limits: None,
             container_port: release.container_port,
+            build_method: None,
         })
     }
 }
@@ -1490,6 +1626,72 @@ fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Re
     previous.filter(|prev| prev.container != container)
 }
 
+/// How a deploy makes its image: the spec's build method, or its Compose
+/// file, checked against what each needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildMethod {
+    Compose,
+    Dockerfile,
+    Railpack,
+    Image,
+}
+
+impl BuildMethod {
+    fn of(spec: &DeploySpec) -> Result<Self, Failure> {
+        use daemon_protocol::BuildMethod as Asked;
+
+        let asked = spec.build.as_ref().map(|b| b.method);
+        if spec.compose_file.is_some() {
+            return match asked {
+                None | Some(Asked::Dockerfile) => Ok(Self::Compose),
+                Some(_) => Err(Failure::new(
+                    "prepare",
+                    "a Compose app is built from its Compose file",
+                )
+                .with_next_step(
+                    "Leave the build method as it is for Compose apps, or stop using the Compose file.",
+                )),
+            };
+        }
+        match asked.unwrap_or_default() {
+            Asked::Dockerfile => Ok(Self::Dockerfile),
+            Asked::Railpack => Ok(Self::Railpack),
+            Asked::Image => {
+                let image = spec
+                    .build
+                    .as_ref()
+                    .and_then(|b| b.image.as_deref())
+                    .unwrap_or_default();
+                if image.trim().is_empty() {
+                    return Err(Failure::new("prepare", "no image to deploy")
+                        .with_next_step("Set the image to run, like nginx:alpine."));
+                }
+                // The release is named for its commit, so an image deploy
+                // still needs one: an id the panel makes for it.
+                if !git::valid_commit(&spec.commit) {
+                    return Err(Failure::new(
+                        "prepare",
+                        format!(
+                            "{:?} can't name a release: it has to be 7 to 64 hex characters",
+                            spec.commit
+                        ),
+                    ));
+                }
+                Ok(Self::Image)
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Compose => "compose",
+            Self::Dockerfile => "dockerfile",
+            Self::Railpack => "railpack",
+            Self::Image => "image",
+        }
+    }
+}
+
 const MAX_JOB_FILES: usize = 64;
 const MAX_JOB_FILE_BYTES: usize = 256 * 1024;
 
@@ -1537,6 +1739,32 @@ fn build_fingerprint(spec: &DeploySpec) -> String {
         field(&mut hash, content);
     }
     optional(&mut hash, spec.base_dir.as_deref());
+    // How it's built, when that isn't the plain Dockerfile build every
+    // image before build settings was, so those images stay reusable.
+    // Not `no_cache`: a build from scratch makes the same image.
+    let plain = |b: &&daemon_protocol::BuildSpec| {
+        let mut b = (*b).clone();
+        b.no_cache = false;
+        b == daemon_protocol::BuildSpec::default()
+    };
+    if let Some(build) = spec.build.as_ref().filter(|b| !plain(b)) {
+        field(&mut hash, "build/2");
+        field(
+            &mut hash,
+            BuildMethod::of(spec).map(BuildMethod::name).unwrap_or("?"),
+        );
+        optional(&mut hash, build.image.as_deref());
+        optional(&mut hash, build.target.as_deref());
+        hash.update((build.args.len() as u64).to_le_bytes());
+        for (name, value) in &build.args {
+            field(&mut hash, name);
+            field(&mut hash, value);
+        }
+        optional(&mut hash, build.install_command.as_deref());
+        optional(&mut hash, build.build_command.as_deref());
+        optional(&mut hash, build.start_command.as_deref());
+        hash.update([u8::from(build.submodules), u8::from(build.lfs)]);
+    }
     hex::encode(hash.finalize())
 }
 
@@ -1544,7 +1772,7 @@ const MAX_BASE_DIR_LEN: usize = 256;
 
 /// The app's folder in its repository, as a path that can only lead inside
 /// it: relative, and without `..` or `.` parts.
-fn base_dir_path(base_dir: &str) -> Result<&Path, Failure> {
+pub(crate) fn base_dir_path(base_dir: &str) -> Result<&Path, Failure> {
     use std::path::Component;
 
     let path = Path::new(base_dir);
@@ -1764,6 +1992,116 @@ mod tests {
         let mut b = spec.clone();
         b.files = [("a".to_string(), "bc".to_string())].into();
         assert_ne!(build_fingerprint(&a), build_fingerprint(&b));
+    }
+
+    #[test]
+    fn build_settings_change_the_fingerprint_but_old_plain_builds_keep_theirs() {
+        let spec: DeploySpec = serde_json::from_value(serde_json::json!({
+            "service": "web",
+            "repo": "https://github.com/acme/shop.git",
+            "commit": "a".repeat(40),
+        }))
+        .unwrap();
+        let base = build_fingerprint(&spec);
+
+        // The default build, sent explicitly or asked to start from
+        // scratch, makes the same image as before build settings.
+        let mut same = spec.clone();
+        same.build = Some(daemon_protocol::BuildSpec::default());
+        assert_eq!(build_fingerprint(&same), base);
+        same.build.as_mut().unwrap().no_cache = true;
+        assert_eq!(build_fingerprint(&same), base);
+
+        type Change = Box<dyn Fn(&mut daemon_protocol::BuildSpec)>;
+        let changes: Vec<Change> = vec![
+            Box::new(|b| b.method = daemon_protocol::BuildMethod::Railpack),
+            Box::new(|b| b.target = Some("web".into())),
+            Box::new(|b| {
+                b.args.insert("NODE_ENV".into(), "production".into());
+            }),
+            Box::new(|b| {
+                b.args.insert("NODE_ENV".into(), "development".into());
+            }),
+            Box::new(|b| b.install_command = Some("npm ci".into())),
+            Box::new(|b| b.build_command = Some("npm run build".into())),
+            Box::new(|b| b.start_command = Some("node server.js".into())),
+            Box::new(|b| b.submodules = false),
+            Box::new(|b| b.lfs = false),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base]);
+        for change in changes {
+            let mut changed = spec.clone();
+            let mut build = daemon_protocol::BuildSpec::default();
+            change(&mut build);
+            changed.build = Some(build);
+            assert!(seen.insert(build_fingerprint(&changed)), "{changed:?}");
+        }
+    }
+
+    #[test]
+    fn build_methods_are_checked_against_what_they_need() {
+        let spec = |extra: serde_json::Value| -> DeploySpec {
+            let mut raw = serde_json::json!({"service": "web", "commit": "a".repeat(40)});
+            raw.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(raw).unwrap()
+        };
+        let method = |extra| BuildMethod::of(&spec(extra));
+
+        assert_eq!(
+            method(serde_json::json!({})).unwrap(),
+            BuildMethod::Dockerfile
+        );
+        assert_eq!(
+            method(serde_json::json!({"compose_file": "compose.yaml"})).unwrap(),
+            BuildMethod::Compose
+        );
+        assert_eq!(
+            method(serde_json::json!({"build": {"method": "railpack"}})).unwrap(),
+            BuildMethod::Railpack
+        );
+        assert_eq!(
+            method(serde_json::json!({"build": {"method": "image", "image": "nginx:alpine"}}))
+                .unwrap()
+                .name(),
+            "image"
+        );
+        let no_image = method(serde_json::json!({"build": {"method": "image"}})).unwrap_err();
+        assert!(no_image.next_step.unwrap().contains("nginx:alpine"));
+        assert!(method(serde_json::json!({
+            "compose_file": "compose.yaml", "build": {"method": "railpack"}
+        }))
+        .is_err());
+        let mut bad_commit = spec(serde_json::json!({
+            "build": {"method": "image", "image": "nginx:alpine"}
+        }));
+        bad_commit.commit = "nginx:alpine".into();
+        assert!(BuildMethod::of(&bad_commit).is_err());
+    }
+
+    #[test]
+    fn deploy_results_say_how_the_image_was_made() {
+        let result = DeployResult {
+            service: "web".into(),
+            commit: "a".repeat(40),
+            container: "serveros-web-aaaaaaaaaaaa".into(),
+            port: 20001,
+            domains: vec![],
+            previous: None,
+            restart_note: None,
+            limits: None,
+            container_port: None,
+            build_method: Some("railpack".into()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["build_method"], "railpack");
+        let json = serde_json::to_value(DeployResult {
+            build_method: None,
+            ..result
+        })
+        .unwrap();
+        assert!(json.get("build_method").is_none());
     }
 
     #[test]
