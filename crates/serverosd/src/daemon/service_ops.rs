@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use daemon_deploy::container::APP_LABEL;
@@ -376,11 +377,23 @@ pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> V
         keys.push(key);
     }
 
-    let prefix = format!("{project}-");
+    // The app each container that's still there belongs to, from its
+    // label, so `shop` never claims `shop-api`'s containers.
+    let apps: BTreeMap<String, String> = docker_lines(&[
+        "ps",
+        "-a",
+        "--format",
+        &format!("{{{{.Names}}}}\t{{{{.Label \"{APP_LABEL}\"}}}}"),
+    ])
+    .await
+    .iter()
+    .filter_map(|row| row.split_once('\t'))
+    .map(|(name, app)| (name.to_string(), app.trim().to_string()))
+    .collect();
     for managed in registry.all().unwrap_or_default() {
         let ours = match &managed.run_by {
             RunBy::Compose { project: p, .. } => p == &project,
-            RunBy::Docker { container } => container.starts_with(&prefix),
+            RunBy::Docker { container } => is_release_of(&spec.service, container, &apps),
             _ => false,
         };
         if ours && managed.origin == ServiceOrigin::Created && !keys.contains(&managed.key) {
@@ -389,6 +402,22 @@ pub async fn register_deploy(app: &App, spec: &DeploySpec, container: &str) -> V
     }
 
     keys
+}
+
+/// Whether `container` is one of `service`'s releases. The deployer names
+/// them `serveros-<app>-<commit>`, with `-b` after it for a commit started
+/// again beside itself, and labels them with the app. A container that's
+/// still there is told by its label; one that's gone by its name, where the
+/// part after the app has to be a commit: up to 12 hex characters.
+fn is_release_of(service: &str, container: &str, apps: &BTreeMap<String, String>) -> bool {
+    if let Some(app) = apps.get(container).filter(|app| !app.is_empty()) {
+        return app == service;
+    }
+    let Some(rest) = container.strip_prefix(&format!("serveros-{}-", sanitise(service))) else {
+        return false;
+    };
+    let commit = rest.strip_suffix("-b").unwrap_or(rest);
+    (1..=12).contains(&commit.len()) && commit.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 pub async fn register_earlier_deploys(app: &App) -> usize {
@@ -538,6 +567,50 @@ mod tests {
 
         assert_eq!(volumes, vec!["pgdata", "3a9e0c"]);
         assert_eq!(binds, vec!["/var/lib/pterodactyl/volumes/8f2c"]);
+    }
+
+    #[test]
+    fn an_apps_releases_are_its_own_containers_only() {
+        let none = BTreeMap::new();
+        for name in [
+            "serveros-shop-abcdef123456",
+            "serveros-shop-abcdef123456-b",
+            "serveros-shop-a1b2c3d",
+        ] {
+            assert!(is_release_of("shop", name, &none), "{name}");
+        }
+        for name in [
+            "serveros-shop-api-abcdef123456",
+            "serveros-shop-api-abcdef123456-b",
+            "serveros-shop-staging-a1b2c3d",
+            "serveros-shop",
+            "serveros-shop-",
+            "serveros-shop-abcdef1234567",
+            "serveros-shopping-abcdef123456",
+        ] {
+            assert!(!is_release_of("shop", name, &none), "{name}");
+        }
+        assert!(is_release_of(
+            "shop-api",
+            "serveros-shop-api-abcdef123456",
+            &none
+        ));
+
+        // A container that's still there goes by its label.
+        let apps = BTreeMap::from([
+            ("serveros-shop-cafe-b".to_string(), "shop-cafe".to_string()),
+            ("serveros-shop-cafe".to_string(), "shop".to_string()),
+            ("serveros-shop-abc123".to_string(), String::new()),
+        ]);
+        assert!(!is_release_of("shop", "serveros-shop-cafe-b", &apps));
+        assert!(is_release_of("shop", "serveros-shop-cafe", &apps));
+        assert!(is_release_of("shop", "serveros-shop-abc123", &apps));
+        // Names go through the same sanitising as the deployer's.
+        assert!(is_release_of("my app", "serveros-my-app-abc1234", &none));
+        assert_eq!(
+            daemon_deploy::container::container_name("my app", "abc1234"),
+            "serveros-my-app-abc1234"
+        );
     }
 
     #[test]
