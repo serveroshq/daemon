@@ -372,11 +372,11 @@ mod tests {
     #[test]
     fn long_values_that_look_generated_are_scrubbed_under_any_name() {
         for value in [
-            "sk_live_51HxQ2pLk9mN3vB7c",
+            "pk_demo_51HxQ2pLk9mN3vB7c",
             "aB3dE5fG7hJ9kL1m",
             "550e8400-e29b-41d4-a716-446655440000",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",
-            "https://hooks.slack.com/services/T0001/B0001/XxYyZz0123456789AbCd",
+            "https://hooks.example.com/services/T0001/B0001/XxYyZz0123456789AbCd",
             "https://api.example.com/v1?api_key=abcdef",
             "/run/secrets/aB3dE5fG7hJ9kL1mN",
             "hunter2hunter2!",

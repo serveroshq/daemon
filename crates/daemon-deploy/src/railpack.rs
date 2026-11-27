@@ -837,13 +837,13 @@ mod tests {
     #[test]
     fn secrets_go_to_buildkit_by_name_and_values_stay_off_the_command_line() {
         let env = vec![
-            ("API_KEY".to_string(), "sk_live_123".to_string()),
+            ("API_KEY".to_string(), "fake_key_123".to_string()),
             ("NODE_ENV".to_string(), "production".to_string()),
         ];
         let hash = secrets_hash(&env);
         assert_eq!(hash.len(), 64);
         let mut changed = env.clone();
-        changed[0].1 = "sk_live_124".into();
+        changed[0].1 = "fake_key_124".into();
         assert_ne!(secrets_hash(&changed), hash);
 
         let args = buildx_args(
@@ -857,7 +857,7 @@ mod tests {
             true,
         );
         let joined = args.join(" ");
-        assert!(!joined.contains("sk_live_123") && !joined.contains("production"));
+        assert!(!joined.contains("fake_key_123") && !joined.contains("production"));
         assert!(joined.starts_with("buildx build --load --progress=plain"));
         assert!(joined.contains(&format!("--build-arg BUILDKIT_SYNTAX={FRONTEND}")));
         assert!(joined.contains("--build-arg cache-key=serveros-web"));
