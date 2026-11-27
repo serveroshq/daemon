@@ -120,6 +120,14 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         if closed > 0 {
             warn!(closed, "closed jobs that were running when the daemon last stopped");
         }
+        let swept = daemon_deploy::deployer::sweep_workspaces(
+            &paths.jobs_dir(),
+            Duration::from_secs(24 * 3600),
+            std::time::SystemTime::now(),
+        );
+        if swept > 0 {
+            info!(swept, "removed workspaces left by deploys that never finished");
+        }
 
         if recent_starts > 5 {
             app.raise(daemon_protocol::Event {

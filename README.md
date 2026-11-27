@@ -185,6 +185,11 @@ firewall = "ufw"     # ufw | nftables | iptables | none
   The job's fields, checks and results, and how the panel copies a
   database between machines over the network, are in
   [docs/project-networks.md](docs/project-networks.md).
+- **Deployed apps**: each release runs as a container on Docker's bridge,
+  published on `127.0.0.1`, health checked before the proxy moves to it,
+  and kept stopped for a rollback. Ports, settings, volumes, the shared
+  network, release commands, timeouts and what happens when a deploy
+  fails are in [docs/running-apps.md](docs/running-apps.md).
 - **Links**: the default panel (`SERVEROS_PANEL_URL`) and the docs base
   (`SERVEROS_DOCS_URL`) are build-time environment variables, and the
   release download allowlist is `[updates] allowed_hosts`.
