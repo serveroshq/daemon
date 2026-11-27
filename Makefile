@@ -34,7 +34,7 @@ endif
 
 TARGETS := x86_64-unknown-linux-musl aarch64-unknown-linux-musl
 
-.PHONY: build test check clippy fmt release gateway linux-check messy-check e2e-networks clean
+.PHONY: build test check clippy fmt release gateway linux-check messy-check e2e-networks e2e-deploys clean
 
 build:
 	cargo build --workspace
@@ -83,6 +83,13 @@ messy-check:
 ## BACKENDS="ufw none" to run only some.
 e2e-networks:
 	tests/e2e/networks/run.sh $(BACKENDS)
+
+## Deploys end to end: Docker installed by the docker_install job on a
+## fresh machine in Docker, then a Dockerfile app, Railpack builds (Node,
+## a static site, Flask) and a prebuilt image, each checked over HTTP.
+## STORE=classic for Docker's pre-containerd image store.
+e2e-deploys:
+	tests/e2e/deploys/run.sh
 
 clean:
 	cargo clean
