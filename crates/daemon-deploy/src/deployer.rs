@@ -102,6 +102,39 @@ impl Deployer {
         .await
     }
 
+    /// A repository's files at a commit (the `repo_inspect` job), read in
+    /// a folder of the job's own that's removed after. An SSH address uses
+    /// `service`'s deploy key when it has one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn inspect_repo(
+        &self,
+        job: &str,
+        service: Option<&str>,
+        repo: &str,
+        git_ref: Option<&str>,
+        base_dir: Option<&str>,
+        token: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<crate::inspect::RepoFiles, Failure> {
+        let key = service
+            .map(|s| git::key_paths(&self.keys_dir(), s).0)
+            .filter(|k| k.exists());
+        crate::inspect::inspect(
+            &self.paths.jobs_dir().join(job),
+            crate::inspect::Request {
+                repo,
+                git_ref,
+                base_dir,
+                auth: git::Auth {
+                    deploy_key: key.as_deref(),
+                    token,
+                },
+            },
+            cancel,
+        )
+        .await
+    }
+
     /// The key in state.db holding the last Railpack build of an app, as
     /// `<image tag> <fingerprint>`: Railpack's frontend doesn't take image
     /// labels, so this is how a redeploy of the same files knows it can use

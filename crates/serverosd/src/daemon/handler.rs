@@ -31,7 +31,7 @@ impl Handler for JobHandler {
         match job {
             Job::Deploy(spec) => deploy_secrets(spec),
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
-            Job::ResolveRef { repo_token, .. } => repo_token
+            Job::ResolveRef { repo_token, .. } | Job::RepoInspect { repo_token, .. } => repo_token
                 .iter()
                 .map(|t| t.0.clone())
                 .filter(|s| !s.is_empty())
@@ -697,6 +697,62 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 .await;
             grant.finish(&result.as_ref().map(|_| ()), Some("resolve ref"));
             Ok(json!(result?))
+        }
+
+        Job::RepoInspect {
+            service,
+            repo,
+            git_ref,
+            base_dir,
+            repo_token,
+        } => {
+            let job = ctx.id.to_string();
+            let grant = authorize(Operation::Deploy(DeployOp::InspectSource {
+                service: service.clone().unwrap_or_else(|| "repository".into()),
+                workspace: app.paths.jobs_dir().join(&job),
+            }))?;
+            ctx.progress.phase("inspect", Some(10)).await;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .inspect_repo(
+                    &job,
+                    service.as_deref(),
+                    &repo,
+                    git_ref.as_deref(),
+                    base_dir.as_deref(),
+                    repo_token.as_ref().map(|t| t.0.as_str()),
+                    &mut cancel,
+                )
+                .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("commit {}", &r.commit[..7.min(r.commit.len())]))
+                    .as_deref(),
+            );
+            Ok(serde_json::to_value(result?).unwrap_or(Value::Null))
+        }
+
+        Job::DockerInstall => {
+            let grant = authorize(Operation::Machine(MachineOp::InstallDocker))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = daemon_deploy::docker_install::install(&mut cancel, &ctx.progress).await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|r| format!("Docker {}", r.version))
+                    .as_deref(),
+            );
+            let result = result?;
+            // A fresh look at the machine, so the panel sees Docker (its
+            // systemd unit, then its containers) without waiting.
+            app.discovery_wake.notify_one();
+            Ok(serde_json::to_value(result).unwrap_or(Value::Null))
         }
 
         Job::Deploy(spec) => {
