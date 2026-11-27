@@ -1791,21 +1791,27 @@ impl Proxy {
         })?;
 
         if let Err(failure) = self.validate(cancel, progress).await {
-            match previous {
-                Some(bytes) => {
-                    let _ = std::fs::write(&path, bytes);
-                }
-                None => {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-            if let Some(main) = previous_main {
-                let _ = std::fs::write(&self.main_config, main);
-            }
+            put_back(
+                &path,
+                previous.as_deref(),
+                &self.main_config,
+                previous_main.as_deref(),
+            );
             return Err(failure);
         }
 
-        self.reload(cancel, progress).await?;
+        // A reload that fails leaves the proxy serving what it had: the
+        // files go back to match, so the next reload (for another app, say)
+        // doesn't pick this one up.
+        if let Err(failure) = self.reload(cancel, progress).await {
+            put_back(
+                &path,
+                previous.as_deref(),
+                &self.main_config,
+                previous_main.as_deref(),
+            );
+            return Err(failure);
+        }
 
         if !https && !plain_http {
             progress
@@ -2615,6 +2621,22 @@ impl Proxy {
     }
 }
 
+/// A site's file as it was before a publish that didn't take, and the
+/// proxy's main config if the publish changed it.
+fn put_back(site: &Path, previous: Option<&[u8]>, main: &Path, previous_main: Option<&str>) {
+    match previous {
+        Some(bytes) => {
+            let _ = std::fs::write(site, bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(site);
+        }
+    }
+    if let Some(text) = previous_main {
+        let _ = std::fs::write(main, text);
+    }
+}
+
 async fn systemctl(args: &[&str], cancel: &mut watch::Receiver<bool>, progress: &Progress) -> bool {
     run_child(
         "systemctl",
@@ -2833,6 +2855,26 @@ fn add_nginx_include(existing: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_publish_that_does_not_take_puts_the_files_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("shop.caddy");
+        let main = dir.path().join("Caddyfile");
+
+        // An app's site that was there: back to what it was.
+        std::fs::write(&site, "new").unwrap();
+        std::fs::write(&main, "new main").unwrap();
+        put_back(&site, Some(b"old"), &main, Some("old main"));
+        assert_eq!(std::fs::read_to_string(&site).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "old main");
+
+        // A new app's site: gone, and the main config left as it is when
+        // the publish didn't change it.
+        put_back(&site, None, &main, None);
+        assert!(!site.exists());
+        assert_eq!(std::fs::read_to_string(&main).unwrap(), "old main");
+    }
 
     #[test]
     fn a_caddy_serveros_installs_imports_only_our_sites() {
