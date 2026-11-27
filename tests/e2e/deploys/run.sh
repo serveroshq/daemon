@@ -86,7 +86,9 @@ field_is() { # answer jq-path expected
     [ "$got" = "$3" ] || { echo "$2 is $got, wanted $3"; return 1; }
 }
 json_has() { printf '%s' "$1" | jq -r "$2" | grep -qF -- "$3" || { echo "$2 doesn't have $3"; return 1; }; }
-log_has() { printf '%s' "$1" | jq -r '.log[]' | grep -qF -- "$2" || { echo "the log never says: $2"; return 1; }; }
+# grep reads all of jq's output (no -q): stopping early would kill jq with
+# SIGPIPE on a long log, and pipefail would call a match a failure.
+log_has() { printf '%s' "$1" | jq -r '.log[]' | grep -F -- "$2" >/dev/null || { echo "the log never says: $2"; return 1; }; }
 log_lacks() { ! printf '%s' "$1" | jq -r '.log[], (.error // {} | tostring)' | grep -F -- "$2"; }
 serves() { # port text
     local i body
