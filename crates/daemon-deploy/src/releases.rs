@@ -1,3 +1,4 @@
+use daemon_protocol::HealthCheck;
 use daemon_state::State;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +20,22 @@ pub struct Release {
     /// both being the project's name.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compose: bool,
+    /// The app's own health check when this release was deployed, so a
+    /// rollback to it asks the same page with the same patience. Missing
+    /// for releases recorded before it was kept: they get the old check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthCheck>,
+    /// The port the app listens on in its container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_port: Option<u16>,
+    /// The network it shares with the machine's other apps, made again
+    /// before a rollback starts it if it's been removed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// A Compose release's file, for starting it again when a deploy over
+    /// it fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compose_file: Option<String>,
 }
 
 fn answers_http() -> bool {
@@ -167,6 +184,10 @@ mod tests {
             status: "live".into(),
             http: true,
             compose: false,
+            health: None,
+            container_port: None,
+            network: None,
+            compose_file: None,
         }
     }
 
@@ -211,6 +232,39 @@ mod tests {
         // A container release's record is written as it was before.
         let json = serde_json::to_string(&release("a")).unwrap();
         assert!(!json.contains("compose"));
+    }
+
+    #[test]
+    fn a_release_keeps_its_health_check_and_network() {
+        let check = HealthCheck {
+            path: "/up".into(),
+            expected_status: 0,
+            timeout_secs: 10,
+            retries: 5,
+            start_period_secs: 60,
+            interval_secs: Some(3),
+        };
+        let kept = Release {
+            health: Some(check.clone()),
+            container_port: Some(3000),
+            network: Some("serveros".into()),
+            ..release("a")
+        };
+        let state = State::in_memory().unwrap();
+        let ledger = ReleaseLedger::new(&state);
+        ledger.promote("app", kept, 5).unwrap();
+        let back = ledger.current("app").unwrap();
+        assert_eq!(back.health, Some(check));
+        assert_eq!(back.container_port, Some(3000));
+        assert_eq!(back.network.as_deref(), Some("serveros"));
+
+        // Recorded before these were kept.
+        let old: Release = serde_json::from_str(
+            r#"{"commit":"a","image":"serveros/app:a","container":"serveros-app-a","port":20001,"deployed_at":0,"status":"live"}"#,
+        )
+        .unwrap();
+        assert!(old.health.is_none() && old.network.is_none());
+        assert!(old.http);
     }
 
     #[test]

@@ -194,10 +194,21 @@ fn parse_container_volumes(json: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Creates the app's named volume unless it's there already.
+/// Creates the app's named volume unless it's there already. One that's
+/// labelled as another app's is refused, so two apps never share data by
+/// accident.
 pub async fn ensure_volume(volume: &str, service: &str) -> Result<(), Failure> {
-    if docker_output(&["volume", "inspect", volume]).await.is_ok() {
-        return Ok(());
+    if let Ok(labels) =
+        docker_output(&["volume", "inspect", "--format", "{{json .Labels}}", volume]).await
+    {
+        return match parse_label(&labels, APP_LABEL) {
+            Some(owner) if owner != service => Err(Failure::new(
+                "volumes",
+                format!("volume {volume} belongs to {owner}, not {service}"),
+            )
+            .with_next_step("Give this app's volume another name.")),
+            _ => Ok(()),
+        };
     }
     let app = format!("{APP_LABEL}={service}");
     docker_output(&[
@@ -214,6 +225,91 @@ pub async fn ensure_volume(volume: &str, service: &str) -> Result<(), Failure> {
     .map_err(|e| Failure::new("volumes", format!("could not create volume {volume}: {e}")))
 }
 
+/// The Docker volume an app's own named volume (`spec.volumes`) is.
+pub fn app_volume_name(service: &str, name: &str) -> String {
+    format!("serveros-{}-{name}", crate::git::sanitise(service))
+}
+
+/// Checks the app's own volumes: names Docker accepts, absolute paths that
+/// aren't the container's root, and no folder twice.
+pub fn check_volumes(volumes: &[daemon_protocol::VolumeMount]) -> Result<(), Failure> {
+    use std::path::Component;
+
+    let bad = |message: String| {
+        Err(Failure::new("volumes", message)
+            .with_next_step("Fix the app's volumes, then deploy again."))
+    };
+    let mut paths = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    for volume in volumes {
+        let mut chars = volume.name.chars();
+        let name_ok = volume.name.len() <= 63
+            && matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+            && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.-".contains(c));
+        if !name_ok {
+            return bad(format!(
+                "{:?} isn't a volume name: use lowercase letters, digits, dots, dashes and underscores",
+                volume.name
+            ));
+        }
+        let path = Path::new(&volume.path);
+        let normal = path.is_absolute()
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+            && !volume.path.contains([':', ',', '\n', '\0']);
+        if !normal {
+            return bad(format!(
+                "{:?} has to be an absolute folder in the container, like /data",
+                volume.path
+            ));
+        }
+        let path = volume.path.trim_end_matches('/');
+        if path.is_empty() {
+            return bad(format!(
+                "volume {} can't be mounted over the container's root folder",
+                volume.name
+            ));
+        }
+        if !paths.insert(path.to_string()) {
+            return bad(format!("two volumes are mounted at {path}"));
+        }
+        if !names.insert(volume.name.clone()) {
+            return bad(format!("volume {} is listed twice", volume.name));
+        }
+    }
+    Ok(())
+}
+
+/// Every volume a release mounts, as (volume, folder): the folders the
+/// image declares, then the app's own, which win where both name a folder.
+pub fn with_app_volumes(
+    service: &str,
+    declared: Vec<(String, String)>,
+    own: &[daemon_protocol::VolumeMount],
+) -> Vec<(String, String)> {
+    let own: Vec<(String, String)> = own
+        .iter()
+        .map(|v| {
+            (
+                app_volume_name(service, &v.name),
+                v.path.trim_end_matches('/').to_string(),
+            )
+        })
+        .collect();
+    let mut all: Vec<(String, String)> = declared
+        .into_iter()
+        .filter(|(_, path)| {
+            let path = path.trim_end_matches('/');
+            !own.iter().any(|(_, p)| p == path)
+        })
+        .collect();
+    all.extend(own);
+    all
+}
+
+const BUILD_NEXT_STEP: &str = "Fix the build locally, push, and redeploy.";
+
 fn failure_from(phase: &str, outcome: ChildOutcome, what: &str) -> Failure {
     match outcome {
         ChildOutcome::Exited { code, tail } => {
@@ -228,7 +324,7 @@ fn failure_from(phase: &str, outcome: ChildOutcome, what: &str) -> Failure {
             };
             Failure::new(phase, summary)
                 .with_output(tail)
-                .with_next_step("Fix the build locally, push, and redeploy.")
+                .with_next_step(BUILD_NEXT_STEP)
         }
         ChildOutcome::TimedOut { tail } => Failure::new(phase, format!("{what} timed out"))
             .with_output(tail)
@@ -362,56 +458,592 @@ pub fn limit_args(limits: &ResourceLimits) -> Result<Vec<String>, Failure> {
     Ok(args)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run(
-    name: &str,
-    tag: &str,
-    service: &str,
+/// Settings the docker client reads from its own environment, or that the
+/// daemon sets for it. An app's setting with one of these names can't be
+/// handed over by name, so it goes in a root-only env file instead.
+pub fn is_client_env(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "PATH"
+            | "HOME"
+            | "LC_ALL"
+            | "TMPDIR"
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "NO_PROXY"
+            | "ALL_PROXY"
+    ) || upper.starts_with("DOCKER_")
+        || upper.starts_with("BUILDKIT_")
+}
+
+/// Letters, digits and underscores.
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// How an app's settings reach its container without their values ever
+/// being on a command line: `-e NAME` for each, with the value in the
+/// docker client's own environment, which docker passes on as it is (so a
+/// value can span lines). The few names the client itself reads go in
+/// the env file instead.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EnvPlan {
+    pub args: Vec<String>,
+    pub client_env: Vec<(String, String)>,
+    pub file: BTreeMap<String, String>,
+}
+
+impl EnvPlan {
+    /// One more setting handed over by name (never one the client reads).
+    pub fn add(&mut self, name: &str, value: &str) {
+        debug_assert!(!is_client_env(name));
+        self.args.push("-e".into());
+        self.args.push(name.into());
+        self.client_env.push((name.into(), value.into()));
+    }
+}
+
+pub fn plan_env(env: &BTreeMap<String, String>) -> Result<EnvPlan, Failure> {
+    let mut plan = EnvPlan::default();
+    for (name, value) in env {
+        if !valid_env_name(name) {
+            return Err(Failure::new(
+                "env",
+                format!("{name:?} is not a valid environment variable name"),
+            )
+            .with_next_step("Use letters, digits and underscores."));
+        }
+        if value.contains('\0') {
+            return Err(Failure::new(
+                "env",
+                format!("{name} has a null character in it"),
+            ));
+        }
+        if is_client_env(name) {
+            if value.contains(['\n', '\r']) {
+                return Err(Failure::new(
+                    "env",
+                    format!("{name} can't span more than one line"),
+                ));
+            }
+            plan.file.insert(name.clone(), value.clone());
+        } else {
+            plan.add(name, value);
+        }
+    }
+    Ok(plan)
+}
+
+/// One line of an env file Docker Compose reads to fill in `${NAME}` in a
+/// Compose file. Single quotes keep a value exactly as it is, over several
+/// lines too; a value with a single quote in it is double-quoted instead,
+/// with `\`, `"`, `$` and line breaks escaped.
+pub fn compose_env_line(name: &str, value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:@,+=%".contains(c));
+    if plain {
+        format!("{name}={value}\n")
+    } else if !value.contains('\'') {
+        format!("{name}='{value}'\n")
+    } else {
+        let mut quoted = String::with_capacity(value.len() + 2);
+        for c in value.chars() {
+            match c {
+                '\\' => quoted.push_str("\\\\"),
+                '"' => quoted.push_str("\\\""),
+                '$' => quoted.push_str("\\$"),
+                '\n' => quoted.push_str("\\n"),
+                '\r' => quoted.push_str("\\r"),
+                c => quoted.push(c),
+            }
+        }
+        format!("{name}=\"{quoted}\"\n")
+    }
+}
+
+/// The ports an image says its app listens on (EXPOSE), TCP only, lowest
+/// first.
+pub async fn image_ports(tag: &str) -> Vec<u16> {
+    docker_output(&[
+        "image",
+        "inspect",
+        "--format",
+        "{{json .Config.ExposedPorts}}",
+        tag,
+    ])
+    .await
+    .map(|out| parse_exposed_ports(&out))
+    .unwrap_or_default()
+}
+
+fn parse_exposed_ports(json: &str) -> Vec<u16> {
+    let mut ports: Vec<u16> =
+        serde_json::from_str::<Option<BTreeMap<String, serde_json::Value>>>(json.trim())
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .into_keys()
+            .filter_map(|key| {
+                let (port, proto) = key.split_once('/').unwrap_or((&key, "tcp"));
+                (proto == "tcp").then(|| port.parse().ok()).flatten()
+            })
+            .filter(|p| *p > 0)
+            .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// The host ports every container ServerOS made has asked for, running or
+/// not: a stopped release keeps its port for a rollback.
+pub async fn claimed_ports() -> std::collections::BTreeSet<u16> {
+    let ids = docker_output(&["ps", "-aq", "--filter", "label=com.serveros.managed=true"])
+        .await
+        .unwrap_or_default();
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    if ids.is_empty() {
+        return Default::default();
+    }
+    let mut args = vec!["inspect", "--format", "{{json .HostConfig.PortBindings}}"];
+    args.extend(ids);
+    docker_output(&args)
+        .await
+        .map(|out| out.lines().flat_map(parse_port_bindings).collect())
+        .unwrap_or_default()
+}
+
+fn parse_port_bindings(json: &str) -> Vec<u16> {
+    #[derive(serde::Deserialize)]
+    struct Binding {
+        #[serde(rename = "HostPort", default)]
+        host_port: String,
+    }
+    serde_json::from_str::<Option<BTreeMap<String, Option<Vec<Binding>>>>>(json.trim())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+        .into_values()
+        .flatten()
+        .flatten()
+        .filter_map(|b| b.host_port.parse().ok())
+        .collect()
+}
+
+/// Whether nothing on this machine is listening on 127.0.0.1:`port`.
+pub fn port_is_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// The first port from `preferred` on, through the 20000-29999 range ServerOS
+/// gives releases, that isn't `taken`.
+pub fn pick_port(preferred: u16, taken: impl Fn(u16) -> bool) -> Option<u16> {
+    let start = preferred.clamp(20_000, 29_999) - 20_000;
+    (0..10_000u16)
+        .map(|i| 20_000 + (start + i) % 10_000)
+        .find(|port| !taken(*port))
+}
+
+/// Whether the machine's Docker sets a log driver or log options for every
+/// container already; then ServerOS leaves logging to it.
+pub fn docker_sets_logging() -> bool {
+    [
+        "/etc/docker/daemon.json",
+        "/var/snap/docker/current/config/daemon.json",
+    ]
+    .iter()
+    .filter_map(|path| std::fs::read_to_string(path).ok())
+    .any(|text| logging_configured(&text))
+}
+
+fn logging_configured(daemon_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(daemon_json)
+        .ok()
+        .and_then(|v| {
+            v.as_object()
+                .map(|o| o.contains_key("log-driver") || o.contains_key("log-opts"))
+        })
+        .unwrap_or(false)
+}
+
+/// Docker's json-file logs grow for ever unless told otherwise: an app's
+/// container keeps three files of 10 MB.
+pub const LOG_ROTATION: [&str; 4] = ["--log-opt", "max-size=10m", "--log-opt", "max-file=3"];
+
+/// Names Docker accepts for a network, and not one of its own special ones.
+pub fn check_network(name: &str) -> Result<(), Failure> {
+    let mut chars = name.chars();
+    let valid = name.len() <= 64
+        && matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c));
+    if !valid {
+        return Err(Failure::new(
+            "network",
+            format!("{name:?} isn't a network name Docker accepts"),
+        )
+        .with_next_step("Use letters, digits, dots, dashes and underscores."));
+    }
+    if matches!(name, "bridge" | "host" | "none" | "default") {
+        return Err(Failure::new(
+            "network",
+            format!("{name:?} is one of Docker's own networks, so apps can't share it by name"),
+        )
+        .with_next_step("Pick another name, like serveros."));
+    }
+    Ok(())
+}
+
+/// Creates the network apps share unless it's there already.
+pub async fn ensure_network(name: &str) -> Result<(), Failure> {
+    check_network(name)?;
+    if docker_output(&["network", "inspect", "--format", "{{.Name}}", name])
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    docker_output(&[
+        "network",
+        "create",
+        "--driver",
+        "bridge",
+        "--label",
+        "com.serveros.managed=true",
+        name,
+    ])
+    .await
+    .map(|_| ())
+    .or_else(|e| {
+        // Made by another deploy in the meantime.
+        if e.contains("already exists") {
+            Ok(())
+        } else {
+            Err(Failure::new(
+                "network",
+                format!("could not create network {name}: {e}"),
+            ))
+        }
+    })
+}
+
+/// The name an app has on the network it shares with others.
+pub fn network_alias(service: &str) -> String {
+    crate::git::sanitise(service).to_ascii_lowercase()
+}
+
+/// What a container runs with. Settings go in `env`, never on the command
+/// line.
+pub struct RunSpec<'a> {
+    pub name: &'a str,
+    pub image: &'a str,
+    pub service: &'a str,
+    pub env: &'a EnvPlan,
+    pub env_file: Option<&'a Path>,
+    pub volumes: &'a [(String, String)],
+    pub network: Option<&'a str>,
+    pub log_rotation: bool,
+}
+
+impl RunSpec<'_> {
+    /// The flags every container of the app gets, the app's own and its
+    /// release command's alike. On Docker's default bridge first, as
+    /// before, so the machine's own services that only let in Docker's
+    /// bridge (a database's pg_hba.conf, say) still do; the shared network
+    /// is joined after.
+    fn common_args(&self) -> Vec<String> {
+        let mut args: Vec<String> = vec![
+            "--label".into(),
+            "com.serveros.managed=true".into(),
+            "--label".into(),
+            format!("{APP_LABEL}={}", self.service),
+            "--add-host".into(),
+            "host.docker.internal:host-gateway".into(),
+        ];
+        for (volume, path) in self.volumes {
+            args.push("-v".into());
+            args.push(format!("{volume}:{path}"));
+        }
+        args.extend(self.env.args.iter().cloned());
+        if let Some(env) = self.env_file {
+            args.push("--env-file".into());
+            args.push(env.to_string_lossy().into_owned());
+        }
+        args
+    }
+
+    fn client_env(&self) -> Vec<(&str, &str)> {
+        self.env
+            .client_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+}
+
+/// The `docker create` arguments for an app's container.
+pub fn create_args(
+    run: &RunSpec<'_>,
     host_port: u16,
     container_port: u16,
-    env_file: Option<&Path>,
-    volumes: &[(String, String)],
+    limits: Option<&ResourceLimits>,
+) -> Result<Vec<String>, Failure> {
+    let mut args: Vec<String> = vec![
+        "create".into(),
+        "--name".into(),
+        run.name.into(),
+        "--restart".into(),
+        "unless-stopped".into(),
+        "-p".into(),
+        format!("127.0.0.1:{host_port}:{container_port}"),
+    ];
+    if run.log_rotation {
+        args.extend(LOG_ROTATION.map(String::from));
+    }
+    args.extend(run.common_args());
+    if let Some(limits) = limits {
+        args.extend(limit_args(limits)?);
+    }
+    args.push(run.image.into());
+    Ok(args)
+}
+
+/// Starts the app's container: created on Docker's bridge, joined to the
+/// shared network under the app's name, then started. A container that
+/// doesn't start is removed again.
+#[allow(clippy::too_many_arguments)]
+pub async fn run(
+    run: &RunSpec<'_>,
+    host_port: u16,
+    container_port: u16,
     limits: Option<&ResourceLimits>,
     timeout: Duration,
     cancel: &mut watch::Receiver<bool>,
     progress: &Progress,
 ) -> Result<(), Failure> {
-    let publish = format!("127.0.0.1:{host_port}:{container_port}");
-    let mut args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        name.into(),
-        "--restart".into(),
-        "unless-stopped".into(),
-        "-p".into(),
-        publish,
-        "--label".into(),
-        "com.serveros.managed=true".into(),
-        "--label".into(),
-        format!("{APP_LABEL}={service}"),
-    ];
-
-    for (volume, path) in volumes {
-        args.push("-v".into());
-        args.push(format!("{volume}:{path}"));
-    }
-
-    if let Some(env) = env_file {
-        args.push("--env-file".into());
-        args.push(env.to_string_lossy().into_owned());
-    }
-
-    if let Some(limits) = limits {
-        args.extend(limit_args(limits)?);
-    }
-
-    args.push(tag.into());
-
+    let args = create_args(run, host_port, container_port, limits)?;
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env = run.client_env();
+    let outcome = run_child(
+        "docker", &arg_refs, None, &env, timeout, cancel, progress, None,
+    )
+    .await;
+    if !outcome.success() {
+        remove(run.name, progress).await;
+        return Err(start_failure(outcome, "docker create", host_port));
+    }
+
+    let started = async {
+        if let Some(network) = run.network {
+            connect(
+                run.name,
+                network,
+                Some(&network_alias(run.service)),
+                cancel,
+                progress,
+            )
+            .await?;
+        }
+        let outcome = run_child(
+            "docker",
+            &["start", run.name],
+            None,
+            &[],
+            timeout,
+            cancel,
+            progress,
+            None,
+        )
+        .await;
+        if outcome.success() {
+            Ok(())
+        } else {
+            Err(start_failure(outcome, "docker start", host_port))
+        }
+    }
+    .await;
+    if started.is_err() {
+        remove(run.name, progress).await;
+    }
+    started
+}
+
+async fn connect(
+    container: &str,
+    network: &str,
+    alias: Option<&str>,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> Result<(), Failure> {
+    let mut args = vec!["network", "connect"];
+    if let Some(alias) = alias {
+        args.extend(["--alias", alias]);
+    }
+    args.extend([network, container]);
     let outcome = run_child(
         "docker",
-        &arg_refs,
+        &args,
+        None,
+        &[],
+        Duration::from_secs(60),
+        cancel,
+        progress,
+        None,
+    )
+    .await;
+    if outcome.success() {
+        Ok(())
+    } else {
+        Err(Failure::new(
+            "network",
+            format!("could not join {container} to network {network}"),
+        )
+        .with_output(outcome.tail().to_vec()))
+    }
+}
+
+/// Why a container didn't start, in words that fit: a port that's taken
+/// says so.
+fn start_failure(outcome: ChildOutcome, what: &str, host_port: u16) -> Failure {
+    let clash = outcome
+        .tail()
+        .iter()
+        .any(|l| l.contains("port is already allocated") || l.contains("address already in use"));
+    if clash {
+        return Failure::new(
+            "start",
+            format!("port {host_port} on this machine is already in use, so the app couldn't start on it"),
+        )
+        .with_output(outcome.tail().to_vec())
+        .with_next_step("Deploy again: ServerOS picks a port that's free.");
+    }
+    match failure_from("start", outcome, what) {
+        f if f.next_step.as_deref() == Some(BUILD_NEXT_STEP) => f.with_next_step(
+            "Check the app's settings (volumes, limits, network), then deploy again.",
+        ),
+        f => f,
+    }
+}
+
+/// The name of the throwaway container a release command runs in.
+pub fn release_container_name(container: &str) -> String {
+    format!("{container}-release")
+}
+
+/// The `docker create` arguments for a release command's container: the
+/// app's image, settings, volumes and network, but no port and no name on
+/// the network, so nothing sends it traffic, and `sh -c` in place of the
+/// image's own entrypoint.
+pub fn release_args(run: &RunSpec<'_>, command: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec!["create".into(), "--name".into(), run.name.into()];
+    args.extend(run.common_args());
+    args.extend([
+        "--entrypoint".into(),
+        "sh".into(),
+        run.image.into(),
+        "-c".into(),
+        command.into(),
+    ]);
+    args
+}
+
+/// Runs a release command (migrations, say) in a container of its own,
+/// with its output in the job's log, and removes the container after.
+pub async fn run_release_command(
+    run: &RunSpec<'_>,
+    command: &str,
+    timeout: Duration,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> Result<(), Failure> {
+    remove(run.name, progress).await;
+    let args = release_args(run, command);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let env = run.client_env();
+    let started = std::time::Instant::now();
+    let created = run_child(
+        "docker", &arg_refs, None, &env, timeout, cancel, progress, None,
+    )
+    .await;
+    let result = if !created.success() {
+        Err(failure_from("release", created, "docker create"))
+    } else {
+        let joined = match run.network {
+            Some(network) => connect(run.name, network, None, cancel, progress).await,
+            None => Ok(()),
+        };
+        match joined {
+            Err(failure) => Err(failure),
+            Ok(()) => {
+                let left = timeout.saturating_sub(started.elapsed());
+                let outcome = run_child(
+                    "docker",
+                    &["start", "-a", run.name],
+                    None,
+                    &[],
+                    left,
+                    cancel,
+                    progress,
+                    None,
+                )
+                .await;
+                release_command_result(outcome, left)
+            }
+        }
+    };
+    remove(run.name, progress).await;
+    result
+}
+
+fn release_command_result(outcome: ChildOutcome, timeout: Duration) -> Result<(), Failure> {
+    match outcome {
+        ChildOutcome::Exited { code: 0, .. } => Ok(()),
+        ChildOutcome::Exited { code, tail } => {
+            let missing_sh = tail.iter().any(|l| {
+                l.contains("\"sh\": executable file not found") || l.contains("sh: not found")
+            });
+            let next = if missing_sh {
+                "The image has no sh to run the command with. Use an image that has one, or run the command in the app's own start-up."
+            } else {
+                "Fix the command or what it needs (a database it connects to, say), then deploy again."
+            };
+            Err(
+                Failure::new("release", format!("the release command exited {code}"))
+                    .with_output(tail)
+                    .with_next_step(next),
+            )
+        }
+        ChildOutcome::TimedOut { tail } => Err(Failure::new(
+            "release",
+            format!(
+                "the release command was still running after {} seconds, so it was stopped",
+                timeout.as_secs()
+            ),
+        )
+        .with_output(tail)
+        .with_next_step("Make the command finish sooner, or give deploys a longer timeout.")),
+        ChildOutcome::Cancelled { tail } => {
+            Err(Failure::new("cancelled", "release command cancelled").with_output(tail))
+        }
+        ChildOutcome::Unstartable(e) => {
+            Err(Failure::new("release", e).with_next_step("Install Docker on the machine."))
+        }
+    }
+}
+
+/// Runs a command in the app's container once it's live. It never fails
+/// the deploy: what happened goes in the log.
+pub async fn post_deploy(
+    container: &str,
+    command: &str,
+    timeout: Duration,
+    cancel: &mut watch::Receiver<bool>,
+    progress: &Progress,
+) -> Result<(), String> {
+    let outcome = run_child(
+        "docker",
+        &["exec", container, "sh", "-c", command],
         None,
         &[],
         timeout,
@@ -420,11 +1052,15 @@ pub async fn run(
         None,
     )
     .await;
-
-    if outcome.success() {
-        Ok(())
-    } else {
-        Err(failure_from("start", outcome, "docker run"))
+    match outcome {
+        ChildOutcome::Exited { code: 0, .. } => Ok(()),
+        ChildOutcome::Exited { code, .. } => Err(format!("it exited {code}")),
+        ChildOutcome::TimedOut { .. } => Err(format!(
+            "it was still running after {} seconds, so it was stopped",
+            timeout.as_secs()
+        )),
+        ChildOutcome::Cancelled { .. } => Err("it was cancelled".into()),
+        ChildOutcome::Unstartable(e) => Err(e),
     }
 }
 
@@ -478,19 +1114,9 @@ pub async fn start(
     }
 }
 
-pub async fn remove(name: &str, progress: &Progress) {
-    let (_tx, mut cancel) = watch::channel(false);
-    let _ = run_child(
-        "docker",
-        &["rm", "-f", name],
-        None,
-        &[],
-        Duration::from_secs(60),
-        &mut cancel,
-        progress,
-        None,
-    )
-    .await;
+/// Removes a container, quietly: there may be none of that name.
+pub async fn remove(name: &str, _progress: &Progress) {
+    let _ = docker_output(&["rm", "-f", name]).await;
 }
 
 pub async fn remove_image(tag: &str, progress: &Progress) {
@@ -552,6 +1178,123 @@ pub async fn compose_up(
     } else {
         Err(failure_from("build", outcome, "docker compose up"))
     }
+}
+
+/// Where one of a Compose stack's containers is at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerState {
+    pub name: String,
+    pub status: String,
+    pub exit_code: i64,
+    pub restarts: u64,
+}
+
+/// Every container of a Compose project, as Docker sees it now.
+pub async fn compose_states(project: &str) -> Vec<ContainerState> {
+    let label = format!("label=com.docker.compose.project={project}");
+    let ids = docker_output(&["ps", "-aq", "--filter", &label])
+        .await
+        .unwrap_or_default();
+    let ids: Vec<&str> = ids.split_whitespace().collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut args = vec![
+        "inspect",
+        "--format",
+        "{{.Name}}\t{{.State.Status}}\t{{.State.ExitCode}}\t{{.RestartCount}}",
+    ];
+    args.extend(ids);
+    docker_output(&args)
+        .await
+        .map(|out| parse_states(&out))
+        .unwrap_or_default()
+}
+
+fn parse_states(out: &str) -> Vec<ContainerState> {
+    out.lines()
+        .filter_map(|line| {
+            let mut cols = line.split('\t');
+            Some(ContainerState {
+                name: cols.next()?.trim().trim_start_matches('/').to_string(),
+                status: cols.next()?.trim().to_string(),
+                exit_code: cols.next()?.trim().parse().ok()?,
+                restarts: cols.next()?.trim().parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// The first container of a stack that isn't settling: one that exited
+/// with an error, keeps restarting, has restarted since `first`, or never
+/// started. One that exited 0 did its job (a one-off setup step).
+pub fn compose_problem(
+    first: &[ContainerState],
+    now: &[ContainerState],
+) -> Option<(String, String)> {
+    now.iter().find_map(|c| {
+        let restarted = first
+            .iter()
+            .find(|f| f.name == c.name)
+            .is_some_and(|f| c.restarts > f.restarts);
+        let why = match c.status.as_str() {
+            "restarting" => Some("keeps restarting".to_string()),
+            "exited" | "dead" if c.exit_code != 0 => Some(format!("exited {}", c.exit_code)),
+            "created" => Some("never started".to_string()),
+            "running" if restarted => Some(format!("restarted {} times", c.restarts)),
+            _ => None,
+        };
+        why.map(|why| (c.name.clone(), why))
+    })
+}
+
+/// For a Compose stack with no web port to ask: its containers have to
+/// keep running (or finish cleanly) for a few seconds after it comes up.
+pub async fn compose_settled(project: &str, progress: &Progress) -> Result<(), Failure> {
+    let first = compose_states(project).await;
+    if first.is_empty() {
+        progress
+            .line("the Compose stack started no containers to check")
+            .await;
+        return Ok(());
+    }
+    for attempt in 0..=3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+        let now = compose_states(project).await;
+        if let Some((name, why)) = compose_problem(&first, &now) {
+            let logs = logs_tail(&name, 40, progress).await;
+            return Err(
+                Failure::new("health", format!("{name} {why} after starting"))
+                    .with_output(logs)
+                    .with_next_step(
+                        "Check that service's logs for the error, often a missing setting.",
+                    ),
+            );
+        }
+        if attempt > 0 {
+            progress
+                .line(format!("still running after check {attempt}/3"))
+                .await;
+        }
+    }
+    progress
+        .line("no web port to check, the stack kept running")
+        .await;
+    Ok(())
+}
+
+/// The last log lines of a Compose stack's containers, scrubbed.
+pub async fn compose_logs_tail(project: &str, lines: usize, progress: &Progress) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in compose_states(project).await {
+        for line in logs_tail(&c.name, lines, progress).await {
+            out.push(format!("{}: {line}", c.name));
+        }
+    }
+    let skip = out.len().saturating_sub(lines);
+    out.split_off(skip)
 }
 
 /// A container's last log lines, what it wrote to stdout then stderr (where
@@ -773,6 +1516,341 @@ mod tests {
             ]
         );
         assert!(plan_volumes("shop", &[], &previous).is_empty());
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn settings_go_by_name_with_their_values_never_on_the_command_line() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQ\n-----END PRIVATE KEY-----";
+        let plan = plan_env(&env(&[
+            ("APP_KEY", "base64:s3cret"),
+            ("JWT_KEY", pem),
+            ("PATH", "/app/bin:/usr/bin"),
+            ("DOCKER_HOST", "tcp://elsewhere:2375"),
+            ("http_proxy", "http://proxy:3128"),
+        ]))
+        .unwrap();
+        assert_eq!(plan.args, ["-e", "APP_KEY", "-e", "JWT_KEY"]);
+        assert!(plan
+            .client_env
+            .contains(&("JWT_KEY".to_string(), pem.to_string())));
+        // What the docker client reads itself goes in the file instead.
+        assert_eq!(
+            plan.file.keys().collect::<Vec<_>>(),
+            ["DOCKER_HOST", "PATH", "http_proxy"]
+        );
+
+        let run = RunSpec {
+            name: "serveros-shop-abc",
+            image: "serveros/shop:abc",
+            service: "shop",
+            env: &plan,
+            env_file: Some(Path::new("/var/lib/serveros/apps/shop/abc.env")),
+            volumes: &[],
+            network: None,
+            log_rotation: false,
+        };
+        let args = create_args(&run, 20001, 3000, None).unwrap().join(" ");
+        assert!(
+            !args.contains("s3cret") && !args.contains("MIIEvQ"),
+            "{args}"
+        );
+        assert!(args.contains("--env-file /var/lib/serveros/apps/shop/abc.env"));
+
+        assert!(plan_env(&env(&[("bad name", "x")])).is_err());
+        assert!(plan_env(&env(&[("", "x")])).is_err());
+        assert!(plan_env(&env(&[("PATH", "a\nb")])).is_err());
+        assert!(plan_env(&env(&[("2FA_SECRET", "x")])).is_ok());
+    }
+
+    #[test]
+    fn compose_env_files_keep_values_exactly() {
+        assert_eq!(compose_env_line("PORT", "3000"), "PORT=3000\n");
+        assert_eq!(
+            compose_env_line("URL", "https://shop.example.com/a"),
+            "URL=https://shop.example.com/a\n"
+        );
+        assert_eq!(compose_env_line("EMPTY", ""), "EMPTY=''\n");
+        assert_eq!(
+            compose_env_line("PASS", "p$ss #word"),
+            "PASS='p$ss #word'\n"
+        );
+        assert_eq!(compose_env_line("KEY", "a\nb"), "KEY='a\nb'\n");
+        assert_eq!(
+            compose_env_line("Q", "it's \"$x\"\\\n"),
+            "Q=\"it's \\\"\\$x\\\"\\\\\\n\"\n"
+        );
+    }
+
+    #[test]
+    fn app_containers_join_the_shared_network_and_rotate_logs() {
+        let plan = plan_env(&env(&[("PORT", "3000")])).unwrap();
+        let volumes = vec![("serveros-shop-uploads".to_string(), "/data".to_string())];
+        let run = RunSpec {
+            name: "serveros-shop-abc",
+            image: "serveros/shop:abc",
+            service: "shop",
+            env: &plan,
+            env_file: None,
+            volumes: &volumes,
+            network: Some("serveros"),
+            log_rotation: true,
+        };
+        let args = create_args(
+            &run,
+            20001,
+            3000,
+            Some(&ResourceLimits {
+                cpu_millis: Some(500),
+                memory_mb: None,
+            }),
+        )
+        .unwrap();
+        let line = args.join(" ");
+        assert!(line.starts_with(
+            "create --name serveros-shop-abc --restart unless-stopped -p 127.0.0.1:20001:3000 "
+        ));
+        assert!(line.contains("--log-opt max-size=10m --log-opt max-file=3"));
+        assert!(line.contains("--add-host host.docker.internal:host-gateway"));
+        assert!(line.contains("-v serveros-shop-uploads:/data"));
+        assert!(line.contains("--label com.serveros.app=shop"));
+        assert!(line.contains("--cpus=0.5"));
+        // Created on Docker's own bridge: the shared network is joined
+        // after, so the bridge stays its first.
+        assert!(!line.contains("--network"));
+        assert_eq!(args.last().unwrap(), "serveros/shop:abc");
+
+        let quiet = RunSpec {
+            log_rotation: false,
+            ..run
+        };
+        assert!(!create_args(&quiet, 1, 2, None)
+            .unwrap()
+            .contains(&"--log-opt".to_string()));
+        assert_eq!(network_alias("My_Shop"), "my_shop");
+    }
+
+    #[test]
+    fn a_release_command_runs_in_a_container_of_its_own() {
+        let plan = plan_env(&env(&[("DATABASE_URL", "postgres://a:b@db/app")])).unwrap();
+        let volumes = vec![("serveros-shop-data".to_string(), "/data".to_string())];
+        let run = RunSpec {
+            name: &release_container_name("serveros-shop-abc"),
+            image: "serveros/shop:abc",
+            service: "shop",
+            env: &plan,
+            env_file: None,
+            volumes: &volumes,
+            network: Some("serveros"),
+            log_rotation: true,
+        };
+        let args = release_args(&run, "php artisan migrate --force");
+        let line = args.join(" ");
+        assert!(line.starts_with("create --name serveros-shop-abc-release "));
+        assert!(line.contains("-v serveros-shop-data:/data"));
+        assert!(line.contains("-e DATABASE_URL"));
+        assert!(!line.contains("postgres://"));
+        // Nothing sends it traffic: no port, no name on the network.
+        assert!(!line.contains("-p ") && !line.contains("--alias"));
+        assert_eq!(
+            &args[args.len() - 5..],
+            [
+                "--entrypoint",
+                "sh",
+                "serveros/shop:abc",
+                "-c",
+                "php artisan migrate --force"
+            ]
+        );
+
+        let failed = release_command_result(
+            ChildOutcome::Exited {
+                code: 1,
+                tail: vec!["SQLSTATE[HY000] [2002] Connection refused".into()],
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert_eq!(failed.phase, "release");
+        assert_eq!(failed.message, "the release command exited 1");
+        assert_eq!(failed.output_tail.len(), 1);
+
+        let no_sh = release_command_result(
+            ChildOutcome::Exited {
+                code: 127,
+                tail: vec!["exec: \"sh\": executable file not found in $PATH".into()],
+            },
+            Duration::from_secs(60),
+        )
+        .unwrap_err();
+        assert!(no_sh.next_step.unwrap().contains("no sh"));
+
+        let slow = release_command_result(
+            ChildOutcome::TimedOut { tail: vec![] },
+            Duration::from_secs(90),
+        )
+        .unwrap_err();
+        assert!(slow.message.contains("90 seconds"));
+        assert!(release_command_result(
+            ChildOutcome::Exited {
+                code: 0,
+                tail: vec![]
+            },
+            Duration::from_secs(1)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn reads_exposed_ports_and_bindings() {
+        assert_eq!(
+            parse_exposed_ports(r#"{"8080/tcp":{},"3000/tcp":{},"53/udp":{}}"#),
+            [3000, 8080]
+        );
+        assert!(parse_exposed_ports("null\n").is_empty());
+        assert!(parse_exposed_ports("").is_empty());
+
+        assert_eq!(
+            parse_port_bindings(
+                r#"{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"20123"}],"9000/tcp":null}"#
+            ),
+            [20123]
+        );
+        assert!(parse_port_bindings("{}").is_empty());
+        assert!(parse_port_bindings("null").is_empty());
+    }
+
+    #[test]
+    fn a_taken_port_moves_to_the_next_free_one_in_range() {
+        assert_eq!(pick_port(20500, |_| false), Some(20500));
+        assert_eq!(pick_port(20500, |p| p < 20503), Some(20503));
+        assert_eq!(pick_port(29999, |p| p == 29999), Some(20000));
+        assert_eq!(pick_port(25000, |_| true), None);
+
+        // Something listening is taken.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!port_is_free(held.local_addr().unwrap().port()));
+    }
+
+    #[test]
+    fn log_rotation_is_left_to_a_docker_that_sets_its_own() {
+        assert!(logging_configured(r#"{"log-driver":"journald"}"#));
+        assert!(logging_configured(r#"{"log-opts":{"max-size":"50m"}}"#));
+        assert!(!logging_configured(r#"{"data-root":"/mnt/docker"}"#));
+        assert!(!logging_configured("not json"));
+    }
+
+    #[test]
+    fn network_names_are_checked() {
+        assert!(check_network("serveros").is_ok());
+        assert!(check_network("acme_apps-1.internal").is_ok());
+        for bad in ["", "-x", "has space", "a/b", "bridge", "host", "none"] {
+            assert!(check_network(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    fn mount(name: &str, path: &str) -> daemon_protocol::VolumeMount {
+        daemon_protocol::VolumeMount {
+            name: name.into(),
+            path: path.into(),
+        }
+    }
+
+    #[test]
+    fn an_apps_own_volumes_are_checked_and_named_for_it() {
+        assert!(check_volumes(&[
+            mount("data", "/data"),
+            mount("uploads.v2", "/var/www/uploads/")
+        ])
+        .is_ok());
+        for bad in [
+            vec![mount("Data", "/data")],
+            vec![mount("-data", "/data")],
+            vec![mount("data", "data")],
+            vec![mount("data", "/")],
+            vec![mount("data", "//")],
+            vec![mount("data", "/a/../etc")],
+            vec![mount("data", "/a:/b")],
+            vec![mount("a", "/data"), mount("b", "/data/")],
+            vec![mount("a", "/one"), mount("a", "/two")],
+            vec![mount(&"a".repeat(64), "/data")],
+        ] {
+            let failure = check_volumes(&bad).unwrap_err();
+            assert_eq!(failure.phase, "volumes", "{bad:?}");
+        }
+
+        assert_eq!(app_volume_name("my shop", "data"), "serveros-my-shop-data");
+        let declared = vec![
+            ("serveros-shop_data".to_string(), "/data".to_string()),
+            ("serveros-shop_cache".to_string(), "/cache".to_string()),
+        ];
+        // The app's own volume wins where both name a folder.
+        assert_eq!(
+            with_app_volumes("shop", declared, &[mount("uploads", "/data/")]),
+            [
+                ("serveros-shop_cache".to_string(), "/cache".to_string()),
+                ("serveros-shop-uploads".to_string(), "/data".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_compose_stack_settles_when_nothing_fails() {
+        let parsed = parse_states(
+            "/serveros-shop-web-1\trunning\t0\t0\n/serveros-shop-migrate-1\texited\t0\t0\nbad line\n",
+        );
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "serveros-shop-web-1");
+        assert_eq!(compose_problem(&parsed, &parsed), None);
+
+        let state = |name: &str, status: &str, code: i64, restarts: u64| ContainerState {
+            name: name.into(),
+            status: status.into(),
+            exit_code: code,
+            restarts,
+        };
+        let first = vec![state("web", "running", 0, 0)];
+        for (now, why) in [
+            (state("web", "exited", 1, 0), "exited 1"),
+            (state("web", "restarting", 1, 3), "keeps restarting"),
+            (state("web", "running", 0, 2), "restarted 2 times"),
+            (state("web", "created", 0, 0), "never started"),
+        ] {
+            assert_eq!(
+                compose_problem(&first, &[now]),
+                Some(("web".to_string(), why.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn a_port_clash_says_so() {
+        let failure = start_failure(
+            ChildOutcome::Exited {
+                code: 125,
+                tail: vec!["Error response from daemon: driver failed programming external connectivity: Bind for 127.0.0.1:20123 failed: port is already allocated".into()],
+            },
+            "docker start",
+            20123,
+        );
+        assert!(failure.message.contains("port 20123"));
+        assert!(failure.next_step.unwrap().contains("Deploy again"));
+
+        let other = start_failure(
+            ChildOutcome::Exited {
+                code: 125,
+                tail: vec!["invalid mount config".into()],
+            },
+            "docker start",
+            20123,
+        );
+        assert!(!other.next_step.unwrap().contains("build"));
     }
 
     #[test]
