@@ -1306,6 +1306,106 @@ pub struct DeploySpec {
     /// machine's own, and never stored or logged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<RegistryLogin>,
+    /// How the app's image is made. Missing builds `dockerfile` (or runs
+    /// `compose_file`), as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
+    /// Named volumes for the app's data, mounted in every release, on top
+    /// of the folders the Dockerfile declares with VOLUME. Each is the
+    /// Docker volume `serveros-<service>-<name>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeMount>,
+    /// Run once in a throwaway container of the new release (same image,
+    /// settings, volumes and network) before it starts serving: migrations,
+    /// say. A non-zero exit or a timeout fails the deploy, and the live
+    /// release keeps serving. Runs as `sh -c <command>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_command: Option<String>,
+    /// Run inside the new container (`sh -c`) once it's live. A failure is
+    /// a warning in the log; the deploy still succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_deploy_command: Option<String>,
+    /// A Docker network the app's container joins, made if missing, with
+    /// the service's name as its address there, so apps on one machine reach
+    /// each other by name. Missing keeps Docker's default bridge, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
+/// How an app's image is made.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildSpec {
+    #[serde(default)]
+    pub method: BuildMethod,
+    /// For `image`: what to run, like `ghcr.io/acme/api:1.4`, or pinned as
+    /// `name@sha256:…`. Pulled with the job's `registries`; nothing is
+    /// fetched or built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// For `dockerfile`: the stage to build (`docker build --target`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Settings the build can read: a Dockerfile's ARGs, or Railpack's build
+    /// environment. Not given to the running app unless also in `env`.
+    /// Never logged, and never put on a command line.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, String>,
+    /// For `railpack`: commands that replace the ones it works out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
+    /// Build from scratch: no layer cache, and no reusing an image already
+    /// built for the same commit.
+    #[serde(default)]
+    pub no_cache: bool,
+    /// Fetch the repository's submodules (recursively, shallow).
+    #[serde(default = "default_true")]
+    pub submodules: bool,
+    /// Fetch the repository's Git LFS files.
+    #[serde(default = "default_true")]
+    pub lfs: bool,
+}
+
+impl Default for BuildSpec {
+    fn default() -> Self {
+        Self {
+            method: BuildMethod::default(),
+            image: None,
+            target: None,
+            args: BTreeMap::new(),
+            install_command: None,
+            build_command: None,
+            start_command: None,
+            no_cache: false,
+            submodules: true,
+            lfs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildMethod {
+    /// The repository's Dockerfile (`DeploySpec::dockerfile`).
+    #[default]
+    Dockerfile,
+    /// No Dockerfile: Railpack works out how to build and start the app
+    /// from its files (package.json, requirements.txt, go.mod, …).
+    Railpack,
+    /// A prebuilt image (`BuildSpec::image`).
+    Image,
+}
+
+/// A named volume mounted into an app's container.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeMount {
+    /// `[a-z0-9][a-z0-9_.-]{0,62}`.
+    pub name: String,
+    /// An absolute path in the container.
+    pub path: String,
 }
 
 /// Limits on what an app's container may use.
@@ -1459,12 +1559,23 @@ pub struct SnapshotRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthCheck {
     pub path: String,
+    /// The status that counts as healthy. 0 means any HTTP response below
+    /// 500: the app answers on its port.
     #[serde(default = "default_expected_status")]
     pub expected_status: u16,
     #[serde(default = "default_health_timeout")]
     pub timeout_secs: u64,
     #[serde(default = "default_health_retries")]
     pub retries: u32,
+    /// Seconds a new release gets to boot before failed tries count against
+    /// `retries`; tries keep running every `interval_secs` during it.
+    /// Missing means none, as before.
+    #[serde(default)]
+    pub start_period_secs: u64,
+    /// Seconds between tries. Missing waits 2, 4, 8, then 16 seconds, as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
 }
 
 fn default_true() -> bool {

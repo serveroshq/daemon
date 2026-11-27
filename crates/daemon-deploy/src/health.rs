@@ -15,6 +15,8 @@ pub async fn wait_healthy(
         expected_status: 200,
         timeout_secs: 30,
         retries: 5,
+        start_period_secs: 0,
+        interval_secs: None,
     };
     let check = check.unwrap_or(&default);
     let per_try = Duration::from_secs(check.timeout_secs.max(1));
