@@ -262,7 +262,9 @@ async fn switch_proxy(app: &App, name: &str, ctx: &JobContext) -> Result<(), Fai
                 "proxy",
                 format!("{name:?} isn't a reverse proxy ServerOS can use"),
             )
-            .with_next_step("Pick Caddy, nginx, Apache or Traefik.")
+            .with_next_step(
+                "Pick Caddy, nginx, Apache, Traefik, or None to route the domain yourself.",
+            )
         })?;
     let current = app.deployer.proxy();
     if current.backend == wanted {
@@ -906,7 +908,11 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
                 },
             );
             let proxy = app.deployer.proxy();
-            if !spec.domains.is_empty() {
+            // None, or a proxy that could not be attached, wrote no site file.
+            if !spec.domains.is_empty()
+                && proxy.backend != daemon_core::config::ProxyBackend::None
+                && result.proxy_note.is_none()
+            {
                 let _ = daemon_uninstall::Manifest::record(
                     &manifest,
                     daemon_uninstall::Artifact::File {

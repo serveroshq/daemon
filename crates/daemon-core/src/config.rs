@@ -170,8 +170,16 @@ pub enum ProxyBackend {
 
 impl ProxyBackend {
     /// The proxies the panel can pick for a machine.
-    pub const CHOOSABLE: [ProxyBackend; 4] =
-        [Self::Caddy, Self::Nginx, Self::Apache, Self::Traefik];
+    /// Caddy, nginx, Apache and Traefik serve the machine's sites. None
+    /// leaves routing to a proxy or tunnel the operator already runs, and
+    /// installs or starts nothing.
+    pub const CHOOSABLE: [ProxyBackend; 5] = [
+        Self::Caddy,
+        Self::Nginx,
+        Self::Apache,
+        Self::Traefik,
+        Self::None,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -202,7 +210,7 @@ impl ProxyBackend {
             Self::Nginx => "nginx",
             Self::Apache => "Apache",
             Self::Traefik => "Traefik",
-            Self::None => "no proxy",
+            Self::None => "None",
         }
     }
 }
@@ -594,6 +602,6 @@ mod tests {
             );
         }
         assert_eq!(ProxyBackend::from_name("lighttpd"), None);
-        assert!(!ProxyBackend::CHOOSABLE.contains(&ProxyBackend::None));
+        assert!(ProxyBackend::CHOOSABLE.contains(&ProxyBackend::None));
     }
 }

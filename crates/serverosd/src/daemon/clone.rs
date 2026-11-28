@@ -286,9 +286,12 @@ pub async fn clone(
         ctx.progress.phase("domain", Some(90)).await;
         let mut cancel = ctx.cancel.clone();
         let host_port = request.port.unwrap_or_default();
-        if let Err(e) = app
-            .deployer
-            .proxy()
+        let proxy = app.deployer.proxy();
+        if proxy.backend == daemon_core::config::ProxyBackend::None {
+            notes.push(format!(
+                "The clone runs on port {host_port}. No reverse proxy was installed or started. Point yours at 127.0.0.1:{host_port}."
+            ));
+        } else if let Err(e) = proxy
             .publish(
                 &name,
                 std::slice::from_ref(domain),

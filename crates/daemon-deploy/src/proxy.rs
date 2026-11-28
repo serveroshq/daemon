@@ -1083,6 +1083,23 @@ fn validate_domains(domains: &[String]) -> Result<(), Failure> {
     Ok(())
 }
 
+fn process_name(listener: &daemon_protocol::Listener) -> Option<&str> {
+    let source = listener.exe.as_deref().or(listener.cmdline.as_deref())?;
+    let token = source.split_whitespace().next().unwrap_or(source);
+    let name = token.rsplit('/').next().unwrap_or(token);
+    (!name.is_empty()).then_some(name)
+}
+
+fn owns_port(backend: ProxyBackend, name: &str) -> bool {
+    match backend {
+        ProxyBackend::Caddy => name == "caddy",
+        ProxyBackend::Nginx => name == "nginx",
+        ProxyBackend::Apache => name == "apache2" || name == "httpd",
+        ProxyBackend::Traefik => name == "traefik",
+        ProxyBackend::None => false,
+    }
+}
+
 impl Proxy {
     pub fn for_backend(backend: ProxyBackend) -> Self {
         let (main_config, include_dir) = match backend {
@@ -1155,8 +1172,71 @@ impl Proxy {
     }
 
     fn none_configured() -> Failure {
-        Failure::new("proxy", "no reverse proxy is configured on this machine")
-            .with_next_step("Pick a reverse proxy when you deploy, or publish the port yourself.")
+        Failure::new(
+            "proxy",
+            "this machine uses an external proxy, so ServerOS does not change one",
+        )
+        .with_next_step(
+            "Point your tunnel or proxy at the app's port. Pick Caddy, nginx, Apache or Traefik to have ServerOS serve the domain.",
+        )
+    }
+
+    /// Ports 80 and 443 already taken by something that is not `backend`
+    /// and not `also` (the proxy a switch is moving off). ServerOS does
+    /// not stop that program. No listener, or one whose process we cannot
+    /// name, is not a conflict. Without /proc there is nothing to check.
+    pub fn port_conflict(
+        backend: ProxyBackend,
+        also: ProxyBackend,
+        listeners: &[daemon_protocol::Listener],
+    ) -> Option<String> {
+        let mut held: Vec<String> = listeners
+            .iter()
+            .filter(|listener| listener.port == 80 || listener.port == 443)
+            .filter_map(|listener| {
+                let name = process_name(listener)?;
+                if owns_port(backend, name) || owns_port(also, name) {
+                    return None;
+                }
+                let pid = listener
+                    .pid
+                    .map(|pid| format!(" (pid {pid})"))
+                    .unwrap_or_default();
+                Some(format!(
+                    "port {} is already used by {name}{pid}",
+                    listener.port
+                ))
+            })
+            .collect();
+        held.sort();
+        held.dedup();
+        if held.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "{}. ServerOS will not stop it",
+            held.join(", and ")
+        ))
+    }
+
+    pub(crate) fn ports_available_for(&self, also: ProxyBackend) -> Result<(), Failure> {
+        self.ports_available_at(std::path::Path::new("/proc"), also)
+    }
+
+    /// `proc` is a /proc tree. Missing `net/tcp` means there is nothing to
+    /// check (macOS, or a container without the host's network namespace).
+    fn ports_available_at(&self, proc: &Path, also: ProxyBackend) -> Result<(), Failure> {
+        if !proc.join("net/tcp").exists() {
+            return Ok(());
+        }
+        let (listeners, _) = daemon_inventory::listeners::discover(proc);
+        match Self::port_conflict(self.backend, also, &listeners) {
+            None => Ok(()),
+            Some(message) => Err(Failure::new("proxy", message).with_next_step(
+                "Choose None as the reverse proxy and point your tunnel or proxy at the app's port, or free ports 80 and 443.",
+            )),
+        }
     }
 
     /// Whether traffic is on: sites write access logs that the daemon rolls
@@ -1522,6 +1602,10 @@ impl Proxy {
             }
             return Ok(false);
         }
+
+        // The install script starts the unit. Refuse first when something
+        // else already has ports 80 and 443, and do not stop it.
+        self.ports_available_for(self.backend)?;
 
         progress
             .line(if on_path(program) {
@@ -2146,8 +2230,16 @@ impl Proxy {
             return Ok(self.clone());
         }
         if to == ProxyBackend::None {
-            return Err(Self::none_configured());
+            progress
+                .line("ServerOS will not install, configure or start a reverse proxy, and will not stop what is already serving ports 80 and 443.".to_string())
+                .await;
+            let mut next = self.clone();
+            next.backend = ProxyBackend::None;
+            return Ok(next);
         }
+        // Before the current proxy is stopped. A program we do not manage
+        // (the panel's container, say) keeps its ports.
+        self.ports_available_for(to)?;
         let next = Proxy {
             backend: to,
             cert_root: self.cert_root.clone(),
@@ -2569,6 +2661,7 @@ impl Proxy {
         // A stopped proxy can't reload (Caddy's reload talks to the running
         // one on localhost:2019). Starting it loads the same config.
         if !unit_active(unit).await {
+            self.ports_available_for(self.backend)?;
             progress
                 .line(format!("{unit} is not running: starting it"))
                 .await;
@@ -2855,6 +2948,205 @@ fn add_nginx_include(existing: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listener(port: u16, exe: &str) -> daemon_protocol::Listener {
+        daemon_protocol::Listener {
+            proto: "tcp".into(),
+            address: "0.0.0.0".into(),
+            port,
+            pid: Some(2482),
+            exe: Some(exe.into()),
+            user: Some("root".into()),
+            cmdline: None,
+        }
+    }
+
+    #[test]
+    fn another_programs_web_ports_are_left_alone() {
+        let docker = vec![
+            listener(80, "/usr/bin/docker-proxy"),
+            listener(443, "/usr/bin/docker-proxy"),
+            listener(8050, "/usr/bin/docker-proxy"),
+        ];
+        let conflict = Proxy::port_conflict(ProxyBackend::Caddy, ProxyBackend::Caddy, &docker)
+            .expect("docker holding 80 and 443");
+        assert!(conflict.contains("docker-proxy"));
+        assert!(conflict.contains("will not stop it"));
+        assert!(!conflict.contains("8050"));
+
+        let ours = vec![listener(80, "/usr/bin/caddy")];
+        assert!(Proxy::port_conflict(ProxyBackend::Caddy, ProxyBackend::Caddy, &ours).is_none());
+        // Moving off Caddy onto Traefik may stop Caddy. It may not stop docker.
+        assert!(Proxy::port_conflict(ProxyBackend::Caddy, ProxyBackend::Traefik, &ours).is_none());
+        assert!(
+            Proxy::port_conflict(ProxyBackend::Caddy, ProxyBackend::Traefik, &docker).is_some()
+        );
+
+        let unnamed = daemon_protocol::Listener {
+            exe: None,
+            cmdline: None,
+            ..listener(80, "/usr/bin/docker-proxy")
+        };
+        assert!(
+            Proxy::port_conflict(ProxyBackend::Caddy, ProxyBackend::Caddy, &[unnamed]).is_none()
+        );
+    }
+
+    /// A /proc tree: `net/tcp` plus one process whose fd is `socket:[inode]`.
+    fn proc_listener(root: &Path, pid: u32, exe_name: &str, fds: &[(u32, u64)]) {
+        let program = root.join("bin").join(exe_name);
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, b"\n").unwrap();
+        let dir = root.join(pid.to_string());
+        std::fs::create_dir_all(dir.join("fd")).unwrap();
+        std::os::unix::fs::symlink(&program, dir.join("exe")).unwrap();
+        std::fs::write(
+            dir.join("status"),
+            format!("Name:\t{exe_name}\nUid:\t0\t0\t0\t0\nPPid:\t1\n"),
+        )
+        .unwrap();
+        std::fs::write(dir.join("comm"), format!("{exe_name}\n")).unwrap();
+        std::fs::write(dir.join("cmdline"), format!("{exe_name}\0")).unwrap();
+        for (fd, inode) in fds {
+            std::os::unix::fs::symlink(
+                format!("socket:[{inode}]"),
+                dir.join("fd").join(fd.to_string()),
+            )
+            .unwrap();
+        }
+    }
+
+    fn tcp_line(port: u16, inode: u64) -> String {
+        format!(
+            "   0: 00000000:{port:04X} 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+        )
+    }
+
+    #[test]
+    fn a_panel_container_on_80_is_seen_from_proc_and_left_alone() {
+        let root = temp_dir("proc-docker-proxy");
+        std::fs::create_dir_all(root.join("net")).unwrap();
+        // The customer's listeners: docker-proxy on 80, 443 and the app port.
+        std::fs::write(
+            root.join("net/tcp"),
+            format!(
+                "{}{}{}",
+                tcp_line(80, 1001),
+                tcp_line(443, 1002),
+                tcp_line(8050, 1003)
+            ),
+        )
+        .unwrap();
+        proc_listener(&root, 2482, "docker-proxy", &[(3, 1001), (4, 1002)]);
+        proc_listener(&root, 2501, "docker-proxy", &[(3, 1003)]);
+
+        let caddy = proxy_in(ProxyBackend::Caddy, &root);
+        let blocked = caddy
+            .ports_available_at(&root, ProxyBackend::Caddy)
+            .unwrap_err();
+        assert!(
+            blocked.message.contains("docker-proxy"),
+            "{}",
+            blocked.message
+        );
+        assert!(
+            blocked.message.contains("will not stop it"),
+            "{}",
+            blocked.message
+        );
+        assert!(!blocked.message.contains("8050"), "{}", blocked.message);
+        assert!(
+            blocked.next_step.unwrap().contains("Choose None"),
+            "{}",
+            blocked.message
+        );
+        // Switching to Traefik still must not stop the panel's container.
+        assert!(caddy
+            .ports_available_at(&root, ProxyBackend::Traefik)
+            .is_err());
+
+        // No /proc data: the live check is skipped, as on macOS.
+        let empty = temp_dir("proc-empty");
+        assert!(caddy
+            .ports_available_at(&empty, ProxyBackend::Caddy)
+            .is_ok());
+
+        // Caddy itself on 80 is ours. An unnamed listener is not a conflict.
+        let ours = temp_dir("proc-caddy");
+        std::fs::create_dir_all(ours.join("net")).unwrap();
+        std::fs::write(ours.join("net/tcp"), tcp_line(80, 2001)).unwrap();
+        proc_listener(&ours, 12, "caddy", &[(3, 2001)]);
+        assert!(caddy.ports_available_at(&ours, ProxyBackend::Caddy).is_ok());
+
+        let unnamed = temp_dir("proc-unnamed");
+        std::fs::create_dir_all(unnamed.join("net")).unwrap();
+        std::fs::write(unnamed.join("net/tcp"), tcp_line(80, 3001)).unwrap();
+        assert!(caddy
+            .ports_available_at(&unnamed, ProxyBackend::Caddy)
+            .is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&empty);
+        let _ = std::fs::remove_dir_all(&ours);
+        let _ = std::fs::remove_dir_all(&unnamed);
+    }
+
+    #[tokio::test]
+    async fn none_does_not_install_or_stop_or_rewrite_a_proxy() {
+        let dir = temp_dir("none-switch");
+        let proxy = proxy_in(ProxyBackend::Caddy, &dir);
+        std::fs::create_dir_all(&proxy.include_dir).unwrap();
+        let site = proxy.include_dir.join("shop.caddy");
+        let body = "shop.example {\n    reverse_proxy 127.0.0.1:3000\n}\n";
+        std::fs::write(&site, body).unwrap();
+
+        let (_tx, mut cancel) = watch::channel(false);
+        let state = std::sync::Arc::new(daemon_state::State::in_memory().unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let progress = Progress::new(uuid::Uuid::new_v4(), state, tx, vec![]);
+
+        let next = proxy
+            .switch_to(ProxyBackend::None, &mut cancel, &progress)
+            .await
+            .unwrap();
+        assert_eq!(next.backend, ProxyBackend::None);
+        assert_eq!(std::fs::read_to_string(&site).unwrap(), body);
+        assert!(!next.ensure_installed(&mut cancel, &progress).await.unwrap());
+        let refused = next
+            .publish(
+                "shop",
+                &["shop.example".into()],
+                8050,
+                Some(false),
+                &mut cancel,
+                &progress,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            refused.message.contains("does not change one"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(next.refresh_sites().await, 0);
+        assert_eq!(std::fs::read_to_string(&site).unwrap(), body);
+
+        let mut said = String::new();
+        while let Ok(update) = rx.try_recv() {
+            for line in update.log {
+                said.push_str(&line);
+                said.push('\n');
+            }
+        }
+        assert!(
+            said.contains("will not stop what is already serving ports 80 and 443"),
+            "{said}"
+        );
+        assert!(!said.contains("Stopping"), "{said}");
+        assert!(!said.contains("installing"), "{said}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_publish_that_does_not_take_puts_the_files_back() {

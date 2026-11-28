@@ -39,6 +39,38 @@ pub struct DeployResult {
     /// compose. Missing from older daemons, and on a rollback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_method: Option<String>,
+    /// The app is up, and the reverse proxy was not changed: an external
+    /// proxy was chosen, or ports 80 and 443 belong to something else.
+    /// Missing when the proxy is serving the domain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_note: Option<String>,
+}
+
+/// What a deploy did with the machine's reverse proxy.
+enum ProxyRoute {
+    /// The proxy is serving this app.
+    Attached,
+    /// None was chosen: nothing was installed, configured or started.
+    External(String),
+    /// The container is up. The proxy was left as it was.
+    LeftAlone(String),
+}
+
+impl ProxyRoute {
+    fn attached(&self) -> bool {
+        matches!(self, Self::Attached)
+    }
+
+    fn left_alone(&self) -> bool {
+        matches!(self, Self::LeftAlone(_))
+    }
+
+    fn note(&self) -> Option<String> {
+        match self {
+            Self::Attached => None,
+            Self::External(note) | Self::LeftAlone(note) => Some(note.clone()),
+        }
+    }
 }
 
 pub struct Deployer {
@@ -761,6 +793,64 @@ impl Deployer {
     /// The local port the new release is published on: its usual one, or
     /// the next free one when something else has it (a stopped release
     /// keeps its port for a rollback, so those count as taken).
+    /// Points the machine's proxy at this app, or leaves it alone.
+    /// A failure here does not fail the deploy: the container is already
+    /// healthy, and stopping an existing proxy is not this step's job.
+    async fn route(
+        &self,
+        service: &str,
+        domains: &[String],
+        port: u16,
+        https: Option<bool>,
+        cancel: &mut watch::Receiver<bool>,
+        progress: &Progress,
+    ) -> ProxyRoute {
+        let proxy = self.proxy();
+        if proxy.backend == daemon_core::config::ProxyBackend::None {
+            let note = format!(
+                "{service} is on 127.0.0.1:{port}. No reverse proxy was installed or started. Point your tunnel or proxy at that address."
+            );
+            progress.line(note.clone()).await;
+            return ProxyRoute::External(note);
+        }
+
+        progress.phase("proxy", Some(80)).await;
+        if let Err(failure) = proxy.ports_available_for(proxy.backend) {
+            return self.leave_proxy(service, port, failure, progress).await;
+        }
+        let attached = async {
+            proxy.ensure_installed(cancel, progress).await?;
+            proxy.ensure_import()?;
+            proxy
+                .publish(service, domains, port, https, cancel, progress)
+                .await?;
+            Ok::<(), Failure>(())
+        }
+        .await;
+        match attached {
+            Ok(()) => ProxyRoute::Attached,
+            Err(failure) => self.leave_proxy(service, port, failure, progress).await,
+        }
+    }
+
+    async fn leave_proxy(
+        &self,
+        service: &str,
+        port: u16,
+        failure: Failure,
+        progress: &Progress,
+    ) -> ProxyRoute {
+        let note = format!(
+            "{service} is running on port {port}. {message} The reverse proxy was left as it is.",
+            message = failure.message
+        );
+        progress.line(format!("warning: {note}")).await;
+        if let Some(step) = &failure.next_step {
+            progress.line(step.clone()).await;
+        }
+        ProxyRoute::LeftAlone(note)
+    }
+
     async fn host_port(
         &self,
         usual: u16,
@@ -1096,13 +1186,11 @@ impl Deployer {
             }
         }
 
-        if !spec.domains.is_empty() {
-            progress.phase("proxy", Some(80)).await;
-            let proxy = self.proxy();
-            proxy.ensure_installed(cancel, progress).await?;
-            proxy.ensure_import()?;
-            proxy
-                .publish(
+        let proxy_route = if spec.domains.is_empty() {
+            None
+        } else {
+            Some(
+                self.route(
                     service,
                     &spec.domains,
                     host_port,
@@ -1110,7 +1198,10 @@ impl Deployer {
                     cancel,
                     progress,
                 )
-                .await?;
+                .await,
+            )
+        };
+        if proxy_route.as_ref().is_some_and(ProxyRoute::attached) {
             Touched::set(&touched.proxy);
         }
 
@@ -1137,9 +1228,24 @@ impl Deployer {
             network: spec.network.clone(),
             compose_file: None,
         };
-        let evicted = ledger
-            .promote(service, release, RETAINED_RELEASES)
-            .map_err(|e| Failure::new("record", e.to_string()))?;
+        // A new port with the proxy left alone would make this release the
+        // one on record while the domain still reaches the previous port.
+        // Leave that release as the one being served. The new container
+        // stays up on its own port.
+        let detached = proxy_route.as_ref().is_some_and(ProxyRoute::left_alone)
+            && previous.is_some_and(|prev| prev.port != host_port);
+        let evicted = if detached {
+            progress
+                .line(format!(
+                    "the new container is running on port {host_port}, and the previous release is still the one being served"
+                ))
+                .await;
+            Vec::new()
+        } else {
+            ledger
+                .promote(service, release, RETAINED_RELEASES)
+                .map_err(|e| Failure::new("record", e.to_string()))?
+        };
         let result = DeployResult {
             service: service.clone(),
             commit: commit.clone(),
@@ -1151,8 +1257,11 @@ impl Deployer {
             limits,
             container_port: Some(container_port),
             build_method: Some(method.name().into()),
+            proxy_note: proxy_route.as_ref().and_then(ProxyRoute::note),
         };
-        *touched.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
+        if !detached {
+            *touched.live.lock().unwrap_or_else(|p| p.into_inner()) = Some(result.clone());
+        }
 
         if let Some(command) = spec
             .post_deploy_command
@@ -1183,22 +1292,24 @@ impl Deployer {
             }
         }
 
-        if let Some(prev) = to_drain(previous, &name) {
-            progress.phase("drain", Some(95)).await;
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let time = left(until).clamp(Duration::from_secs(1), Duration::from_secs(90));
-            if let Err(e) = container::stop(&prev.container, time, cancel, progress).await {
-                progress
-                    .line(format!(
-                        "old release {} did not stop cleanly: {}",
-                        prev.container, e.message
-                    ))
-                    .await;
-            }
-            // The same commit's other container: the ledger now holds
-            // the new one for this commit, so the old one is let go.
-            if prev.commit == *commit {
-                container::remove(&prev.container, progress).await;
+        if !detached {
+            if let Some(prev) = to_drain(previous, &name) {
+                progress.phase("drain", Some(95)).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let time = left(until).clamp(Duration::from_secs(1), Duration::from_secs(90));
+                if let Err(e) = container::stop(&prev.container, time, cancel, progress).await {
+                    progress
+                        .line(format!(
+                            "old release {} did not stop cleanly: {}",
+                            prev.container, e.message
+                        ))
+                        .await;
+                }
+                // The same commit's other container: the ledger now holds
+                // the new one for this commit, so the old one is let go.
+                if prev.commit == *commit {
+                    container::remove(&prev.container, progress).await;
+                }
             }
         }
 
@@ -1298,15 +1409,13 @@ impl Deployer {
             None => container::compose_settled(&project, progress).await?,
         }
 
-        if let (Some(port), false) = (host_port, spec.domains.is_empty()) {
-            progress.phase("proxy", Some(80)).await;
-            let proxy = self.proxy();
-            proxy.ensure_installed(cancel, progress).await?;
-            proxy.ensure_import()?;
-            proxy
-                .publish(service, &spec.domains, port, spec.https, cancel, progress)
-                .await?;
-        }
+        let proxy_route = match host_port {
+            Some(port) if !spec.domains.is_empty() => {
+                self.route(service, &spec.domains, port, spec.https, cancel, progress)
+                    .await
+            }
+            _ => ProxyRoute::Attached,
+        };
 
         progress.phase("verify", Some(90)).await;
 
@@ -1337,6 +1446,7 @@ impl Deployer {
             previous: previous.map(|p| p.commit.clone()),
             restart_note: Some("Compose projects are recreated in place, so the service restarted briefly during this deploy.".into()),
             limits: None,
+            proxy_note: proxy_route.note(),
             container_port: None,
             build_method: Some("compose".into()),
         };
@@ -1481,10 +1591,20 @@ impl Deployer {
         }
 
         if !domains.is_empty() {
-            progress.phase("proxy", Some(80)).await;
-            self.proxy()
-                .publish(service, domains, release.port, None, &mut cancel, progress)
-                .await?;
+            let proxy = self.proxy();
+            if proxy.backend == daemon_core::config::ProxyBackend::None {
+                progress
+                    .line(format!(
+                        "{service} is on 127.0.0.1:{}. No reverse proxy was installed or started.",
+                        release.port
+                    ))
+                    .await;
+            } else {
+                progress.phase("proxy", Some(80)).await;
+                proxy
+                    .publish(service, domains, release.port, None, &mut cancel, progress)
+                    .await?;
+            }
         }
 
         ledger
@@ -1514,6 +1634,7 @@ impl Deployer {
             limits: None,
             container_port: release.container_port,
             build_method: None,
+            proxy_note: None,
         })
     }
 }
@@ -2093,6 +2214,7 @@ mod tests {
             limits: None,
             container_port: None,
             build_method: Some("railpack".into()),
+            proxy_note: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["build_method"], "railpack");
