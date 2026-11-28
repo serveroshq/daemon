@@ -83,7 +83,7 @@ curve25519-dalek = "4.1"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 nix = { version = "0.29", features = ["process", "signal", "fs", "user", "term", "poll"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
