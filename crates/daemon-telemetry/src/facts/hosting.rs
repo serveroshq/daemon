@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use daemon_protocol::HostingFacts;
@@ -18,7 +19,58 @@ pub(super) fn detect() -> HostingFacts {
         return HostingFacts::default();
     }
 
-    probe().unwrap_or_default()
+    probe().or_else(by_network).unwrap_or_default()
+}
+
+/// Dedicated servers have no metadata service, so go by who owns the
+/// machine's address. Asked once per run.
+// ponytail: a failed lookup sticks until the daemon restarts.
+fn by_network() -> Option<HostingFacts> {
+    static ORG: OnceLock<Option<String>> = OnceLock::new();
+    let org = ORG.get_or_init(|| {
+        if cfg!(test) {
+            return None;
+        }
+        https_get("ipinfo.io", "/org")
+    });
+    parse_org(org.as_deref()?)
+}
+
+/// `AS24940 Hetzner Online GmbH` → Hetzner.
+fn parse_org(org: &str) -> Option<HostingFacts> {
+    let (asn, name) = org.trim().split_once(' ')?;
+    if !asn.starts_with("AS") || !name.starts_with("Hetzner Online") {
+        return None;
+    }
+    Some(HostingFacts {
+        provider: Some("Hetzner".into()),
+        source: Some("network_owner".into()),
+        ..HostingFacts::default()
+    })
+}
+
+fn https_get(host: &str, path: &str) -> Option<String> {
+    let address = (host, 443).to_socket_addrs().ok()?.next()?;
+    let socket = TcpStream::connect_timeout(&address, Duration::from_secs(2)).ok()?;
+    socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    socket
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .ok()?;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connection =
+        rustls::ClientConnection::new(Arc::new(config), host.to_owned().try_into().ok()?).ok()?;
+    let mut stream = rustls::StreamOwned::new(connection, socket);
+    stream
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nAccept: text/plain\r\nUser-Agent: serverosd\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    parse_response(&read_response(&mut stream)?)
 }
 
 fn probe() -> Option<HostingFacts> {
@@ -386,6 +438,16 @@ mod tests {
             parse_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"),
             None
         );
+    }
+
+    #[test]
+    fn a_hetzner_address_means_hetzner() {
+        let dedicated = parse_org("AS24940 Hetzner Online GmbH\n").unwrap();
+        assert_eq!(dedicated.provider.as_deref(), Some("Hetzner"));
+        assert_eq!(dedicated.source.as_deref(), Some("network_owner"));
+        assert!(parse_org("AS16276 OVH SAS").is_none());
+        assert!(parse_org("Hetzner Online GmbH").is_none());
+        assert!(parse_org("").is_none());
     }
 
     #[test]
